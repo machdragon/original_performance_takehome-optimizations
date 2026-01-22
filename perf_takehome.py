@@ -300,8 +300,14 @@ class KernelBuilder:
             self.add("flow", ("add_imm", val_load_ptr, val_load_ptr, 1))
 
         # Vector scratch registers and broadcasted constants.
-        v_node_val = self.alloc_scratch("v_node_val", VLEN)
-        v_addr = self.alloc_scratch("v_addr", VLEN)
+        v_node_val = [
+            self.alloc_scratch("v_node_val_0", VLEN),
+            self.alloc_scratch("v_node_val_1", VLEN),
+        ]
+        v_addr = [
+            self.alloc_scratch("v_addr_0", VLEN),
+            self.alloc_scratch("v_addr_1", VLEN),
+        ]
         v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
         v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
         v_tmp3 = self.alloc_scratch("v_tmp3", VLEN)
@@ -316,6 +322,143 @@ class KernelBuilder:
         for _, val1, _, _, val3 in HASH_STAGES:
             self.scratch_vconst(val1)
             self.scratch_vconst(val3)
+
+        def interleave_slots(hash_slots, load_slots):
+            if not load_slots:
+                return hash_slots
+            if not hash_slots:
+                return load_slots
+            combined = []
+            h_len = len(hash_slots)
+            l_len = len(load_slots)
+            spacing = max(1, h_len // (l_len + 1))
+            h_i = 0
+            l_i = 0
+            since_load = 0
+            while h_i < h_len or l_i < l_len:
+                if h_i < h_len:
+                    combined.append(hash_slots[h_i])
+                    h_i += 1
+                    since_load += 1
+                if l_i < l_len and since_load >= spacing:
+                    combined.append(load_slots[l_i])
+                    l_i += 1
+                    since_load = 0
+                elif h_i >= h_len and l_i < l_len:
+                    combined.append(load_slots[l_i])
+                    l_i += 1
+            return combined
+
+        def vec_load_slots(vec_i, buf_idx):
+            slots = []
+            v_idx = idx_cache + vec_i
+            v_addr_buf = v_addr[buf_idx]
+            v_node_buf = v_node_val[buf_idx]
+            slots.append(("valu", ("+", v_addr_buf, v_idx, v_forest_p)))
+            for lane in range(VLEN):
+                slots.append(("load", ("load_offset", v_node_buf, v_addr_buf, lane)))
+            return slots
+
+        def vec_hash_slots(vec_i, buf_idx, round_idx, wrap_round):
+            slots = []
+            v_idx = idx_cache + vec_i
+            v_val = val_cache + vec_i
+            v_node_buf = v_node_val[buf_idx]
+            if self.enable_debug:
+                slots.append(
+                    (
+                        "debug",
+                        (
+                            "vcompare",
+                            v_idx,
+                            [(round_idx, vec_i + lane, "idx") for lane in range(VLEN)],
+                        ),
+                    )
+                )
+                slots.append(
+                    (
+                        "debug",
+                        (
+                            "vcompare",
+                            v_val,
+                            [(round_idx, vec_i + lane, "val") for lane in range(VLEN)],
+                        ),
+                    )
+                )
+                slots.append(
+                    (
+                        "debug",
+                        (
+                            "vcompare",
+                            v_node_buf,
+                            [
+                                (round_idx, vec_i + lane, "node_val")
+                                for lane in range(VLEN)
+                            ],
+                        ),
+                    )
+                )
+            slots.append(("valu", ("^", v_val, v_val, v_node_buf)))
+            slots.extend(self.build_hash_vec(v_val, v_tmp1, v_tmp2))
+            if self.enable_debug:
+                slots.append(
+                    (
+                        "debug",
+                        (
+                            "vcompare",
+                            v_val,
+                            [
+                                (round_idx, vec_i + lane, "hashed_val")
+                                for lane in range(VLEN)
+                            ],
+                        ),
+                    )
+                )
+            if fast_wrap:
+                if wrap_round:
+                    slots.append(("valu", ("+", v_idx, v_zero, v_zero)))
+                else:
+                    slots.append(("valu", ("&", v_tmp3, v_val, v_one)))
+                    slots.append(("valu", ("+", v_tmp3, v_tmp3, v_one)))
+                    slots.append(("valu", ("+", v_idx, v_idx, v_idx)))
+                    slots.append(("valu", ("+", v_idx, v_idx, v_tmp3)))
+            else:
+                slots.append(("valu", ("&", v_tmp3, v_val, v_one)))
+                slots.append(("valu", ("+", v_tmp3, v_tmp3, v_one)))
+                slots.append(("valu", ("+", v_idx, v_idx, v_idx)))
+                slots.append(("valu", ("+", v_idx, v_idx, v_tmp3)))
+            if self.enable_debug:
+                slots.append(
+                    (
+                        "debug",
+                        (
+                            "vcompare",
+                            v_idx,
+                            [
+                                (round_idx, vec_i + lane, "next_idx")
+                                for lane in range(VLEN)
+                            ],
+                        ),
+                    )
+                )
+            if not fast_wrap:
+                slots.append(("valu", ("<", v_tmp1, v_idx, v_n_nodes)))
+                slots.append(("flow", ("vselect", v_idx, v_tmp1, v_idx, v_zero)))
+            if self.enable_debug:
+                slots.append(
+                    (
+                        "debug",
+                        (
+                            "vcompare",
+                            v_idx,
+                            [
+                                (round_idx, vec_i + lane, "wrapped_idx")
+                                for lane in range(VLEN)
+                            ],
+                        ),
+                    )
+                )
+            return slots
 
         # Pause instructions are matched up with yield statements in the reference
         # kernel to let you debug at intermediate steps. The testing harness in this
@@ -335,98 +478,22 @@ class KernelBuilder:
         wrap_period = forest_height + 1
         # Fast wrap relies on inputs starting at index 0 (Input.generate does this).
         fast_wrap = self.assume_zero_indices and not self.enable_debug
+        vec_count = vec_end // VLEN
         for round in range(rounds):
             wrap_round = (round % wrap_period) == forest_height
-            for i in range(0, vec_end, VLEN):
-                v_idx = idx_cache + i
-                v_val = val_cache + i
-                if self.enable_debug:
-                    body.append(
-                        (
-                            "debug",
-                            (
-                                "vcompare",
-                                v_idx,
-                                [(round, i + lane, "idx") for lane in range(VLEN)],
-                            ),
-                        )
-                    )
-                if self.enable_debug:
-                    body.append(
-                        (
-                            "debug",
-                            (
-                                "vcompare",
-                                v_val,
-                                [(round, i + lane, "val") for lane in range(VLEN)],
-                            ),
-                        )
-                    )
-                body.append(("valu", ("+", v_addr, v_idx, v_forest_p)))
-                for lane in range(VLEN):
-                    body.append(("load", ("load_offset", v_node_val, v_addr, lane)))
-                if self.enable_debug:
-                    body.append(
-                        (
-                            "debug",
-                            (
-                                "vcompare",
-                                v_node_val,
-                                [(round, i + lane, "node_val") for lane in range(VLEN)],
-                            ),
-                        )
-                    )
-                body.append(("valu", ("^", v_val, v_val, v_node_val)))
-                body.extend(self.build_hash_vec(v_val, v_tmp1, v_tmp2))
-                if self.enable_debug:
-                    body.append(
-                        (
-                            "debug",
-                            (
-                                "vcompare",
-                                v_val,
-                                [(round, i + lane, "hashed_val") for lane in range(VLEN)],
-                            ),
-                        )
-                    )
-                if fast_wrap:
-                    if wrap_round:
-                        body.append(("valu", ("+", v_idx, v_zero, v_zero)))
-                    else:
-                        body.append(("valu", ("&", v_tmp3, v_val, v_one)))
-                        body.append(("valu", ("+", v_tmp3, v_tmp3, v_one)))
-                        body.append(("valu", ("+", v_idx, v_idx, v_idx)))
-                        body.append(("valu", ("+", v_idx, v_idx, v_tmp3)))
-                else:
-                    body.append(("valu", ("&", v_tmp3, v_val, v_one)))
-                    body.append(("valu", ("+", v_tmp3, v_tmp3, v_one)))
-                    body.append(("valu", ("+", v_idx, v_idx, v_idx)))
-                    body.append(("valu", ("+", v_idx, v_idx, v_tmp3)))
-                if self.enable_debug:
-                    body.append(
-                        (
-                            "debug",
-                            (
-                                "vcompare",
-                                v_idx,
-                                [(round, i + lane, "next_idx") for lane in range(VLEN)],
-                            ),
-                        )
-                    )
-                if not fast_wrap:
-                    body.append(("valu", ("<", v_tmp1, v_idx, v_n_nodes)))
-                    body.append(("flow", ("vselect", v_idx, v_tmp1, v_idx, v_zero)))
-                if self.enable_debug:
-                    body.append(
-                        (
-                            "debug",
-                            (
-                                "vcompare",
-                                v_idx,
-                                [(round, i + lane, "wrapped_idx") for lane in range(VLEN)],
-                            ),
-                        )
-                    )
+            if vec_count > 0:
+                # Prologue: load vector 0
+                body.extend(vec_load_slots(0, 0))
+                for vec in range(1, vec_count):
+                    prev = vec - 1
+                    hash_slots = vec_hash_slots(prev * VLEN, prev % 2, round, wrap_round)
+                    load_slots = vec_load_slots(vec * VLEN, vec % 2)
+                    body.extend(interleave_slots(hash_slots, load_slots))
+                # Epilogue: hash last vector
+                last_vec = vec_count - 1
+                body.extend(
+                    vec_hash_slots(last_vec * VLEN, last_vec % 2, round, wrap_round)
+                )
 
             for i in range(vec_end, batch_size):
                 idx_addr = idx_cache + i
