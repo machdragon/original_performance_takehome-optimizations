@@ -115,6 +115,15 @@ class KernelBuilder:
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
 
+        # Precompute input pointers to avoid repeated address arithmetic in the hot loop.
+        idx_ptrs = self.alloc_scratch("idx_ptrs", batch_size)
+        val_ptrs = self.alloc_scratch("val_ptrs", batch_size)
+        self.add("alu", ("+", idx_ptrs, self.scratch["inp_indices_p"], zero_const))
+        self.add("alu", ("+", val_ptrs, self.scratch["inp_values_p"], zero_const))
+        for i in range(1, batch_size):
+            self.add("alu", ("+", idx_ptrs + i, idx_ptrs + i - 1, one_const))
+            self.add("alu", ("+", val_ptrs + i, val_ptrs + i - 1, one_const))
+
         # Pause instructions are matched up with yield statements in the reference
         # kernel to let you debug at intermediate steps. The testing harness in this
         # file requires these match up to the reference kernel's yields, but the
@@ -133,14 +142,13 @@ class KernelBuilder:
 
         for round in range(rounds):
             for i in range(batch_size):
-                i_const = self.scratch_const(i)
                 # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
+                idx_ptr = idx_ptrs + i
+                val_ptr = val_ptrs + i
+                body.append(("load", ("load", tmp_idx, idx_ptr)))
                 body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
                 # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
+                body.append(("load", ("load", tmp_val, val_ptr)))
                 body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
                 # node_val = mem[forest_values_p + idx]
                 body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
@@ -151,9 +159,8 @@ class KernelBuilder:
                 body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
                 body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
+                body.append(("alu", ("&", tmp3, tmp_val, one_const)))
+                body.append(("alu", ("+", tmp3, tmp3, one_const)))
                 body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
                 body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
                 body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
@@ -162,11 +169,9 @@ class KernelBuilder:
                 body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
                 body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
                 # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
+                body.append(("store", ("store", idx_ptr, tmp_idx)))
                 # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
+                body.append(("store", ("store", val_ptr, tmp_val)))
 
         body_instrs = self.build(body)
         self.instrs.extend(body_instrs)
