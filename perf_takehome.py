@@ -16,7 +16,6 @@ anything in the tests/ folder.
 We recommend you look through problem.py next.
 """
 
-from collections import defaultdict
 import random
 import unittest
 
@@ -443,6 +442,7 @@ def do_kernel_test(
     seed: int = 123,
     trace: bool = False,
     prints: bool = False,
+    enable_debug: bool | None = None,
 ):
     print(f"{forest_height=}, {rounds=}, {batch_size=}")
     random.seed(seed)
@@ -450,7 +450,9 @@ def do_kernel_test(
     inp = Input.generate(forest, batch_size, rounds)
     mem = build_mem_image(forest, inp)
 
-    kb = KernelBuilder()
+    if enable_debug is None:
+        enable_debug = trace
+    kb = KernelBuilder(enable_debug=enable_debug)
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
     # print(kb.instrs)
 
