@@ -37,7 +37,7 @@ from problem import (
 
 
 class KernelBuilder:
-    def __init__(self, enable_debug: bool = False):
+    def __init__(self, enable_debug: bool = False, assume_zero_indices: bool = True):
         self.instrs = []
         self.scratch = {}
         self.scratch_debug = {}
@@ -45,6 +45,7 @@ class KernelBuilder:
         self.const_map = {}
         self.vconst_map = {}
         self.enable_debug = enable_debug
+        self.assume_zero_indices = assume_zero_indices
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -332,6 +333,8 @@ class KernelBuilder:
         tmp_addr = self.alloc_scratch("tmp_addr")
 
         wrap_period = forest_height + 1
+        # Fast wrap relies on inputs starting at index 0 (Input.generate does this).
+        fast_wrap = self.assume_zero_indices and not self.enable_debug
         for round in range(rounds):
             wrap_round = (round % wrap_period) == forest_height
             for i in range(0, vec_end, VLEN):
@@ -386,13 +389,19 @@ class KernelBuilder:
                             ),
                         )
                     )
-                if self.enable_debug or not wrap_round:
+                if fast_wrap:
+                    if wrap_round:
+                        body.append(("valu", ("+", v_idx, v_zero, v_zero)))
+                    else:
+                        body.append(("valu", ("&", v_tmp3, v_val, v_one)))
+                        body.append(("valu", ("+", v_tmp3, v_tmp3, v_one)))
+                        body.append(("valu", ("+", v_idx, v_idx, v_idx)))
+                        body.append(("valu", ("+", v_idx, v_idx, v_tmp3)))
+                else:
                     body.append(("valu", ("&", v_tmp3, v_val, v_one)))
                     body.append(("valu", ("+", v_tmp3, v_tmp3, v_one)))
                     body.append(("valu", ("+", v_idx, v_idx, v_idx)))
                     body.append(("valu", ("+", v_idx, v_idx, v_tmp3)))
-                else:
-                    body.append(("valu", ("+", v_idx, v_zero, v_zero)))
                 if self.enable_debug:
                     body.append(
                         (
@@ -404,7 +413,7 @@ class KernelBuilder:
                             ),
                         )
                     )
-                if self.enable_debug:
+                if not fast_wrap:
                     body.append(("valu", ("<", v_tmp1, v_idx, v_n_nodes)))
                     body.append(("flow", ("vselect", v_idx, v_tmp1, v_idx, v_zero)))
                 if self.enable_debug:
@@ -445,19 +454,24 @@ class KernelBuilder:
                         ("debug", ("compare", val_addr, (round, i, "hashed_val")))
                     )
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                if self.enable_debug or not wrap_round:
+                if fast_wrap:
+                    if wrap_round:
+                        body.append(("alu", ("+", idx_addr, zero_const, zero_const)))
+                    else:
+                        body.append(("alu", ("&", tmp3, val_addr, one_const)))
+                        body.append(("alu", ("+", tmp3, tmp3, one_const)))
+                        body.append(("alu", ("*", idx_addr, idx_addr, two_const)))
+                        body.append(("alu", ("+", idx_addr, idx_addr, tmp3)))
+                else:
                     body.append(("alu", ("&", tmp3, val_addr, one_const)))
                     body.append(("alu", ("+", tmp3, tmp3, one_const)))
                     body.append(("alu", ("*", idx_addr, idx_addr, two_const)))
                     body.append(("alu", ("+", idx_addr, idx_addr, tmp3)))
-                else:
-                    body.append(("alu", ("+", idx_addr, zero_const, zero_const)))
                 if self.enable_debug:
                     body.append(
                         ("debug", ("compare", idx_addr, (round, i, "next_idx")))
                     )
-                # idx = 0 if idx >= n_nodes else idx
-                if self.enable_debug:
+                if not fast_wrap:
                     body.append(
                         ("alu", ("<", tmp1, idx_addr, self.scratch["n_nodes"]))
                     )
@@ -504,6 +518,7 @@ def do_kernel_test(
     trace: bool = False,
     prints: bool = False,
     enable_debug: bool | None = None,
+    assume_zero_indices: bool | None = None,
 ):
     print(f"{forest_height=}, {rounds=}, {batch_size=}")
     random.seed(seed)
@@ -513,7 +528,11 @@ def do_kernel_test(
 
     if enable_debug is None:
         enable_debug = trace
-    kb = KernelBuilder(enable_debug=enable_debug)
+    if assume_zero_indices is None:
+        assume_zero_indices = True
+    kb = KernelBuilder(
+        enable_debug=enable_debug, assume_zero_indices=assume_zero_indices
+    )
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
     # print(kb.instrs)
 
