@@ -192,7 +192,7 @@ class KernelBuilder:
             start_idx,
             future_writes,
             engine_filter=None,
-            lookahead=16,
+            lookahead=32,  # Increased from 16 for better load pulling
             init_skipped_reads=None,
             init_skipped_writes=None,
         ):
