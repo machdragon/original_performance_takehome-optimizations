@@ -57,6 +57,7 @@ Notes
 - Fast wrap assumes Input.generate indices start at 0; set assume_zero_indices=False for general inputs.
 - max_special_level >= 0 enables the early-level gather bypass; default remains -1 due to regression.
 - max_arith_level >= 2 enables VALU-only early-level selection (Phase 17); default remains -1 due to regression.
-- enable_prefetch enables lookahead prefetch for arith rounds (Phase 19); default False due to regression.
+- enable_prefetch enables lookahead prefetch for arith rounds (Phase 19); requires max_arith_level >= 2 and cross-round
+  pipeline eligibility; default False due to regression.
 - Wrap periodicity is a structural invariant (forest_height + 1 rounds to exceed bounds when starting at root).
 - Phase 16 (2095 cycles) clears the 2164 cycle threshold; further optimization is required for lower thresholds.

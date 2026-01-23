@@ -1328,13 +1328,6 @@ class KernelBuilder:
                         "diffs": v_level_diffs,
                     }
         vec_count = vec_end // VLEN
-        v_node_prefetch = None
-        # Prefetch relies on arith rounds to create room for lookahead loads.
-        enable_prefetch = self.enable_prefetch and enable_arith and rounds > 1
-        if enable_prefetch and vec_count > 0:
-            # Only consumed by the cross-round pipeline when enabled.
-            v_node_prefetch = self.alloc_scratch("v_node_prefetch", vec_count * VLEN)
-
         # Cross-round pipelining for better load utilization
         block_limit = vec_count - (vec_count % block_size)
         num_blocks = block_limit // block_size
@@ -1345,6 +1338,13 @@ class KernelBuilder:
             and not use_special
             and block_limit == vec_count  # no remainder
         )
+        v_node_prefetch = None
+        # Prefetch relies on arith rounds and the cross-round pipeline to create room for lookahead loads.
+        enable_prefetch = (
+            self.enable_prefetch and enable_arith and rounds > 1 and use_cross_round
+        )
+        if enable_prefetch:
+            v_node_prefetch = self.alloc_scratch("v_node_prefetch", vec_count * VLEN)
 
         round_info = []
         prefetch_active = [False] * rounds
