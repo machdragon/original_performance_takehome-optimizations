@@ -410,8 +410,8 @@ class KernelBuilder:
             self.scratch_vconst(val1)
             self.scratch_vconst(val3)
 
-        # Block size 4 works well with 32 vectors (no remainder)
-        block_size = 4
+        # Block size 8 fits 32 vectors (no remainder) and reduces block overhead.
+        block_size = 8
         # Double buffers for pipelining
         v_node_block = [
             self.alloc_scratch("v_node_block_A", block_size * VLEN),
@@ -529,8 +529,9 @@ class KernelBuilder:
             elif node_pair is not None:
                 node_right, node_diff = node_pair
                 slots.append(("valu", ("&", v_tmp1, v_idx, v_one)))
-                slots.append(("valu", ("*", v_tmp2, v_tmp1, node_diff)))
-                slots.append(("valu", ("+", v_tmp3, node_right, v_tmp2)))
+                slots.append(
+                    ("valu", ("multiply_add", v_tmp3, v_tmp1, node_diff, node_right))
+                )
                 v_node_buf = v_tmp3
             else:
                 v_node_buf = v_node_val[buf_idx]
@@ -700,21 +701,11 @@ class KernelBuilder:
                         (
                             "valu",
                             (
-                                "*",
-                                v_tmp2_block + bi * VLEN,
+                                "multiply_add",
+                                v_tmp3_block + bi * VLEN,
                                 v_tmp1_block + bi * VLEN,
                                 node_diff,
-                            ),
-                        )
-                    )
-                    slots.append(
-                        (
-                            "valu",
-                            (
-                                "+",
-                                v_tmp3_block + bi * VLEN,
                                 node_right,
-                                v_tmp2_block + bi * VLEN,
                             ),
                         )
                     )
@@ -845,7 +836,8 @@ class KernelBuilder:
         v_root_node = None
         v_level1_right = None
         v_level1_diff = None
-        enable_level1 = False
+        # Enable level-1 parity shortcut: node_pair now uses multiply_add.
+        enable_level1 = True
         if fast_wrap:
             root_node_val = self.alloc_scratch("root_node_val")
             v_root_node = self.alloc_scratch("v_root_node", VLEN)
