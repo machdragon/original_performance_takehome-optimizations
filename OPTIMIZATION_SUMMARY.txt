@@ -72,7 +72,7 @@ Notes
 - max_arith_level >= 2 enables VALU-only early-level selection (Phase 17); default remains -1 due to regression.
 - enable_prefetch enables lookahead prefetch for arith rounds (Phase 19); requires cross-round eligibility plus
   (max_arith_level >= 2 or enable_level2_where); default False due to regression.
-- enable_level2_where enables a level-2 where-tree (flow vselect) with block-0 prefetch overlap; best seen 1872 cycles
+- enable_level2_where enables a level-2 where-tree (flow vselect) with block-0 prefetch overlap; best seen 1864 cycles
   at h=10, r=16, b=256 with enable_prefetch=True (Phase 23, default False).
 - enable_level3_where enables a level-3 where-tree (flow vselect) with block-0 prefetch overlap; currently regresses
   (e.g., 1947 cycles at h=10, r=16, b=256), so default False.
