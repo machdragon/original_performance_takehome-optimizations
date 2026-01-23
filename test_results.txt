@@ -1,0 +1,182 @@
+================================================================================
+COMPREHENSIVE SYSTEMATIC OPTIMIZATION TEST SUITE
+================================================================================
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  1923
+Speedup over baseline:  76.8247529901196
+
+================================================================================
+Baseline: 1923 cycles
+Target: <1487 cycles (need to save 436 cycles)
+================================================================================
+
+================================================================================
+CATEGORY 1: Block Size Variations
+================================================================================
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  1981
+Speedup over baseline:  74.57546693589096
+✗ Block size=4                    1981 (  +58)
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  2018
+Speedup over baseline:  73.20812685827552
+✗ Block size=6                    2018 (  +95)
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  1980
+Speedup over baseline:  74.61313131313132
+✗ Block size=8                    1980 (  +57)
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  2014
+Speedup over baseline:  73.35352532274081
+✗ Block size=10                   2014 (  +91)
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  1986
+Speedup over baseline:  74.3877139979859
+✗ Block size=12                   1986 (  +63)
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  2001
+Speedup over baseline:  73.83008495752124
+✗ Block size=14                   2001 (  +78)
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  1923
+Speedup over baseline:  76.8247529901196
+= Block size=16                   1923 (   +0)
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  2130
+Speedup over baseline:  69.35868544600939
+✗ Block size=18                   2130 ( +207)
+forest_height=10, rounds=16, batch_size=256
+  ERROR: Out of scratch space
+forest_height=10, rounds=16, batch_size=256
+  ERROR: Out of scratch space
+forest_height=10, rounds=16, batch_size=256
+  ERROR: Out of scratch space
+
+================================================================================
+CATEGORY 2: Lookahead Variations (with block_size=16)
+================================================================================
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  1928
+Speedup over baseline:  76.62551867219916
+✗ Lookahead=512                   1928 (   +5)
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  1923
+Speedup over baseline:  76.8247529901196
+= Lookahead=1024                  1923 (   +0)
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  1923
+Speedup over baseline:  76.8247529901196
+= Lookahead=2048                  1923 (   +0)
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  1923
+Speedup over baseline:  76.8247529901196
+= Lookahead=4096                  1923 (   +0)
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  1923
+Speedup over baseline:  76.8247529901196
+= Lookahead=8192                  1923 (   +0)
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  1923
+Speedup over baseline:  76.8247529901196
+= Lookahead=16384                 1923 (   +0)
+
+================================================================================
+CATEGORY 3: Combined Block Size + Lookahead
+================================================================================
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  1980
+Speedup over baseline:  74.61313131313132
+✗ Block=8 + Lookahead=2048        1980 (  +57)
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  2014
+Speedup over baseline:  73.35352532274081
+✗ Block=10 + Lookahead=2048       2014 (  +91)
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  1986
+Speedup over baseline:  74.3877139979859
+✗ Block=12 + Lookahead=2048       1986 (  +63)
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  2001
+Speedup over baseline:  73.83008495752124
+✗ Block=14 + Lookahead=2048       2001 (  +78)
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  1923
+Speedup over baseline:  76.8247529901196
+= Block=16 + Lookahead=2048       1923 (   +0)
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  1923
+Speedup over baseline:  76.8247529901196
+= Block=16 + Lookahead=4096       1923 (   +0)
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  2130
+Speedup over baseline:  69.35868544600939
+✗ Block=18 + Lookahead=2048       2130 ( +207)
+forest_height=10, rounds=16, batch_size=256
+  ERROR: Out of scratch space
+forest_height=10, rounds=16, batch_size=256
+  ERROR: Out of scratch space
+forest_height=10, rounds=16, batch_size=256
+  ERROR: Out of scratch space
+
+================================================================================
+CATEGORY 4: VLIW Bundler Techniques
+================================================================================
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  1923
+Speedup over baseline:  76.8247529901196
+= Second-pass reordering          1923 (   +0)
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  1923
+Speedup over baseline:  76.8247529901196
+= Latency-aware                   1923 (   +0)
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  1923
+Speedup over baseline:  76.8247529901196
+= Second-pass + Latency-aware     1923 (   +0)
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  1923
+Speedup over baseline:  76.8247529901196
+= Combining (disabled)            1923 (   +0)
+
+================================================================================
+CATEGORY 5: Triple Combinations (Best Block + Best Lookahead + VLIW)
+================================================================================
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  1923
+Speedup over baseline:  76.8247529901196
+= Best + Second-pass              1923 (   +0)
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  1923
+Speedup over baseline:  76.8247529901196
+= Best + Latency-aware            1923 (   +0)
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  1923
+Speedup over baseline:  76.8247529901196
+= Best + Both VLIW                1923 (   +0)
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  1923
+Speedup over baseline:  76.8247529901196
+= Best + Lookahead=2048           1923 (   +0)
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  1923
+Speedup over baseline:  76.8247529901196
+= Best + Lookahead=4096           1923 (   +0)
+
+================================================================================
+FINAL SUMMARY
+================================================================================
+
+Total tests: 30
+  Wins: 0
+  Regressions: 13
+  Same: 17
+
+================================================================================
+WORST REGRESSIONS (top 5):
+================================================================================
+ 1. Block size=18                                  2130 cycles (+ 207)
+ 2. Block=18 + Lookahead=2048                      2130 cycles (+ 207)
+ 3. Block size=6                                   2018 cycles (+  95)
+ 4. Block size=10                                  2014 cycles (+  91)
+ 5. Block=10 + Lookahead=2048                      2014 cycles (+  91)
+
