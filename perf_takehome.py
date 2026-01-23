@@ -42,6 +42,7 @@ class KernelBuilder:
         enable_debug: bool = False,
         assume_zero_indices: bool = True,
         max_special_level: int = -1,
+        max_arith_level: int = -1,
     ):
         self.instrs = []
         self.scratch = {}
@@ -52,6 +53,7 @@ class KernelBuilder:
         self.enable_debug = enable_debug
         self.assume_zero_indices = assume_zero_indices
         self.max_special_level = max_special_level
+        self.max_arith_level = max_arith_level
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -438,6 +440,8 @@ class KernelBuilder:
                 self.add("flow", ("add_imm", idx_load_ptr, idx_load_ptr, 1))
             self.add("flow", ("add_imm", val_load_ptr, val_load_ptr, 1))
 
+        enable_arith = self.max_arith_level >= 2
+
         # Vector scratch registers and broadcasted constants.
         v_node_val = [
             self.alloc_scratch("v_node_val_0", VLEN),
@@ -450,14 +454,22 @@ class KernelBuilder:
         v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
         v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
         v_tmp3 = self.alloc_scratch("v_tmp3", VLEN)
+        v_tmp4 = None
+        if enable_arith:
+            v_tmp4 = self.alloc_scratch("v_tmp4", VLEN)
         v_zero = self.alloc_scratch("v_zero", VLEN)
         v_one = self.alloc_scratch("v_one", VLEN)
         v_two = self.alloc_scratch("v_two", VLEN)
+        v_three = None
+        if enable_arith:
+            v_three = self.alloc_scratch("v_three", VLEN)
         v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
         v_forest_p = self.alloc_scratch("v_forest_values_p", VLEN)
         self.add("valu", ("vbroadcast", v_zero, zero_const))
         self.add("valu", ("vbroadcast", v_one, one_const))
         self.add("valu", ("vbroadcast", v_two, two_const))
+        if enable_arith:
+            self.add("valu", ("vbroadcast", v_three, self.scratch_const(3)))
         self.add("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]))
         self.add("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]))
         for _, val1, _, _, val3 in HASH_STAGES:
@@ -474,6 +486,9 @@ class KernelBuilder:
         v_tmp1_block = self.alloc_scratch("v_tmp1_block", block_size * VLEN)
         v_tmp2_block = self.alloc_scratch("v_tmp2_block", block_size * VLEN)
         v_tmp3_block = self.alloc_scratch("v_tmp3_block", block_size * VLEN)
+        v_tmp4_block = None
+        if enable_arith:
+            v_tmp4_block = self.alloc_scratch("v_tmp4_block", block_size * VLEN)
 
         max_special = min(self.max_special_level, forest_height)
         use_special = self.assume_zero_indices and max_special >= 0
@@ -555,9 +570,9 @@ class KernelBuilder:
                     l_i += 1
             return combined
 
-        def vec_load_slots(vec_i, buf_idx, node_const=None, node_pair=None):
+        def vec_load_slots(vec_i, buf_idx, node_const=None, node_pair=None, node_arith=None):
             slots = []
-            if node_const is not None or node_pair is not None:
+            if node_const is not None or node_pair is not None or node_arith is not None:
                 return slots
             v_idx = idx_cache + vec_i
             v_addr_buf = v_addr[buf_idx]
@@ -567,6 +582,129 @@ class KernelBuilder:
                 slots.append(("load", ("load_offset", v_node_buf, v_addr_buf, lane)))
             return slots
 
+        def emit_level_select_slots(v_idx, buf_idx, node_arith):
+            level = node_arith["level"]
+            v_start = node_arith["v_start"]
+            bases = node_arith["bases"]
+            diffs = node_arith["diffs"]
+            slots = []
+            v_offset = v_addr[buf_idx]
+            if level == 2:
+                slots.append(("valu", ("-", v_offset, v_idx, v_start)))
+                slots.append(("valu", ("&", v_tmp1, v_offset, v_one)))
+                slots.append(
+                    ("valu", ("multiply_add", v_tmp2, v_tmp1, diffs[0], bases[0]))
+                )
+                slots.append(
+                    ("valu", ("multiply_add", v_tmp3, v_tmp1, diffs[1], bases[1]))
+                )
+                slots.append(("valu", (">>", v_tmp1, v_offset, v_one)))
+                slots.append(("valu", ("&", v_tmp1, v_tmp1, v_one)))
+                slots.append(("valu", ("-", v_tmp3, v_tmp3, v_tmp2)))
+                slots.append(("valu", ("multiply_add", v_tmp3, v_tmp1, v_tmp3, v_tmp2)))
+                return slots, v_tmp3
+            if level == 3:
+                v_node_buf = v_node_val[buf_idx]
+                slots.append(("valu", ("-", v_offset, v_idx, v_start)))
+                slots.append(("valu", ("&", v_tmp1, v_offset, v_one)))
+                slots.append(
+                    ("valu", ("multiply_add", v_tmp2, v_tmp1, diffs[0], bases[0]))
+                )
+                slots.append(
+                    ("valu", ("multiply_add", v_tmp3, v_tmp1, diffs[1], bases[1]))
+                )
+                slots.append(
+                    ("valu", ("multiply_add", v_tmp4, v_tmp1, diffs[2], bases[2]))
+                )
+                slots.append(
+                    ("valu", ("multiply_add", v_node_buf, v_tmp1, diffs[3], bases[3]))
+                )
+                slots.append(("valu", (">>", v_tmp1, v_offset, v_one)))
+                slots.append(("valu", ("&", v_tmp1, v_tmp1, v_one)))
+                slots.append(("valu", ("-", v_tmp3, v_tmp3, v_tmp2)))
+                slots.append(("valu", ("multiply_add", v_tmp2, v_tmp1, v_tmp3, v_tmp2)))
+                slots.append(("valu", ("-", v_node_buf, v_node_buf, v_tmp4)))
+                slots.append(
+                    ("valu", ("multiply_add", v_node_buf, v_tmp1, v_node_buf, v_tmp4))
+                )
+                slots.append(("valu", (">>", v_tmp1, v_offset, v_two)))
+                slots.append(("valu", ("&", v_tmp1, v_tmp1, v_one)))
+                slots.append(("valu", ("-", v_node_buf, v_node_buf, v_tmp2)))
+                slots.append(
+                    ("valu", ("multiply_add", v_node_buf, v_tmp1, v_node_buf, v_tmp2))
+                )
+                return slots, v_node_buf
+            if level == 4:
+                v_node_buf = v_node_val[buf_idx]
+                # Group-of-4 selection for q0..q3, then combine with bits 2/3.
+                slots.append(("valu", ("-", v_offset, v_idx, v_start)))
+                slots.append(("valu", ("&", v_tmp1, v_offset, v_one)))
+                slots.append(
+                    ("valu", ("multiply_add", v_tmp2, v_tmp1, diffs[0], bases[0]))
+                )
+                slots.append(
+                    ("valu", ("multiply_add", v_tmp3, v_tmp1, diffs[1], bases[1]))
+                )
+                slots.append(("valu", (">>", v_tmp1, v_offset, v_one)))
+                slots.append(("valu", ("&", v_tmp1, v_tmp1, v_one)))
+                slots.append(("valu", ("-", v_tmp3, v_tmp3, v_tmp2)))
+                slots.append(("valu", ("multiply_add", v_tmp2, v_tmp1, v_tmp3, v_tmp2)))
+
+                slots.append(("valu", ("&", v_tmp1, v_offset, v_one)))
+                slots.append(
+                    ("valu", ("multiply_add", v_tmp3, v_tmp1, diffs[2], bases[2]))
+                )
+                slots.append(
+                    ("valu", ("multiply_add", v_tmp4, v_tmp1, diffs[3], bases[3]))
+                )
+                slots.append(("valu", (">>", v_tmp1, v_offset, v_one)))
+                slots.append(("valu", ("&", v_tmp1, v_tmp1, v_one)))
+                slots.append(("valu", ("-", v_tmp4, v_tmp4, v_tmp3)))
+                slots.append(("valu", ("multiply_add", v_tmp3, v_tmp1, v_tmp4, v_tmp3)))
+
+                slots.append(("valu", (">>", v_tmp1, v_offset, v_two)))
+                slots.append(("valu", ("&", v_tmp1, v_tmp1, v_one)))
+                slots.append(("valu", ("-", v_tmp3, v_tmp3, v_tmp2)))
+                slots.append(("valu", ("multiply_add", v_tmp2, v_tmp1, v_tmp3, v_tmp2)))
+
+                slots.append(("valu", ("&", v_tmp1, v_offset, v_one)))
+                slots.append(
+                    ("valu", ("multiply_add", v_tmp3, v_tmp1, diffs[4], bases[4]))
+                )
+                slots.append(
+                    ("valu", ("multiply_add", v_tmp4, v_tmp1, diffs[5], bases[5]))
+                )
+                slots.append(("valu", (">>", v_tmp1, v_offset, v_one)))
+                slots.append(("valu", ("&", v_tmp1, v_tmp1, v_one)))
+                slots.append(("valu", ("-", v_tmp4, v_tmp4, v_tmp3)))
+                slots.append(("valu", ("multiply_add", v_tmp3, v_tmp1, v_tmp4, v_tmp3)))
+
+                slots.append(("valu", ("&", v_tmp1, v_offset, v_one)))
+                slots.append(
+                    ("valu", ("multiply_add", v_tmp4, v_tmp1, diffs[6], bases[6]))
+                )
+                slots.append(
+                    ("valu", ("multiply_add", v_node_buf, v_tmp1, diffs[7], bases[7]))
+                )
+                slots.append(("valu", (">>", v_tmp1, v_offset, v_one)))
+                slots.append(("valu", ("&", v_tmp1, v_tmp1, v_one)))
+                slots.append(("valu", ("-", v_node_buf, v_node_buf, v_tmp4)))
+                slots.append(
+                    ("valu", ("multiply_add", v_tmp4, v_tmp1, v_node_buf, v_tmp4))
+                )
+
+                slots.append(("valu", (">>", v_tmp1, v_offset, v_two)))
+                slots.append(("valu", ("&", v_tmp1, v_tmp1, v_one)))
+                slots.append(("valu", ("-", v_tmp4, v_tmp4, v_tmp3)))
+                slots.append(("valu", ("multiply_add", v_tmp3, v_tmp1, v_tmp4, v_tmp3)))
+
+                slots.append(("valu", (">>", v_tmp1, v_offset, v_three)))
+                slots.append(("valu", ("&", v_tmp1, v_tmp1, v_one)))
+                slots.append(("valu", ("-", v_tmp3, v_tmp3, v_tmp2)))
+                slots.append(("valu", ("multiply_add", v_tmp2, v_tmp1, v_tmp3, v_tmp2)))
+                return slots, v_tmp2
+            return slots, v_node_val[buf_idx]
+
         def vec_hash_slots(
             vec_i,
             buf_idx,
@@ -574,6 +712,7 @@ class KernelBuilder:
             wrap_round,
             node_const=None,
             node_pair=None,
+            node_arith=None,
         ):
             slots = []
             v_idx = idx_cache + vec_i
@@ -587,6 +726,11 @@ class KernelBuilder:
                     ("valu", ("multiply_add", v_tmp3, v_tmp1, node_diff, node_right))
                 )
                 v_node_buf = v_tmp3
+            elif node_arith is not None:
+                select_slots, v_node_buf = emit_level_select_slots(
+                    v_idx, buf_idx, node_arith
+                )
+                slots.extend(select_slots)
             else:
                 v_node_buf = v_node_val[buf_idx]
             if self.enable_debug:
@@ -710,10 +854,12 @@ class KernelBuilder:
             slots.append(("valu", ("+", v_node_buf, current_base, v_zero)))
             return slots
 
-        def vec_block_load_slots(block_vecs, buf_idx, node_const=None, node_pair=None):
+        def vec_block_load_slots(
+            block_vecs, buf_idx, node_const=None, node_pair=None, node_arith=None
+        ):
             """Load node values for a block into the specified buffer."""
             slots = []
-            if node_const is not None or node_pair is not None:
+            if node_const is not None or node_pair is not None or node_arith is not None:
                 return slots
             node_buf = v_node_block[buf_idx]
             for bi, vec_i in enumerate(block_vecs):
@@ -733,8 +879,152 @@ class KernelBuilder:
                     )
             return slots
 
+        def emit_level_select_block_slots(block_vecs, buf_idx, node_arith):
+            level = node_arith["level"]
+            v_start = node_arith["v_start"]
+            bases = node_arith["bases"]
+            diffs = node_arith["diffs"]
+            slots = []
+            node_buf = v_node_block[buf_idx]
+            for bi, vec_i in enumerate(block_vecs):
+                v_idx = idx_cache + vec_i
+                # Offset is recomputed into bit each phase; could be cached to save VALU ops.
+                bit = v_tmp1_block + bi * VLEN
+                t0 = v_tmp2_block + bi * VLEN
+                t1 = v_tmp3_block + bi * VLEN
+                t2 = v_tmp4_block + bi * VLEN
+                node = node_buf + bi * VLEN
+                if level == 2:
+                    slots.append(("valu", ("-", t0, v_idx, v_start)))
+                    slots.append(("valu", ("&", bit, t0, v_one)))
+                    slots.append(
+                        ("valu", ("multiply_add", t0, bit, diffs[0], bases[0]))
+                    )
+                    slots.append(
+                        ("valu", ("multiply_add", t1, bit, diffs[1], bases[1]))
+                    )
+                    slots.append(("valu", ("-", bit, v_idx, v_start)))
+                    slots.append(("valu", (">>", bit, bit, v_one)))
+                    slots.append(("valu", ("&", bit, bit, v_one)))
+                    slots.append(("valu", ("-", t1, t1, t0)))
+                    slots.append(("valu", ("multiply_add", node, bit, t1, t0)))
+                elif level == 3:
+                    slots.append(("valu", ("-", bit, v_idx, v_start)))
+                    slots.append(("valu", ("&", bit, bit, v_one)))
+                    slots.append(
+                        ("valu", ("multiply_add", t0, bit, diffs[0], bases[0]))
+                    )
+                    slots.append(
+                        ("valu", ("multiply_add", t1, bit, diffs[1], bases[1]))
+                    )
+                    slots.append(("valu", ("-", bit, v_idx, v_start)))
+                    slots.append(("valu", (">>", bit, bit, v_one)))
+                    slots.append(("valu", ("&", bit, bit, v_one)))
+                    slots.append(("valu", ("-", t1, t1, t0)))
+                    slots.append(("valu", ("multiply_add", t0, bit, t1, t0)))
+
+                    slots.append(("valu", ("-", bit, v_idx, v_start)))
+                    slots.append(("valu", ("&", bit, bit, v_one)))
+                    slots.append(
+                        ("valu", ("multiply_add", t1, bit, diffs[2], bases[2]))
+                    )
+                    slots.append(
+                        ("valu", ("multiply_add", t2, bit, diffs[3], bases[3]))
+                    )
+                    slots.append(("valu", ("-", bit, v_idx, v_start)))
+                    slots.append(("valu", (">>", bit, bit, v_one)))
+                    slots.append(("valu", ("&", bit, bit, v_one)))
+                    slots.append(("valu", ("-", t2, t2, t1)))
+                    slots.append(("valu", ("multiply_add", t1, bit, t2, t1)))
+
+                    slots.append(("valu", ("-", bit, v_idx, v_start)))
+                    slots.append(("valu", (">>", bit, bit, v_two)))
+                    slots.append(("valu", ("&", bit, bit, v_one)))
+                    slots.append(("valu", ("-", t1, t1, t0)))
+                    slots.append(("valu", ("multiply_add", node, bit, t1, t0)))
+                else:
+                    slots.append(("valu", ("-", bit, v_idx, v_start)))
+                    slots.append(("valu", ("&", bit, bit, v_one)))
+                    slots.append(
+                        ("valu", ("multiply_add", t0, bit, diffs[0], bases[0]))
+                    )
+                    slots.append(
+                        ("valu", ("multiply_add", t1, bit, diffs[1], bases[1]))
+                    )
+                    slots.append(("valu", ("-", bit, v_idx, v_start)))
+                    slots.append(("valu", (">>", bit, bit, v_one)))
+                    slots.append(("valu", ("&", bit, bit, v_one)))
+                    slots.append(("valu", ("-", t1, t1, t0)))
+                    slots.append(("valu", ("multiply_add", t0, bit, t1, t0)))
+
+                    slots.append(("valu", ("-", bit, v_idx, v_start)))
+                    slots.append(("valu", ("&", bit, bit, v_one)))
+                    slots.append(
+                        ("valu", ("multiply_add", t1, bit, diffs[2], bases[2]))
+                    )
+                    slots.append(
+                        ("valu", ("multiply_add", t2, bit, diffs[3], bases[3]))
+                    )
+                    slots.append(("valu", ("-", bit, v_idx, v_start)))
+                    slots.append(("valu", (">>", bit, bit, v_one)))
+                    slots.append(("valu", ("&", bit, bit, v_one)))
+                    slots.append(("valu", ("-", t2, t2, t1)))
+                    slots.append(("valu", ("multiply_add", t1, bit, t2, t1)))
+
+                    slots.append(("valu", ("-", bit, v_idx, v_start)))
+                    slots.append(("valu", (">>", bit, bit, v_two)))
+                    slots.append(("valu", ("&", bit, bit, v_one)))
+                    slots.append(("valu", ("-", t1, t1, t0)))
+                    slots.append(("valu", ("multiply_add", t0, bit, t1, t0)))
+
+                    slots.append(("valu", ("-", bit, v_idx, v_start)))
+                    slots.append(("valu", ("&", bit, bit, v_one)))
+                    slots.append(
+                        ("valu", ("multiply_add", t1, bit, diffs[4], bases[4]))
+                    )
+                    slots.append(
+                        ("valu", ("multiply_add", t2, bit, diffs[5], bases[5]))
+                    )
+                    slots.append(("valu", ("-", bit, v_idx, v_start)))
+                    slots.append(("valu", (">>", bit, bit, v_one)))
+                    slots.append(("valu", ("&", bit, bit, v_one)))
+                    slots.append(("valu", ("-", t2, t2, t1)))
+                    slots.append(("valu", ("multiply_add", t1, bit, t2, t1)))
+
+                    slots.append(("valu", ("-", bit, v_idx, v_start)))
+                    slots.append(("valu", ("&", bit, bit, v_one)))
+                    slots.append(
+                        ("valu", ("multiply_add", t2, bit, diffs[6], bases[6]))
+                    )
+                    slots.append(
+                        ("valu", ("multiply_add", node, bit, diffs[7], bases[7]))
+                    )
+                    slots.append(("valu", ("-", bit, v_idx, v_start)))
+                    slots.append(("valu", (">>", bit, bit, v_one)))
+                    slots.append(("valu", ("&", bit, bit, v_one)))
+                    slots.append(("valu", ("-", node, node, t2)))
+                    slots.append(("valu", ("multiply_add", t2, bit, node, t2)))
+
+                    slots.append(("valu", ("-", bit, v_idx, v_start)))
+                    slots.append(("valu", (">>", bit, bit, v_two)))
+                    slots.append(("valu", ("&", bit, bit, v_one)))
+                    slots.append(("valu", ("-", t2, t2, t1)))
+                    slots.append(("valu", ("multiply_add", t1, bit, t2, t1)))
+
+                    slots.append(("valu", ("-", bit, v_idx, v_start)))
+                    slots.append(("valu", (">>", bit, bit, v_three)))
+                    slots.append(("valu", ("&", bit, bit, v_one)))
+                    slots.append(("valu", ("-", t1, t1, t0)))
+                    slots.append(("valu", ("multiply_add", node, bit, t1, t0)))
+            return slots, node_buf
+
         def vec_block_hash_only_slots(
-            block_vecs, buf_idx, wrap_round, node_const=None, node_pair=None
+            block_vecs,
+            buf_idx,
+            wrap_round,
+            node_const=None,
+            node_pair=None,
+            node_arith=None,
         ):
             """XOR, hash, and update indices using node values from specified buffer."""
             slots = []
@@ -767,6 +1057,16 @@ class KernelBuilder:
                     v_val = val_cache + vec_i
                     slots.append(
                         ("valu", ("^", v_val, v_val, v_tmp3_block + bi * VLEN))
+                    )
+            elif node_arith is not None:
+                select_slots, node_base = emit_level_select_block_slots(
+                    block_vecs, buf_idx, node_arith
+                )
+                slots.extend(select_slots)
+                for bi, vec_i in enumerate(block_vecs):
+                    v_val = val_cache + vec_i
+                    slots.append(
+                        ("valu", ("^", v_val, v_val, node_base + bi * VLEN))
                     )
             else:
                 for bi, vec_i in enumerate(block_vecs):
@@ -859,12 +1159,19 @@ class KernelBuilder:
             return slots
 
         def vec_block_hash_slots(
-            block_vecs, round_idx, wrap_round, node_const=None, node_pair=None
+            block_vecs,
+            round_idx,
+            wrap_round,
+            node_const=None,
+            node_pair=None,
+            node_arith=None,
         ):
             """Combined load + hash (non-pipelined fallback)."""
-            slots = vec_block_load_slots(block_vecs, 0, node_const, node_pair)
+            slots = vec_block_load_slots(block_vecs, 0, node_const, node_pair, node_arith)
             slots.extend(
-                vec_block_hash_only_slots(block_vecs, 0, wrap_round, node_const, node_pair)
+                vec_block_hash_only_slots(
+                    block_vecs, 0, wrap_round, node_const, node_pair, node_arith
+                )
             )
             return slots
 
@@ -890,6 +1197,7 @@ class KernelBuilder:
         v_root_node = None
         v_level1_right = None
         v_level1_diff = None
+        level_arith = {}
         # Enable level-1 parity shortcut: node_pair now uses multiply_add.
         enable_level1 = True
         if fast_wrap:
@@ -919,6 +1227,51 @@ class KernelBuilder:
                 self.add("valu", ("vbroadcast", v_level1_left, level1_left))
                 self.add("valu", ("vbroadcast", v_level1_right, level1_right))
                 self.add("valu", ("-", v_level1_diff, v_level1_left, v_level1_right))
+            if enable_arith:
+                max_arith = min(self.max_arith_level, forest_height, 4)
+                for level in range(2, max_arith + 1):
+                    level_size = 1 << level
+                    level_start = level_size - 1
+                    level_addr = self.alloc_scratch(f"level{level}_addr")
+                    self.add(
+                        "alu",
+                        (
+                            "+",
+                            level_addr,
+                            self.scratch["forest_values_p"],
+                            self.scratch_const(level_start),
+                        ),
+                    )
+                    v_level_bases = []
+                    v_level_diffs = []
+                    for pair in range(level_size // 2):
+                        even_val = tmp1
+                        odd_val = tmp2
+                        diff_val = tmp3
+                        self.add("load", ("load", even_val, level_addr))
+                        self.add("flow", ("add_imm", level_addr, level_addr, 1))
+                        self.add("load", ("load", odd_val, level_addr))
+                        if pair < (level_size // 2) - 1:
+                            self.add("flow", ("add_imm", level_addr, level_addr, 1))
+                        # base is even-indexed value; diff=odd-even makes bit=1 select odd.
+                        self.add("alu", ("-", diff_val, odd_val, even_val))
+                        v_base = self.alloc_scratch(
+                            f"v_level{level}_base_{2 * pair}", VLEN
+                        )
+                        v_diff = self.alloc_scratch(
+                            f"v_level{level}_diff_{2 * pair}", VLEN
+                        )
+                        self.add("valu", ("vbroadcast", v_base, even_val))
+                        self.add("valu", ("vbroadcast", v_diff, diff_val))
+                        v_level_bases.append(v_base)
+                        v_level_diffs.append(v_diff)
+                    level_arith[level] = {
+                        "level": level,
+                        "start": level_start,
+                        "v_start": self.scratch_vconst(level_start),
+                        "bases": v_level_bases,
+                        "diffs": v_level_diffs,
+                    }
         vec_count = vec_end // VLEN
 
         # Cross-round pipelining for better load utilization
@@ -944,13 +1297,20 @@ class KernelBuilder:
 
             # Round 0: prologue + steady state
             wrap_round_0 = (0 % wrap_period) == forest_height
-            uniform_round_0 = fast_wrap and (0 % wrap_period) == 0
-            binary_round_0 = fast_wrap and (0 % wrap_period) == 1
+            level_0 = 0 % wrap_period
+            uniform_round_0 = fast_wrap and level_0 == 0
+            binary_round_0 = fast_wrap and level_0 == 1
+            arith_round_0 = fast_wrap and level_0 in level_arith
             node_const_0 = v_root_node if uniform_round_0 else None
             node_pair_0 = (
                 (v_level1_right, v_level1_diff) if binary_round_0 and v_level1_diff else None
             )
-            body.extend(vec_block_load_slots(block_0_vecs, 0, node_const_0, node_pair_0))
+            node_arith_0 = level_arith[level_0] if arith_round_0 else None
+            body.extend(
+                vec_block_load_slots(
+                    block_0_vecs, 0, node_const_0, node_pair_0, node_arith_0
+                )
+            )
             for block_idx in range(1, num_blocks):
                 prev_buf = (block_idx - 1) % 2
                 curr_buf = block_idx % 2
@@ -960,9 +1320,10 @@ class KernelBuilder:
                     wrap_round_0,
                     node_const_0,
                     node_pair_0,
+                    node_arith_0,
                 )
                 load_slots = vec_block_load_slots(
-                    all_block_vecs[block_idx], curr_buf, node_const_0, node_pair_0
+                    all_block_vecs[block_idx], curr_buf, node_const_0, node_pair_0, node_arith_0
                 )
                 body.extend(interleave_slots(hash_slots, load_slots))
 
@@ -970,10 +1331,14 @@ class KernelBuilder:
             for round in range(1, rounds):
                 wrap_round_prev = ((round - 1) % wrap_period) == forest_height
                 wrap_round_curr = (round % wrap_period) == forest_height
-                uniform_round_prev = fast_wrap and ((round - 1) % wrap_period) == 0
-                uniform_round_curr = fast_wrap and (round % wrap_period) == 0
-                binary_round_prev = fast_wrap and ((round - 1) % wrap_period) == 1
-                binary_round_curr = fast_wrap and (round % wrap_period) == 1
+                level_prev = (round - 1) % wrap_period
+                level_curr = round % wrap_period
+                uniform_round_prev = fast_wrap and level_prev == 0
+                uniform_round_curr = fast_wrap and level_curr == 0
+                binary_round_prev = fast_wrap and level_prev == 1
+                binary_round_curr = fast_wrap and level_curr == 1
+                arith_round_prev = fast_wrap and level_prev in level_arith
+                arith_round_curr = fast_wrap and level_curr in level_arith
                 node_const_prev = v_root_node if uniform_round_prev else None
                 node_const_curr = v_root_node if uniform_round_curr else None
                 node_pair_prev = (
@@ -986,6 +1351,8 @@ class KernelBuilder:
                     if binary_round_curr and v_level1_diff
                     else None
                 )
+                node_arith_prev = level_arith[level_prev] if arith_round_prev else None
+                node_arith_curr = level_arith[level_curr] if arith_round_curr else None
                 last_buf = last_block_idx % 2
 
                 # Epilogue of prev round + prologue of current
@@ -995,9 +1362,10 @@ class KernelBuilder:
                     wrap_round_prev,
                     node_const_prev,
                     node_pair_prev,
+                    node_arith_prev,
                 )
                 load_slots = vec_block_load_slots(
-                    block_0_vecs, 0, node_const_curr, node_pair_curr
+                    block_0_vecs, 0, node_const_curr, node_pair_curr, node_arith_curr
                 )
                 body.extend(interleave_slots(hash_slots, load_slots))
 
@@ -1011,22 +1379,30 @@ class KernelBuilder:
                         wrap_round_curr,
                         node_const_curr,
                         node_pair_curr,
+                        node_arith_curr,
                     )
                     load_slots = vec_block_load_slots(
-                        all_block_vecs[block_idx], curr_buf, node_const_curr, node_pair_curr
+                        all_block_vecs[block_idx],
+                        curr_buf,
+                        node_const_curr,
+                        node_pair_curr,
+                        node_arith_curr,
                     )
                     body.extend(interleave_slots(hash_slots, load_slots))
 
             # Final epilogue
             wrap_round_last = ((rounds - 1) % wrap_period) == forest_height
-            uniform_round_last = fast_wrap and ((rounds - 1) % wrap_period) == 0
-            binary_round_last = fast_wrap and ((rounds - 1) % wrap_period) == 1
+            level_last = (rounds - 1) % wrap_period
+            uniform_round_last = fast_wrap and level_last == 0
+            binary_round_last = fast_wrap and level_last == 1
+            arith_round_last = fast_wrap and level_last in level_arith
             node_const_last = v_root_node if uniform_round_last else None
             node_pair_last = (
                 (v_level1_right, v_level1_diff)
                 if binary_round_last and v_level1_diff
                 else None
             )
+            node_arith_last = level_arith[level_last] if arith_round_last else None
             last_buf = last_block_idx % 2
             body.extend(
                 vec_block_hash_only_slots(
@@ -1035,6 +1411,7 @@ class KernelBuilder:
                     wrap_round_last,
                     node_const_last,
                     node_pair_last,
+                    node_arith_last,
                 )
             )
 
@@ -1051,8 +1428,14 @@ class KernelBuilder:
                     if binary_round and v_level1_diff
                     else None
                 )
+                arith_round = fast_wrap and level in level_arith
+                node_arith = level_arith[level] if arith_round else None
                 special_round = (
-                    use_special and level <= max_special and not uniform_round and not binary_round
+                    use_special
+                    and level <= max_special
+                    and not uniform_round
+                    and not binary_round
+                    and not arith_round
                 )
                 if vec_count > 0:
                     if special_round:
@@ -1069,7 +1452,11 @@ class KernelBuilder:
                                 [(b * block_size + offset) * VLEN for offset in range(block_size)]
                                 for b in range(num_blocks)
                             ]
-                            body.extend(vec_block_load_slots(block_0_vecs, 0, node_const, node_pair))
+                            body.extend(
+                                vec_block_load_slots(
+                                    block_0_vecs, 0, node_const, node_pair, node_arith
+                                )
+                            )
                             for block_idx in range(1, num_blocks):
                                 prev_buf = (block_idx - 1) % 2
                                 curr_buf = block_idx % 2
@@ -1079,9 +1466,14 @@ class KernelBuilder:
                                     wrap_round,
                                     node_const,
                                     node_pair,
+                                    node_arith,
                                 )
                                 load_slots = vec_block_load_slots(
-                                    all_block_vecs[block_idx], curr_buf, node_const, node_pair
+                                    all_block_vecs[block_idx],
+                                    curr_buf,
+                                    node_const,
+                                    node_pair,
+                                    node_arith,
                                 )
                                 body.extend(interleave_slots(hash_slots, load_slots))
                             last_buf = (num_blocks - 1) % 2
@@ -1092,6 +1484,7 @@ class KernelBuilder:
                                     wrap_round,
                                     node_const,
                                     node_pair,
+                                    node_arith,
                                 )
                             )
                         else:
@@ -1099,13 +1492,24 @@ class KernelBuilder:
                                 block_vecs = [(vec + offset) * VLEN for offset in range(block_size)]
                                 body.extend(
                                     vec_block_hash_slots(
-                                        block_vecs, round, wrap_round, node_const, node_pair
+                                        block_vecs,
+                                        round,
+                                        wrap_round,
+                                        node_const,
+                                        node_pair,
+                                        node_arith,
                                     )
                                 )
                         if block_limit < vec_count:
                             start_vec = block_limit
                             body.extend(
-                                vec_load_slots(start_vec * VLEN, start_vec % 2, node_const, node_pair)
+                                vec_load_slots(
+                                    start_vec * VLEN,
+                                    start_vec % 2,
+                                    node_const,
+                                    node_pair,
+                                    node_arith,
+                                )
                             )
                             for vec in range(start_vec + 1, vec_count):
                                 prev = vec - 1
@@ -1116,8 +1520,15 @@ class KernelBuilder:
                                     wrap_round,
                                     node_const,
                                     node_pair,
+                                    node_arith,
                                 )
-                                load_slots = vec_load_slots(vec * VLEN, vec % 2, node_const, node_pair)
+                                load_slots = vec_load_slots(
+                                    vec * VLEN,
+                                    vec % 2,
+                                    node_const,
+                                    node_pair,
+                                    node_arith,
+                                )
                                 body.extend(interleave_slots(hash_slots, load_slots))
                             last_vec = vec_count - 1
                             body.extend(
@@ -1128,10 +1539,13 @@ class KernelBuilder:
                                     wrap_round,
                                     node_const,
                                     node_pair,
+                                    node_arith,
                                 )
                             )
                     else:
-                        body.extend(vec_load_slots(0, 0, node_const, node_pair))
+                        body.extend(
+                            vec_load_slots(0, 0, node_const, node_pair, node_arith)
+                        )
                         for vec in range(1, vec_count):
                             prev = vec - 1
                             hash_slots = vec_hash_slots(
@@ -1141,8 +1555,15 @@ class KernelBuilder:
                                 wrap_round,
                                 node_const,
                                 node_pair,
+                                node_arith,
                             )
-                            load_slots = vec_load_slots(vec * VLEN, vec % 2, node_const, node_pair)
+                            load_slots = vec_load_slots(
+                                vec * VLEN,
+                                vec % 2,
+                                node_const,
+                                node_pair,
+                                node_arith,
+                            )
                             body.extend(interleave_slots(hash_slots, load_slots))
                         last_vec = vec_count - 1
                         body.extend(
@@ -1153,6 +1574,7 @@ class KernelBuilder:
                                 wrap_round,
                                 node_const,
                                 node_pair,
+                                node_arith,
                             )
                         )
 
@@ -1256,6 +1678,7 @@ def do_kernel_test(
     enable_debug: bool | None = None,
     assume_zero_indices: bool | None = None,
     max_special_level: int | None = None,
+    max_arith_level: int | None = None,
 ):
     print(f"{forest_height=}, {rounds=}, {batch_size=}")
     random.seed(seed)
@@ -1269,10 +1692,13 @@ def do_kernel_test(
         assume_zero_indices = True
     if max_special_level is None:
         max_special_level = -1
+    if max_arith_level is None:
+        max_arith_level = -1
     kb = KernelBuilder(
         enable_debug=enable_debug,
         assume_zero_indices=assume_zero_indices,
         max_special_level=max_special_level,
+        max_arith_level=max_arith_level,
     )
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
     # print(kb.instrs)
