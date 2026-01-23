@@ -400,6 +400,12 @@ class KernelBuilder:
             self.scratch_vconst(val1)
             self.scratch_vconst(val3)
 
+        block_size = SLOT_LIMITS["valu"]
+        v_node_block = self.alloc_scratch("v_node_block", block_size * VLEN)
+        v_tmp1_block = self.alloc_scratch("v_tmp1_block", block_size * VLEN)
+        v_tmp2_block = self.alloc_scratch("v_tmp2_block", block_size * VLEN)
+        v_tmp3_block = self.alloc_scratch("v_tmp3_block", block_size * VLEN)
+
         max_special = min(self.max_special_level, forest_height)
         use_special = self.assume_zero_indices and max_special >= 0
         level_vec_base = []
@@ -612,6 +618,109 @@ class KernelBuilder:
             slots.append(("valu", ("+", v_node_buf, current_base, v_zero)))
             return slots
 
+        def vec_block_hash_slots(block_vecs, round_idx, wrap_round):
+            slots = []
+            # Gather node values into block scratch.
+            for bi, vec_i in enumerate(block_vecs):
+                v_idx = idx_cache + vec_i
+                slots.append(("valu", ("+", v_addr[0], v_idx, v_forest_p)))
+                for lane in range(VLEN):
+                    slots.append(
+                        (
+                            "load",
+                            (
+                                "load_offset",
+                                v_node_block + bi * VLEN,
+                                v_addr[0],
+                                lane,
+                            ),
+                        )
+                    )
+            # XOR with node values.
+            for bi, vec_i in enumerate(block_vecs):
+                v_val = val_cache + vec_i
+                slots.append(
+                    ("valu", ("^", v_val, v_val, v_node_block + bi * VLEN))
+                )
+            # Hash stages interleaved across the block.
+            for op1, val1, op2, op3, val3 in HASH_STAGES:
+                if op1 == "+" and op2 == "+" and op3 == "<<":
+                    factor = 1 + (1 << val3)
+                    v_factor = self.scratch_vconst(factor)
+                    v_val1 = self.scratch_vconst(val1)
+                    for bi, vec_i in enumerate(block_vecs):
+                        v_val = val_cache + vec_i
+                        slots.append(
+                            ("valu", ("multiply_add", v_val, v_val, v_factor, v_val1))
+                        )
+                else:
+                    v_val1 = self.scratch_vconst(val1)
+                    v_val3 = self.scratch_vconst(val3)
+                    for bi, vec_i in enumerate(block_vecs):
+                        v_val = val_cache + vec_i
+                        slots.append(
+                            (
+                                "valu",
+                                (op1, v_tmp1_block + bi * VLEN, v_val, v_val1),
+                            )
+                        )
+                    for bi, vec_i in enumerate(block_vecs):
+                        v_val = val_cache + vec_i
+                        slots.append(
+                            (
+                                "valu",
+                                (op3, v_tmp2_block + bi * VLEN, v_val, v_val3),
+                            )
+                        )
+                    for bi, vec_i in enumerate(block_vecs):
+                        v_val = val_cache + vec_i
+                        slots.append(
+                            (
+                                "valu",
+                                (op2, v_val, v_tmp1_block + bi * VLEN, v_tmp2_block + bi * VLEN),
+                            )
+                        )
+            # Index update.
+            if fast_wrap and wrap_round:
+                for _bi, vec_i in enumerate(block_vecs):
+                    v_idx = idx_cache + vec_i
+                    slots.append(("valu", ("+", v_idx, v_zero, v_zero)))
+            else:
+                for bi, vec_i in enumerate(block_vecs):
+                    v_val = val_cache + vec_i
+                    slots.append(
+                        ("valu", ("&", v_tmp3_block + bi * VLEN, v_val, v_one))
+                    )
+                for bi, _vec_i in enumerate(block_vecs):
+                    slots.append(
+                        (
+                            "valu",
+                            ("+", v_tmp3_block + bi * VLEN, v_tmp3_block + bi * VLEN, v_one),
+                        )
+                    )
+                for bi, vec_i in enumerate(block_vecs):
+                    v_idx = idx_cache + vec_i
+                    slots.append(("valu", ("+", v_idx, v_idx, v_idx)))
+                    slots.append(
+                        (
+                            "valu",
+                            ("+", v_idx, v_idx, v_tmp3_block + bi * VLEN),
+                        )
+                    )
+                if not fast_wrap:
+                    for bi, vec_i in enumerate(block_vecs):
+                        v_idx = idx_cache + vec_i
+                        slots.append(
+                            ("valu", ("<", v_tmp1_block + bi * VLEN, v_idx, v_n_nodes))
+                        )
+                        slots.append(
+                            (
+                                "flow",
+                                ("vselect", v_idx, v_tmp1_block + bi * VLEN, v_idx, v_zero),
+                            )
+                        )
+            return slots
+
         # Pause instructions are matched up with yield statements in the reference
         # kernel to let you debug at intermediate steps. The testing harness in this
         # file requires these match up to the reference kernel's yields, but the
@@ -642,20 +751,48 @@ class KernelBuilder:
                         body.extend(vec_special_slots(vec * VLEN, buf, level))
                         body.extend(vec_hash_slots(vec * VLEN, buf, round, wrap_round))
                 else:
-                    # Prologue: load vector 0
-                    body.extend(vec_load_slots(0, 0))
-                    for vec in range(1, vec_count):
-                        prev = vec - 1
-                        hash_slots = vec_hash_slots(
-                            prev * VLEN, prev % 2, round, wrap_round
+                    if not self.enable_debug and vec_count >= block_size:
+                        block_limit = vec_count - (vec_count % block_size)
+                        for vec in range(0, block_limit, block_size):
+                            block_vecs = [
+                                (vec + offset) * VLEN for offset in range(block_size)
+                            ]
+                            body.extend(
+                                vec_block_hash_slots(block_vecs, round, wrap_round)
+                            )
+                        if block_limit < vec_count:
+                            start_vec = block_limit
+                            body.extend(vec_load_slots(start_vec * VLEN, start_vec % 2))
+                            for vec in range(start_vec + 1, vec_count):
+                                prev = vec - 1
+                                hash_slots = vec_hash_slots(
+                                    prev * VLEN, prev % 2, round, wrap_round
+                                )
+                                load_slots = vec_load_slots(vec * VLEN, vec % 2)
+                                body.extend(interleave_slots(hash_slots, load_slots))
+                            last_vec = vec_count - 1
+                            body.extend(
+                                vec_hash_slots(
+                                    last_vec * VLEN, last_vec % 2, round, wrap_round
+                                )
+                            )
+                    else:
+                        # Prologue: load vector 0
+                        body.extend(vec_load_slots(0, 0))
+                        for vec in range(1, vec_count):
+                            prev = vec - 1
+                            hash_slots = vec_hash_slots(
+                                prev * VLEN, prev % 2, round, wrap_round
+                            )
+                            load_slots = vec_load_slots(vec * VLEN, vec % 2)
+                            body.extend(interleave_slots(hash_slots, load_slots))
+                        # Epilogue: hash last vector
+                        last_vec = vec_count - 1
+                        body.extend(
+                            vec_hash_slots(
+                                last_vec * VLEN, last_vec % 2, round, wrap_round
+                            )
                         )
-                        load_slots = vec_load_slots(vec * VLEN, vec % 2)
-                        body.extend(interleave_slots(hash_slots, load_slots))
-                    # Epilogue: hash last vector
-                    last_vec = vec_count - 1
-                    body.extend(
-                        vec_hash_slots(last_vec * VLEN, last_vec % 2, round, wrap_round)
-                    )
 
             for i in range(vec_end, batch_size):
                 idx_addr = idx_cache + i
