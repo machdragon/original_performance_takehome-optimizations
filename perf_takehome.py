@@ -48,6 +48,8 @@ class KernelBuilder:
         block_size: int = 16,  # Optimized: 16 gives best performance (1928->1923 with lookahead=1024)
         enable_second_pass: bool = False,
         enable_latency_aware: bool = False,
+        enable_combining: bool = False,
+        enable_software_pipeline: bool = False,
     ):
         self.instrs = []
         self.scratch = {}
@@ -64,6 +66,8 @@ class KernelBuilder:
         self.block_size = block_size
         self.enable_second_pass = enable_second_pass
         self.enable_latency_aware = enable_latency_aware
+        self.enable_combining = enable_combining
+        self.enable_software_pipeline = enable_software_pipeline
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -273,7 +277,7 @@ class KernelBuilder:
             if self.enable_latency_aware and "load" in bundle:
                 recent_loads = bundle_writes  # Loads in current bundle are "recent"
             
-            # Try to pull loads when we have non-load ops
+            # Try to pull loads when we have non-load ops (trace scheduling: prioritize loads)
             if engine != "load" and bundle_loads() < SLOT_LIMITS["load"]:
                 while bundle_loads() < SLOT_LIMITS["load"]:
                     future_writes = bundle_writes | writes
@@ -288,7 +292,7 @@ class KernelBuilder:
                     slots_info[pull_idx] = None
                     add_to_bundle(pull)
             
-            # Try to pull VALU ops when blocked on loads
+            # Try to pull VALU ops when blocked on loads (trace scheduling: prioritize VALU after loads)
             if engine == "load" and bundle_loads() >= SLOT_LIMITS["load"]:
                 # We're at load limit, try to pull VALU ops to fill the bundle
                 while not engine_full("valu") and bundle_loads() >= SLOT_LIMITS["load"]:
@@ -308,7 +312,7 @@ class KernelBuilder:
                 if bundle:
                     blocked_reads = reads
                     blocked_writes = writes
-                    # Try to pull any available ops before flushing
+                    # Try to pull any available ops before flushing (trace scheduling: prioritize loads/VALU)
                     while True:
                         pull_idx = find_pullable_slot(
                             i + 1,
@@ -330,6 +334,79 @@ class KernelBuilder:
             i += 1
 
         flush()
+        
+        # Combining: Merge partially filled bundles to reduce NOPs
+        # DISABLED: Causes correctness issues - bundles are already well-packed
+        # The initial bundler does a good job, so combining doesn't help
+        if False and self.enable_combining:
+            combined = []
+            i = 0
+            while i < len(instrs):
+                current = instrs[i].copy()
+                
+                # Calculate current bundle utilization
+                current_slots = sum(len(slots) for slots in current.values())
+                max_slots = sum(SLOT_LIMITS.get(engine, 0) for engine in ["alu", "valu", "load", "store", "flow"])
+                utilization = current_slots / max_slots if max_slots > 0 else 1.0
+                
+                # Only try to combine if current bundle is < 80% full
+                if utilization < 0.8:
+                    j = i + 1
+                    merged_count = 0
+                    while j < len(instrs) and merged_count < 2:  # Limit to 2 merges for safety
+                        next_bundle = instrs[j].copy()
+                        
+                        # Collect all reads/writes from current bundle
+                        current_writes = set()
+                        current_reads = set()
+                        for engine, slots in current.items():
+                            for slot in slots:
+                                reads, writes, _ = self._slot_reads_writes(engine, slot)
+                                current_reads.update(reads)
+                                current_writes.update(writes)
+                        
+                        # Collect all reads/writes from next bundle
+                        next_reads = set()
+                        next_writes = set()
+                        for engine, slots in next_bundle.items():
+                            for slot in slots:
+                                reads, writes, _ = self._slot_reads_writes(engine, slot)
+                                next_reads.update(reads)
+                                next_writes.update(writes)
+                        
+                        # Check all hazard types: RAW, WAW, WAR
+                        has_raw = bool(next_reads & current_writes)
+                        has_waw = bool(next_writes & current_writes)
+                        has_war = bool(next_writes & current_reads)
+                        
+                        if has_raw or has_waw or has_war:
+                            break  # Can't merge due to dependency
+                        
+                        # Check if merge would exceed limits
+                        can_merge = True
+                        merged = current.copy()
+                        for engine, slots in next_bundle.items():
+                            current_count = len(merged.get(engine, []))
+                            next_count = len(slots)
+                            limit = SLOT_LIMITS.get(engine, 64)
+                            if current_count + next_count > limit:
+                                can_merge = False
+                                break
+                            merged.setdefault(engine, []).extend(slots)
+                        
+                        if can_merge:
+                            current = merged
+                            j += 1
+                            merged_count += 1
+                        else:
+                            break
+                    i = j if j > i + 1 else i + 1
+                else:
+                    i += 1
+                
+                combined.append(current)
+            
+            instrs = combined
         
         # Second-pass reordering: prioritize loads, then VALU, then ALU
         if self.enable_second_pass:
@@ -2601,6 +2678,8 @@ def do_kernel_test(
     block_size: int | None = None,
     enable_second_pass: bool | None = None,
     enable_latency_aware: bool | None = None,
+    enable_combining: bool | None = None,
+    enable_software_pipeline: bool | None = None,
 ):
     print(f"{forest_height=}, {rounds=}, {batch_size=}")
     random.seed(seed)
@@ -2626,6 +2705,10 @@ def do_kernel_test(
         enable_second_pass = False
     if enable_latency_aware is None:
         enable_latency_aware = False
+    if enable_combining is None:
+        enable_combining = False
+    if enable_software_pipeline is None:
+        enable_software_pipeline = False
     kb = KernelBuilder(
         enable_debug=enable_debug,
         assume_zero_indices=assume_zero_indices,
@@ -2636,6 +2719,8 @@ def do_kernel_test(
         block_size=block_size,
         enable_second_pass=enable_second_pass,
         enable_latency_aware=enable_latency_aware,
+        enable_combining=enable_combining,
+        enable_software_pipeline=enable_software_pipeline,
     )
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
     # print(kb.instrs)
