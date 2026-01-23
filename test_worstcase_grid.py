@@ -46,9 +46,15 @@ def main():
     block_sizes = parse_ranges(args.block_sizes)
     lookaheads = parse_ranges(args.lookaheads)
 
+    if not rounds:
+        parser.error(f"Invalid rounds range: '{args.rounds}' results in empty list (did you use an inverted range like '10-5'?)")
+
     print("Worst-case grid search settings:")
     print(f"  heights: {heights}")
-    print(f"  rounds: {rounds[0]}..{rounds[-1]} ({len(rounds)} values)")
+    if rounds:
+        print(f"  rounds: {rounds[0]}..{rounds[-1]} ({len(rounds)} values)")
+    else:
+        print(f"  rounds: (empty)")
     print(f"  batches: {batches}")
     print(f"  block_sizes: {block_sizes}")
     print(f"  lookaheads: {lookaheads}")
