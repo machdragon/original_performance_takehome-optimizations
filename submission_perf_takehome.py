@@ -25,7 +25,8 @@ class KernelBuilder:
         assume_zero_indices: bool = True,
         max_special_level: int = -1,
         max_arith_level: int = -1,
-        enable_prefetch: bool = False,
+        enable_prefetch: bool = True,
+        enable_level2_where: bool = True,
         lookahead: int = 1024,
         block_size: int = 16,
         enable_second_pass: bool = False,
@@ -44,6 +45,7 @@ class KernelBuilder:
         self.max_special_level = max_special_level
         self.max_arith_level = max_arith_level
         self.enable_prefetch = enable_prefetch
+        self.enable_level2_where = enable_level2_where
         self.lookahead = lookahead
         self.block_size = block_size
         self.enable_second_pass = enable_second_pass
@@ -759,7 +761,7 @@ class KernelBuilder:
 
     def build_kernel_10_16_256(self, n_nodes: int, write_indices: bool = True):
 
-        return self.build_kernel_general(10, n_nodes, 256, 16, write_indices)
+        return self.build_kernel_general(10, n_nodes, 256, 16, False)
 
     def build_kernel_general(
         self,
@@ -819,19 +821,43 @@ class KernelBuilder:
                 self.add("flow", ("add_imm", idx_load_ptr, idx_load_ptr, 1))
             self.add("flow", ("add_imm", val_load_ptr, val_load_ptr, 1))
 
+        vec_count = vec_end // VLEN
+        block_size = self.block_size
+        block_limit = vec_count - (vec_count % block_size)
+        num_blocks = block_limit // block_size
+        max_special = min(self.max_special_level, forest_height)
+        use_special = self.assume_zero_indices and max_special >= 0
+        use_cross_round = (
+            not self.enable_debug
+            and vec_count >= block_size
+            and num_blocks >= 2
+            and not use_special
+            and block_limit == vec_count
+        )
+
         enable_arith = self.max_arith_level >= 2
 
-        v_node_val = [
-            self.alloc_scratch("v_node_val_0", VLEN),
-            self.alloc_scratch("v_node_val_1", VLEN),
-        ]
-        v_addr = [
-            self.alloc_scratch("v_addr_0", VLEN),
-            self.alloc_scratch("v_addr_1", VLEN),
-        ]
+        v_node_val_0 = self.alloc_scratch("v_node_val_0", VLEN)
+        v_addr_0 = self.alloc_scratch("v_addr_0", VLEN)
+        if use_cross_round:
+            v_node_val = [v_node_val_0, v_node_val_0]
+            v_addr = [v_addr_0, v_addr_0]
+        else:
+            v_node_val = [
+                v_node_val_0,
+                self.alloc_scratch("v_node_val_1", VLEN),
+            ]
+            v_addr = [
+                v_addr_0,
+                self.alloc_scratch("v_addr_1", VLEN),
+            ]
         v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
-        v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
-        v_tmp3 = self.alloc_scratch("v_tmp3", VLEN)
+        if use_cross_round:
+            v_tmp2 = v_tmp1
+            v_tmp3 = v_tmp1
+        else:
+            v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
+            v_tmp3 = self.alloc_scratch("v_tmp3", VLEN)
         v_tmp4 = None
         if enable_arith:
             v_tmp4 = self.alloc_scratch("v_tmp4", VLEN)
@@ -854,8 +880,6 @@ class KernelBuilder:
             self.scratch_vconst(val1)
             self.scratch_vconst(val3)
 
-        block_size = self.block_size
-
         v_node_block = [
             self.alloc_scratch("v_node_block_A", block_size * VLEN),
             self.alloc_scratch("v_node_block_B", block_size * VLEN),
@@ -867,16 +891,13 @@ class KernelBuilder:
         if enable_arith:
             v_tmp4_block = self.alloc_scratch("v_tmp4_block", block_size * VLEN)
 
+        enable_level2_where = self.enable_level2_where
         level2_base_addr_const = self.scratch_const(3)
         level2_vecs_base = v_node_block[0]
         level2_tree_tmp_base = None
-        level2_addr_temp = v_addr[0]
+        level2_addr_temp = tmp1
+        level2_scalars_base = v_tmp1
 
-        level2_scalars_list = [v_tmp1, v_tmp2, v_tmp3, v_tmp3]
-        level2_scalars_temp = None
-
-        max_special = min(self.max_special_level, forest_height)
-        use_special = self.assume_zero_indices and max_special >= 0
         level_vec_base = []
         level_sizes = []
         level_starts = []
@@ -1345,6 +1366,31 @@ class KernelBuilder:
                     )
             return slots
 
+        def level2_prepare_slots():
+            if not (enable_level2_where and enable_prefetch):
+                return []
+            slots = []
+            slots.append(
+                (
+                    "alu",
+                    (
+                        "+",
+                        level2_addr_temp,
+                        self.scratch["forest_values_p"],
+                        level2_base_addr_const,
+                    ),
+                )
+            )
+            for i in range(4):
+                slots.append(("load", ("load", level2_scalars_base + i, level2_addr_temp)))
+                if i < 3:
+                    slots.append(("flow", ("add_imm", level2_addr_temp, level2_addr_temp, 1)))
+            for i in range(4):
+                slots.append(
+                    ("valu", ("vbroadcast", level2_vecs_base + i * VLEN, level2_scalars_base + i))
+                )
+            return slots
+
         def emit_level_select_block_slots(block_vecs, buf_idx, node_arith):
             level = node_arith["level"]
             v_start = node_arith["v_start"]
@@ -1492,38 +1538,86 @@ class KernelBuilder:
             node_pair=None,
             node_arith=None,
             node_prefetch=None,
+            level2_round=False,
         ):
             slots = []
             node_buf = v_node_block[buf_idx]
 
-            if node_const is not None:
+            if level2_round:
+                node0 = level2_vecs_base
+                node1 = level2_vecs_base + VLEN
+                node2 = level2_vecs_base + 2 * VLEN
+                node3 = level2_vecs_base + 3 * VLEN
+                v_level_start = self.scratch_vconst(3)
+                for bi, vec_i in enumerate(block_vecs):
+                    v_idx = idx_cache + vec_i
+                    v_val = val_cache + vec_i
+                    v_offset = v_tmp1_block + bi * VLEN
+                    v_go_left1 = v_tmp2_block + bi * VLEN
+                    v_left = v_tmp3_block + bi * VLEN
+                    slots.append(("valu", ("-", v_offset, v_idx, v_level_start)))
+                    slots.append(("valu", ("<", v_go_left1, v_offset, v_two)))
+                    slots.append(("valu", ("<", v_left, v_offset, v_one)))
+                    slots.append(("flow", ("vselect", v_left, v_left, node0, node1)))
+                    slots.append(("valu", ("-", v_offset, v_offset, v_two)))
+                    slots.append(("valu", ("<", v_offset, v_offset, v_one)))
+                    slots.append(("flow", ("vselect", v_offset, v_offset, node2, node3)))
+                    slots.append(("flow", ("vselect", v_offset, v_go_left1, v_left, v_offset)))
+                    slots.append(("valu", ("^", v_val, v_val, v_offset)))
+            elif node_const is not None:
                 for _bi, vec_i in enumerate(block_vecs):
                     v_val = val_cache + vec_i
                     slots.append(("valu", ("^", v_val, v_val, node_const)))
             elif node_pair is not None:
-                node_right, node_diff = node_pair
-                for bi, vec_i in enumerate(block_vecs):
-                    v_idx = idx_cache + vec_i
-                    slots.append(
-                        ("valu", ("&", v_tmp1_block + bi * VLEN, v_idx, v_one))
-                    )
-                    slots.append(
-                        (
-                            "valu",
-                            (
-                                "multiply_add",
-                                v_tmp3_block + bi * VLEN,
-                                v_tmp1_block + bi * VLEN,
-                                node_diff,
-                                node_right,
-                            ),
+                if self.enable_level2_where and v_level1_left is not None:
+                    node_right, _node_diff = node_pair
+                    for bi, vec_i in enumerate(block_vecs):
+                        v_idx = idx_cache + vec_i
+                        slots.append(
+                            ("valu", ("&", v_tmp1_block + bi * VLEN, v_idx, v_one))
                         )
-                    )
-                for bi, vec_i in enumerate(block_vecs):
-                    v_val = val_cache + vec_i
-                    slots.append(
-                        ("valu", ("^", v_val, v_val, v_tmp3_block + bi * VLEN))
-                    )
+                    for bi, _vec_i in enumerate(block_vecs):
+                        slots.append(
+                            (
+                                "flow",
+                                (
+                                    "vselect",
+                                    v_tmp3_block + bi * VLEN,
+                                    v_tmp1_block + bi * VLEN,
+                                    v_level1_left,
+                                    node_right,
+                                ),
+                            )
+                        )
+                    for bi, vec_i in enumerate(block_vecs):
+                        v_val = val_cache + vec_i
+                        slots.append(
+                            ("valu", ("^", v_val, v_val, v_tmp3_block + bi * VLEN))
+                        )
+                else:
+                    node_right, node_diff = node_pair
+                    for bi, vec_i in enumerate(block_vecs):
+                        v_idx = idx_cache + vec_i
+                        slots.append(
+                            ("valu", ("&", v_tmp1_block + bi * VLEN, v_idx, v_one))
+                        )
+                        slots.append(
+                            (
+                                "valu",
+                                (
+                                    "multiply_add",
+                                    v_tmp3_block + bi * VLEN,
+                                    v_tmp1_block + bi * VLEN,
+                                    node_diff,
+                                    node_right,
+                                ),
+                            )
+                        )
+                    for bi, vec_i in enumerate(block_vecs):
+                        v_val = val_cache + vec_i
+                        slots.append(
+                            ("valu", ("^", v_val, v_val, v_tmp3_block + bi * VLEN))
+                        )
             elif node_prefetch is not None:
                 for _bi, vec_i in enumerate(block_vecs):
                     v_val = val_cache + vec_i
@@ -1747,24 +1841,18 @@ class KernelBuilder:
                         "bases": v_level_bases,
                         "diffs": v_level_diffs,
                     }
-        vec_count = vec_end // VLEN
-
-        block_limit = vec_count - (vec_count % block_size)
-        num_blocks = block_limit // block_size
-        use_cross_round = (
-            not self.enable_debug
-            and vec_count >= block_size
-            and num_blocks >= 2
-            and not use_special
-            and block_limit == vec_count
-        )
         v_node_prefetch = None
 
         enable_prefetch = (
-            self.enable_prefetch and enable_arith and rounds > 1 and use_cross_round
+            self.enable_prefetch
+            and rounds > 1
+            and use_cross_round
+            and (enable_arith or enable_level2_where)
         )
         if enable_prefetch:
-            v_node_prefetch = self.alloc_scratch("v_node_prefetch", vec_count * VLEN)
+            v_node_prefetch = self.alloc_scratch(
+                "v_node_prefetch", block_size * VLEN
+            )
 
         round_info = []
         prefetch_active = [False] * rounds
@@ -1782,7 +1870,9 @@ class KernelBuilder:
                     else None
                 )
                 node_arith = level_arith[level] if arith_round else None
-                level2_round = fast_wrap and level == 2
+                level2_round = (
+                    fast_wrap and enable_level2_where and enable_prefetch and level == 2
+                )
                 round_info.append(
                     {
                         "round": round,
@@ -1802,11 +1892,10 @@ class KernelBuilder:
                     }
                 )
             if v_node_prefetch is not None:
-
                 for round in range(rounds - 1):
                     info = round_info[round]
                     next_info = round_info[round + 1]
-                    if info["arith_round"] and next_info["load_needed"]:
+                    if (info["arith_round"] or info["level2_round"]) and next_info["load_needed"]:
                         prefetch_next[round] = True
                         prefetch_active[round + 1] = True
 
@@ -1832,7 +1921,11 @@ class KernelBuilder:
                 do_prefetch_next = prefetch_next[round]
                 node_prefetch = v_node_prefetch if use_prefetch else None
 
-                special_round = info["arith_round"] and enable_prefetch
+                special_round = enable_prefetch and (
+                    info["arith_round"] or info["level2_round"]
+                )
+                level2_prep = level2_prepare_slots() if info["level2_round"] else []
+                level2_prepared = False
 
                 if pending_prev:
                     last_buf = last_block_idx % 2
@@ -1845,8 +1938,12 @@ class KernelBuilder:
                         prev_info["node_pair"],
                         prev_info["node_arith"],
                         prev_node_prefetch,
+                        prev_info["level2_round"],
                     )
-                    if special_round:
+                    if info["level2_round"]:
+                        body.extend(interleave_slots(hash_prev, level2_prep))
+                        level2_prepared = True
+                    elif special_round:
                         body.extend(hash_prev)
                     else:
                         load_slots = vec_block_load_slots(
@@ -1861,6 +1958,10 @@ class KernelBuilder:
                         )
                         body.extend(interleave_slots(hash_prev, load_slots))
 
+                if info["level2_round"] and not level2_prepared:
+                    body.extend(level2_prep)
+                    level2_prepared = True
+
                 if special_round:
                     body.extend(
                         vec_block_hash_only_slots(
@@ -1871,6 +1972,7 @@ class KernelBuilder:
                             info["node_pair"],
                             info["node_arith"],
                             node_prefetch,
+                            info["level2_round"],
                         )
                     )
                     for block_idx in range(1, num_blocks):
@@ -1884,6 +1986,7 @@ class KernelBuilder:
                             info["node_pair"],
                             info["node_arith"],
                             node_prefetch,
+                            info["level2_round"],
                         )
 
                         load_slots = []
@@ -1905,6 +2008,7 @@ class KernelBuilder:
                             info["node_pair"],
                             info["node_arith"],
                             node_prefetch,
+                            info["level2_round"],
                         )
                         load_slots = vec_block_load_slots(
                             all_block_vecs[1],
@@ -1936,6 +2040,8 @@ class KernelBuilder:
                             info["node_const"],
                             info["node_pair"],
                             info["node_arith"],
+                            None,
+                            info["level2_round"],
                         )
                         load_slots = vec_block_load_slots(
                             all_block_vecs[block_idx],
@@ -1963,6 +2069,7 @@ class KernelBuilder:
                         prev_info["node_pair"],
                         prev_info["node_arith"],
                         node_prefetch,
+                        prev_info["level2_round"],
                     )
                 )
 
