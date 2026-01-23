@@ -477,6 +477,46 @@ class KernelBuilder:
                 l_i += 1
         return combined
 
+    def build_vselect_tree_level2_unrolled(
+        self, all_level_vecs, relative_idx_vec, temp_base, round, vec
+    ):
+        """
+        Non-recursive unrolled where-tree for level 2 (4 nodes).
+        Layer 1: Select between pairs (0-1 vs 2-3)
+        Layer 2: Select within chosen pair
+        """
+        slots = []
+        # Layer 1: Select between first pair (nodes 0-1) and second pair (nodes 2-3)
+        v_mid1 = self.scratch_vconst(2)
+        go_left1 = self.alloc_scratch(f"go_left1_{vec}", VLEN)
+        slots.append(("valu", ("<", go_left1, relative_idx_vec, v_mid1)))
+        
+        # Select within left pair (nodes 0-1)
+        v_one = self.scratch_vconst(1)
+        go_left2_left = self.alloc_scratch(f"go_left2_left_{vec}", VLEN)
+        slots.append(("valu", ("<", go_left2_left, relative_idx_vec, v_one)))
+        node0 = all_level_vecs  # node 0
+        node1 = all_level_vecs + VLEN  # node 1
+        out_left = temp_base
+        slots.append(("flow", ("vselect", out_left, go_left2_left, node0, node1)))
+        
+        # Select within right pair (nodes 2-3)
+        rel_idx_right = self.alloc_scratch(f"rel_idx_right_{vec}", VLEN)
+        v_two = self.scratch_vconst(2)
+        slots.append(("valu", ("-", rel_idx_right, relative_idx_vec, v_two)))
+        go_left2_right = self.alloc_scratch(f"go_left2_right_{vec}", VLEN)
+        slots.append(("valu", ("<", go_left2_right, rel_idx_right, v_one)))
+        node2 = all_level_vecs + 2 * VLEN  # node 2
+        node3 = all_level_vecs + 3 * VLEN  # node 3
+        out_right = temp_base + VLEN
+        slots.append(("flow", ("vselect", out_right, go_left2_right, node2, node3)))
+        
+        # Final select between left and right pairs
+        final_out = temp_base + 2 * VLEN
+        slots.append(("flow", ("vselect", final_out, go_left1, out_left, out_right)))
+        
+        return final_out, slots
+
     def _vec_block_load_slots_specialized(
         self, block_vecs, buf_idx, info, v_root_node, v_level1_right, v_level1_diff,
         idx_cache, v_forest_p, v_addr, v_node_block
@@ -492,7 +532,7 @@ class KernelBuilder:
             # Level-1 pair - no loads needed
             return slots
         
-        # Regular load path for all other levels (where-tree optimization deferred to save scratch)
+        # Regular load path for all levels (where-tree deferred to after unrolling)
         for bi, vec_i in enumerate(block_vecs):
             v_idx = idx_cache + vec_i
             slots.append(("valu", ("+", v_addr[0], v_idx, v_forest_p)))
@@ -709,6 +749,11 @@ class KernelBuilder:
         self.add("valu", ("vbroadcast", v_level1_right, level1_right))
         self.add("valu", ("-", v_level1_diff, v_level1_left, v_level1_right))
 
+        # Level 2 where-tree optimization deferred due to scratch constraints
+        # Will integrate after unrolling optimizations
+        level2_vecs = None
+        level2_tree_tmp = None
+
         # Precompute round info statically
         round_info = []
         for round in range(rounds):
@@ -743,60 +788,232 @@ class KernelBuilder:
         ]
         last_block_vecs = all_block_vecs[num_blocks - 1]
 
-        pending_prev = False
-        prev_info = None
-
-        # Cross-round pipelining loop - will be unrolled in Phase 5
-        for round in range(rounds):
-            info = round_info[round]
+        # Helper to emit a single round's processing with unrolled blocks
+        def emit_round(round_num, level, wrap_round, uniform_round, binary_round):
+            info = {
+                "round": round_num,
+                "level": level,
+                "wrap_round": wrap_round,
+                "uniform_round": uniform_round,
+                "binary_round": binary_round,
+                "level2_round": False,
+                "level3_round": False,
+                "level4_round": False,
+            }
+            round_body = []
             
-            if pending_prev:
-                last_buf = (num_blocks - 1) % 2
-                # Hash previous round's last block
-                body.extend(self._vec_block_hash_only_slots_specialized(
-                    last_block_vecs, last_buf, prev_info["wrap_round"],
-                    prev_info, v_root_node, v_level1_right, v_level1_diff,
-                    idx_cache, val_cache, v_tmp1_block, v_tmp2_block, v_tmp3_block,
-                    v_zero, v_one, v_two, v_n_nodes, v_node_block
-                ))
-                pending_prev = False
-
             # Load block 0
-            body.extend(self._vec_block_load_slots_specialized(
+            round_body.extend(self._vec_block_load_slots_specialized(
                 block_0_vecs, 0, info, v_root_node, v_level1_right, v_level1_diff,
                 idx_cache, v_forest_p, v_addr, v_node_block
             ))
 
-            # Process blocks 1-3 with pipelining
-            for block_idx in range(1, num_blocks):
-                prev_buf = (block_idx - 1) % 2
-                curr_buf = block_idx % 2
-                # Hash previous block
-                hash_slots = self._vec_block_hash_only_slots_specialized(
-                    all_block_vecs[block_idx - 1], prev_buf, info["wrap_round"],
-                    info, v_root_node, v_level1_right, v_level1_diff,
-                    idx_cache, val_cache, v_tmp1_block, v_tmp2_block, v_tmp3_block,
-                    v_zero, v_one, v_two, v_n_nodes, v_node_block
-                )
-                # Load current block
-                load_slots = self._vec_block_load_slots_specialized(
-                    all_block_vecs[block_idx], curr_buf, info, v_root_node, v_level1_right, v_level1_diff,
-                    idx_cache, v_forest_p, v_addr, v_node_block
-                )
-                body.extend(self._interleave_slots(hash_slots, load_slots))
-            
-            pending_prev = True
-            prev_info = info
-
-        # Epilogue: hash last block
-        if pending_prev:
-            last_buf = (num_blocks - 1) % 2
-            body.extend(self._vec_block_hash_only_slots_specialized(
-                last_block_vecs, last_buf, prev_info["wrap_round"],
-                prev_info, v_root_node, v_level1_right, v_level1_diff,
+            # Unroll blocks 1-3 (num_blocks=4, so blocks 0,1,2,3)
+            # Block 1: hash block 0, load block 1
+            hash_slots_1 = self._vec_block_hash_only_slots_specialized(
+                all_block_vecs[0], 0, wrap_round,
+                info, v_root_node, v_level1_right, v_level1_diff,
                 idx_cache, val_cache, v_tmp1_block, v_tmp2_block, v_tmp3_block,
                 v_zero, v_one, v_two, v_n_nodes, v_node_block
-            ))
+            )
+            load_slots_1 = self._vec_block_load_slots_specialized(
+                all_block_vecs[1], 1, info, v_root_node, v_level1_right, v_level1_diff,
+                idx_cache, v_forest_p, v_addr, v_node_block
+            )
+            round_body.extend(self._interleave_slots(hash_slots_1, load_slots_1))
+            
+            # Block 2: hash block 1, load block 2
+            hash_slots_2 = self._vec_block_hash_only_slots_specialized(
+                all_block_vecs[1], 1, wrap_round,
+                info, v_root_node, v_level1_right, v_level1_diff,
+                idx_cache, val_cache, v_tmp1_block, v_tmp2_block, v_tmp3_block,
+                v_zero, v_one, v_two, v_n_nodes, v_node_block
+            )
+            load_slots_2 = self._vec_block_load_slots_specialized(
+                all_block_vecs[2], 0, info, v_root_node, v_level1_right, v_level1_diff,
+                idx_cache, v_forest_p, v_addr, v_node_block
+            )
+            round_body.extend(self._interleave_slots(hash_slots_2, load_slots_2))
+            
+            # Block 3: hash block 2, load block 3
+            hash_slots_3 = self._vec_block_hash_only_slots_specialized(
+                all_block_vecs[2], 0, wrap_round,
+                info, v_root_node, v_level1_right, v_level1_diff,
+                idx_cache, val_cache, v_tmp1_block, v_tmp2_block, v_tmp3_block,
+                v_zero, v_one, v_two, v_n_nodes, v_node_block
+            )
+            load_slots_3 = self._vec_block_load_slots_specialized(
+                all_block_vecs[3], 1, info, v_root_node, v_level1_right, v_level1_diff,
+                idx_cache, v_forest_p, v_addr, v_node_block
+            )
+            round_body.extend(self._interleave_slots(hash_slots_3, load_slots_3))
+            
+            # Hash last block (will be deferred to next round's start)
+            return round_body, info
+
+        # Fully unroll 16 rounds
+        # Round 0: level 0 (root)
+        round0_body, info0 = emit_round(0, 0, False, True, False)
+        body.extend(round0_body)
+        
+        # Round 1: level 1 (binary)
+        round1_body, info1 = emit_round(1, 1, False, False, True)
+        # Hash round 0's last block
+        body.extend(self._vec_block_hash_only_slots_specialized(
+            last_block_vecs, (num_blocks - 1) % 2, info0["wrap_round"],
+            info0, v_root_node, v_level1_right, v_level1_diff,
+            idx_cache, val_cache, v_tmp1_block, v_tmp2_block, v_tmp3_block,
+            v_zero, v_one, v_two, v_n_nodes, v_node_block
+        ))
+        body.extend(round1_body)
+        
+        # Round 2: level 2
+        round2_body, info2 = emit_round(2, 2, False, False, False)
+        body.extend(self._vec_block_hash_only_slots_specialized(
+            last_block_vecs, (num_blocks - 1) % 2, info1["wrap_round"],
+            info1, v_root_node, v_level1_right, v_level1_diff,
+            idx_cache, val_cache, v_tmp1_block, v_tmp2_block, v_tmp3_block,
+            v_zero, v_one, v_two, v_n_nodes, v_node_block
+        ))
+        body.extend(round2_body)
+        
+        # Round 3: level 3
+        round3_body, info3 = emit_round(3, 3, False, False, False)
+        body.extend(self._vec_block_hash_only_slots_specialized(
+            last_block_vecs, (num_blocks - 1) % 2, info2["wrap_round"],
+            info2, v_root_node, v_level1_right, v_level1_diff,
+            idx_cache, val_cache, v_tmp1_block, v_tmp2_block, v_tmp3_block,
+            v_zero, v_one, v_two, v_n_nodes, v_node_block
+        ))
+        body.extend(round3_body)
+        
+        # Round 4: level 4
+        round4_body, info4 = emit_round(4, 4, False, False, False)
+        body.extend(self._vec_block_hash_only_slots_specialized(
+            last_block_vecs, (num_blocks - 1) % 2, info3["wrap_round"],
+            info3, v_root_node, v_level1_right, v_level1_diff,
+            idx_cache, val_cache, v_tmp1_block, v_tmp2_block, v_tmp3_block,
+            v_zero, v_one, v_two, v_n_nodes, v_node_block
+        ))
+        body.extend(round4_body)
+        
+        # Round 5: level 5
+        round5_body, info5 = emit_round(5, 5, False, False, False)
+        body.extend(self._vec_block_hash_only_slots_specialized(
+            last_block_vecs, (num_blocks - 1) % 2, info4["wrap_round"],
+            info4, v_root_node, v_level1_right, v_level1_diff,
+            idx_cache, val_cache, v_tmp1_block, v_tmp2_block, v_tmp3_block,
+            v_zero, v_one, v_two, v_n_nodes, v_node_block
+        ))
+        body.extend(round5_body)
+        
+        # Round 6: level 6
+        round6_body, info6 = emit_round(6, 6, False, False, False)
+        body.extend(self._vec_block_hash_only_slots_specialized(
+            last_block_vecs, (num_blocks - 1) % 2, info5["wrap_round"],
+            info5, v_root_node, v_level1_right, v_level1_diff,
+            idx_cache, val_cache, v_tmp1_block, v_tmp2_block, v_tmp3_block,
+            v_zero, v_one, v_two, v_n_nodes, v_node_block
+        ))
+        body.extend(round6_body)
+        
+        # Round 7: level 7
+        round7_body, info7 = emit_round(7, 7, False, False, False)
+        body.extend(self._vec_block_hash_only_slots_specialized(
+            last_block_vecs, (num_blocks - 1) % 2, info6["wrap_round"],
+            info6, v_root_node, v_level1_right, v_level1_diff,
+            idx_cache, val_cache, v_tmp1_block, v_tmp2_block, v_tmp3_block,
+            v_zero, v_one, v_two, v_n_nodes, v_node_block
+        ))
+        body.extend(round7_body)
+        
+        # Round 8: level 8
+        round8_body, info8 = emit_round(8, 8, False, False, False)
+        body.extend(self._vec_block_hash_only_slots_specialized(
+            last_block_vecs, (num_blocks - 1) % 2, info7["wrap_round"],
+            info7, v_root_node, v_level1_right, v_level1_diff,
+            idx_cache, val_cache, v_tmp1_block, v_tmp2_block, v_tmp3_block,
+            v_zero, v_one, v_two, v_n_nodes, v_node_block
+        ))
+        body.extend(round8_body)
+        
+        # Round 9: level 9
+        round9_body, info9 = emit_round(9, 9, False, False, False)
+        body.extend(self._vec_block_hash_only_slots_specialized(
+            last_block_vecs, (num_blocks - 1) % 2, info8["wrap_round"],
+            info8, v_root_node, v_level1_right, v_level1_diff,
+            idx_cache, val_cache, v_tmp1_block, v_tmp2_block, v_tmp3_block,
+            v_zero, v_one, v_two, v_n_nodes, v_node_block
+        ))
+        body.extend(round9_body)
+        
+        # Round 10: level 10 (wrap)
+        round10_body, info10 = emit_round(10, 10, True, False, False)
+        body.extend(self._vec_block_hash_only_slots_specialized(
+            last_block_vecs, (num_blocks - 1) % 2, info9["wrap_round"],
+            info9, v_root_node, v_level1_right, v_level1_diff,
+            idx_cache, val_cache, v_tmp1_block, v_tmp2_block, v_tmp3_block,
+            v_zero, v_one, v_two, v_n_nodes, v_node_block
+        ))
+        body.extend(round10_body)
+        
+        # Round 11: level 0 (root)
+        round11_body, info11 = emit_round(11, 0, False, True, False)
+        body.extend(self._vec_block_hash_only_slots_specialized(
+            last_block_vecs, (num_blocks - 1) % 2, info10["wrap_round"],
+            info10, v_root_node, v_level1_right, v_level1_diff,
+            idx_cache, val_cache, v_tmp1_block, v_tmp2_block, v_tmp3_block,
+            v_zero, v_one, v_two, v_n_nodes, v_node_block
+        ))
+        body.extend(round11_body)
+        
+        # Round 12: level 1 (binary)
+        round12_body, info12 = emit_round(12, 1, False, False, True)
+        body.extend(self._vec_block_hash_only_slots_specialized(
+            last_block_vecs, (num_blocks - 1) % 2, info11["wrap_round"],
+            info11, v_root_node, v_level1_right, v_level1_diff,
+            idx_cache, val_cache, v_tmp1_block, v_tmp2_block, v_tmp3_block,
+            v_zero, v_one, v_two, v_n_nodes, v_node_block
+        ))
+        body.extend(round12_body)
+        
+        # Round 13: level 2
+        round13_body, info13 = emit_round(13, 2, False, False, False)
+        body.extend(self._vec_block_hash_only_slots_specialized(
+            last_block_vecs, (num_blocks - 1) % 2, info12["wrap_round"],
+            info12, v_root_node, v_level1_right, v_level1_diff,
+            idx_cache, val_cache, v_tmp1_block, v_tmp2_block, v_tmp3_block,
+            v_zero, v_one, v_two, v_n_nodes, v_node_block
+        ))
+        body.extend(round13_body)
+        
+        # Round 14: level 3
+        round14_body, info14 = emit_round(14, 3, False, False, False)
+        body.extend(self._vec_block_hash_only_slots_specialized(
+            last_block_vecs, (num_blocks - 1) % 2, info13["wrap_round"],
+            info13, v_root_node, v_level1_right, v_level1_diff,
+            idx_cache, val_cache, v_tmp1_block, v_tmp2_block, v_tmp3_block,
+            v_zero, v_one, v_two, v_n_nodes, v_node_block
+        ))
+        body.extend(round14_body)
+        
+        # Round 15: level 4
+        round15_body, info15 = emit_round(15, 4, False, False, False)
+        body.extend(self._vec_block_hash_only_slots_specialized(
+            last_block_vecs, (num_blocks - 1) % 2, info14["wrap_round"],
+            info14, v_root_node, v_level1_right, v_level1_diff,
+            idx_cache, val_cache, v_tmp1_block, v_tmp2_block, v_tmp3_block,
+            v_zero, v_one, v_two, v_n_nodes, v_node_block
+        ))
+        body.extend(round15_body)
+        
+        # Epilogue: hash last block of round 15
+        body.extend(self._vec_block_hash_only_slots_specialized(
+            last_block_vecs, (num_blocks - 1) % 2, info15["wrap_round"],
+            info15, v_root_node, v_level1_right, v_level1_diff,
+            idx_cache, val_cache, v_tmp1_block, v_tmp2_block, v_tmp3_block,
+            v_zero, v_one, v_two, v_n_nodes, v_node_block
+        ))
 
         # Write back values
         val_store_ptr = self.alloc_scratch("val_store_ptr")
