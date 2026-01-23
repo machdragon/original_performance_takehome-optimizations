@@ -45,6 +45,7 @@ class KernelBuilder:
         max_arith_level: int = -1,
         enable_prefetch: bool = False,
         enable_level2_where: bool = False,
+        enable_two_round_fusion: bool = False,
         lookahead: int = 1024,  # Optimized: 1024 with block_size=16 gives 1923 cycles
         block_size: int = 16,  # Optimized: 16 gives best performance (1928->1923 with lookahead=1024)
         enable_second_pass: bool = False,
@@ -64,6 +65,7 @@ class KernelBuilder:
         self.max_arith_level = max_arith_level
         self.enable_prefetch = enable_prefetch
         self.enable_level2_where = enable_level2_where
+        self.enable_two_round_fusion = enable_two_round_fusion
         self.lookahead = lookahead
         self.block_size = block_size
         self.enable_second_pass = enable_second_pass
@@ -836,6 +838,8 @@ class KernelBuilder:
         
         # Parameter-specialized kernel dispatch for benchmark cases
         if (forest_height, rounds, batch_size) == (10, 16, 256):
+            if self.enable_two_round_fusion:
+                return self.build_kernel_10_16_256_OLD(n_nodes, write_indices)
             return self.build_kernel_10_16_256(n_nodes, write_indices)
         # Add other benchmark combinations as needed:
         # elif (forest_height, rounds, batch_size) == (8, 12, 128):
@@ -2876,6 +2880,7 @@ def do_kernel_test(
     max_arith_level: int | None = None,
     enable_prefetch: bool | None = None,
     enable_level2_where: bool | None = None,
+    enable_two_round_fusion: bool | None = None,
     lookahead: int | None = None,
     block_size: int | None = None,
     enable_second_pass: bool | None = None,
@@ -2901,6 +2906,10 @@ def do_kernel_test(
         enable_prefetch = False
     if enable_level2_where is None:
         enable_level2_where = False
+        if max_arith_level is not None and max_arith_level >= 2 and enable_prefetch:
+            enable_level2_where = True
+    if enable_two_round_fusion is None:
+        enable_two_round_fusion = False
     if lookahead is None:
         lookahead = 1024
     if block_size is None:
@@ -2920,6 +2929,7 @@ def do_kernel_test(
         max_arith_level=max_arith_level,
         enable_prefetch=enable_prefetch,
         enable_level2_where=enable_level2_where,
+        enable_two_round_fusion=enable_two_round_fusion,
         lookahead=lookahead,
         block_size=block_size,
         enable_second_pass=enable_second_pass,
