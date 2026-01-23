@@ -3013,8 +3013,7 @@ def do_kernel_test(
     if enable_prefetch is None:
         enable_prefetch = True
     if enable_level2_where is None:
-        # Default: tie level-2 where-tree to the same flag combo used in sweeps.
-        enable_level2_where = (max_arith_level >= 2 and enable_prefetch)
+        enable_level2_where = True
     if enable_two_round_fusion is None:
         enable_two_round_fusion = False
     if enable_level3_valu is None:
