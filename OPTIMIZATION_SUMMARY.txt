@@ -26,18 +26,25 @@ Remaining optimization plan
 2) Gather pressure reduction (valid)
    - Revisit early-level gather bypass with better scheduling and tighter scratch usage (Phase 8 regressed).
    - Consider partial prefetch of node values per round to reduce load_offset count.
+   - Explore lane grouping or partial tiling when indices fall into nearby ranges (load contiguous blocks + select).
+   - Detect duplicate lane addresses and broadcast a single loaded value when possible.
 
 3) Bundler refinements (valid)
    - Add optional latency-aware rules to the load-aware bundler without reordering hazards.
    - Consider a second-pass reorder within bundles to keep load limits saturated.
+   - Increase ILP via small unroll factors to give the bundler more independent work.
 
-4) Gray-area experiments (workflow-driven; validate on benchmark)
+4) Structure-aware tricks (valid)
+   - Investigate 2-round jump composition (combine two traversal steps into one).
+   - Explore memoization at upper levels where lanes converge (cache node results in scratch).
+
+5) Gray-area experiments (workflow-driven; validate on benchmark)
    - Drop pause instructions in submission-only builds (local harness depends on pause/yield alignment).
    - Specialize for fixed benchmark params (forest_height=10, rounds=16, batch_size=256) while keeping a general fallback.
    - Skip scalar tail/writeback paths when batch_size is a known multiple of VLEN (general, not test-specific).
 
-5) Deferred (intent risk)
-   - Skipping index write-back could pass current submission checks but likely violates intent; avoid unless explicitly requested.
+6) Deferred (intent risk)
+   - Skipping index write-back could pass current submission checks but likely violates intent; keep as backlog only.
 
 Notes
 - Debug mode can be re-enabled via KernelBuilder(enable_debug=True).
