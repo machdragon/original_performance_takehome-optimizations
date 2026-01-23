@@ -1624,7 +1624,7 @@ class KernelBuilder:
             if node_const is not None:
                 v_node_buf = node_const
             elif node_pair is not None:
-                if self.enable_flow_select and v_level1_left is not None:
+                if self.enable_level2_where and v_level1_left is not None:
                     node_right, _node_diff = node_pair
                     slots.append(("valu", ("&", v_tmp1, v_idx, v_one)))
                     slots.append(
@@ -2083,7 +2083,7 @@ class KernelBuilder:
                     v_val = val_cache + vec_i
                     slots.append(("valu", ("^", v_val, v_val, node_const)))
             elif node_pair is not None:
-                if self.enable_flow_select and v_level1_left is not None:
+                if self.enable_level2_where and v_level1_left is not None:
                     node_right, _node_diff = node_pair
                     for bi, vec_i in enumerate(block_vecs):
                         v_idx = idx_cache + vec_i
