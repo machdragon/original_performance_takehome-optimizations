@@ -24,6 +24,9 @@ Implemented & tested changes
   max_arith_level=2 + enable_prefetch=True to 2114 cycles (vs 2116 without prefetch), still above baseline.
 - Phase 21 (submission alignment): enable index write-back by default (write_indices=True) so final memory matches submission
   harness expectations (values and indices). Cycle count with submission-style settings (10,16,256): 2127 cycles.
+- Phase 22 (parameter specialization): added parameter dispatch and specialized build_kernel_10_16_256 with hardcoded constants,
+  fully unrolled 16-round and 4-block loops. Where-tree helper implemented but deferred due to scratch constraints.
+  Current: 2367 cycles (slower than 2095 general, needs further optimization to realize unrolling benefits).
 
 Verification performed
 - `python3 perf_takehome.py Tests.test_kernel_cycles` after each phase (latest: 2095 cycles; Phase 17 default off).

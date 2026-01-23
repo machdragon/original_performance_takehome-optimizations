@@ -755,25 +755,7 @@ class KernelBuilder:
         level2_vecs = None
         level2_tree_tmp = None
 
-        # Precompute round info statically
-        round_info = []
-        for round in range(rounds):
-            level = round % wrap_period
-            uniform_round = fast_wrap and level == 0
-            binary_round = fast_wrap and level == 1
-            level2_round = fast_wrap and level == 2
-            level3_round = fast_wrap and level == 3
-            level4_round = fast_wrap and level == 4
-            round_info.append({
-                "round": round,
-                "level": level,
-                "wrap_round": level == forest_height,
-                "uniform_round": uniform_round,
-                "binary_round": binary_round,
-                "level2_round": level2_round,
-                "level3_round": level3_round,
-                "level4_round": level4_round,
-            })
+        # Round info not needed - fully unrolled below
 
         self.add("flow", ("pause",))
         if self.enable_debug:
