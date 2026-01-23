@@ -44,6 +44,10 @@ class KernelBuilder:
         max_special_level: int = -1,
         max_arith_level: int = -1,
         enable_prefetch: bool = False,
+        lookahead: int = 512,
+        block_size: int = 16,  # Optimized: 16 gives best performance (1928 cycles)
+        enable_second_pass: bool = False,
+        enable_latency_aware: bool = False,
     ):
         self.instrs = []
         self.scratch = {}
@@ -56,6 +60,10 @@ class KernelBuilder:
         self.max_special_level = max_special_level
         self.max_arith_level = max_arith_level
         self.enable_prefetch = enable_prefetch
+        self.lookahead = lookahead
+        self.block_size = block_size
+        self.enable_second_pass = enable_second_pass
+        self.enable_latency_aware = enable_latency_aware
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -179,23 +187,31 @@ class KernelBuilder:
             bundle_reads.update(info["reads"])
             bundle_writes.update(info["writes"])
 
-        def can_add_now(info):
+        def can_add_now(info, recent_loads=None):
+            if recent_loads is None:
+                recent_loads = set()
             if engine_full(info["engine"]):
                 return False
             if info["reads"] & bundle_writes:
                 return False
             if info["writes"] & bundle_writes:
                 return False
+            # Latency-aware: delay VALU/ALU if dependent on recent load
+            if self.enable_latency_aware and info["engine"] in ["alu", "valu"]:
+                if info["reads"] & recent_loads:
+                    return False
             return True
 
         def find_pullable_slot(
             start_idx,
             future_writes,
             engine_filter=None,
-            lookahead=512,  # Optimized: 512 gives best performance (1980 cycles)
+            lookahead=None,
             init_skipped_reads=None,
             init_skipped_writes=None,
         ):
+            if lookahead is None:
+                lookahead = self.lookahead
             skipped_writes = (
                 set() if init_skipped_writes is None else set(init_skipped_writes)
             )
@@ -252,6 +268,11 @@ class KernelBuilder:
                 i += 1
                 continue
 
+            # Track recent loads for latency-aware scheduling
+            recent_loads = set()
+            if self.enable_latency_aware and "load" in bundle:
+                recent_loads = bundle_writes  # Loads in current bundle are "recent"
+            
             # Try to pull loads when we have non-load ops
             if engine != "load" and bundle_loads() < SLOT_LIMITS["load"]:
                 while bundle_loads() < SLOT_LIMITS["load"]:
@@ -283,7 +304,7 @@ class KernelBuilder:
                     slots_info[pull_idx] = None
                     add_to_bundle(pull)
 
-            if not can_add_now(info):
+            if not can_add_now(info, recent_loads):
                 if bundle:
                     blocked_reads = reads
                     blocked_writes = writes
@@ -309,6 +330,41 @@ class KernelBuilder:
             i += 1
 
         flush()
+        
+        # Second-pass reordering: prioritize loads, then VALU, then ALU
+        if self.enable_second_pass:
+            for i in range(len(instrs)):
+                bundle = instrs[i].copy()
+                # Extract by engine
+                load_slots = bundle.pop("load", [])
+                valu_slots = bundle.pop("valu", [])
+                alu_slots = bundle.pop("alu", [])
+                store_slots = bundle.pop("store", [])
+                flow_slots = bundle.pop("flow", [])
+                debug_slots = bundle.pop("debug", [])
+                
+                # Reorder: prioritize loads (up to 2), then VALU (up to 6), then ALU (up to 12)
+                reordered = {}
+                if load_slots:
+                    reordered["load"] = load_slots[:SLOT_LIMITS["load"]]
+                if valu_slots:
+                    reordered["valu"] = valu_slots[:SLOT_LIMITS["valu"]]
+                if alu_slots:
+                    reordered["alu"] = alu_slots[:SLOT_LIMITS["alu"]]
+                if store_slots:
+                    reordered["store"] = store_slots[:SLOT_LIMITS["store"]]
+                if flow_slots:
+                    reordered["flow"] = flow_slots[:SLOT_LIMITS["flow"]]
+                if debug_slots:
+                    reordered["debug"] = debug_slots
+                
+                # Add any remaining slots (shouldn't happen if bundler works correctly)
+                for engine, slots in bundle.items():
+                    if slots:
+                        reordered.setdefault(engine, []).extend(slots)
+                
+                instrs[i] = reordered
+        
         return instrs
 
     def add(self, engine, slot):
@@ -1195,8 +1251,8 @@ class KernelBuilder:
             self.scratch_vconst(val1)
             self.scratch_vconst(val3)
 
-        # Block size 8 fits 32 vectors (no remainder) and reduces block overhead.
-        block_size = 8
+        # Block size configurable via self.block_size (default 8)
+        block_size = self.block_size
         # Double buffers for pipelining
         v_node_block = [
             self.alloc_scratch("v_node_block_A", block_size * VLEN),
@@ -2541,6 +2597,10 @@ def do_kernel_test(
     max_special_level: int | None = None,
     max_arith_level: int | None = None,
     enable_prefetch: bool | None = None,
+    lookahead: int | None = None,
+    block_size: int | None = None,
+    enable_second_pass: bool | None = None,
+    enable_latency_aware: bool | None = None,
 ):
     print(f"{forest_height=}, {rounds=}, {batch_size=}")
     random.seed(seed)
@@ -2558,12 +2618,24 @@ def do_kernel_test(
         max_arith_level = -1
     if enable_prefetch is None:
         enable_prefetch = False
+    if lookahead is None:
+        lookahead = 512
+    if block_size is None:
+        block_size = 16
+    if enable_second_pass is None:
+        enable_second_pass = False
+    if enable_latency_aware is None:
+        enable_latency_aware = False
     kb = KernelBuilder(
         enable_debug=enable_debug,
         assume_zero_indices=assume_zero_indices,
         max_special_level=max_special_level,
         max_arith_level=max_arith_level,
         enable_prefetch=enable_prefetch,
+        lookahead=lookahead,
+        block_size=block_size,
+        enable_second_pass=enable_second_pass,
+        enable_latency_aware=enable_latency_aware,
     )
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
     # print(kb.instrs)
