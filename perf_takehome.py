@@ -1346,20 +1346,16 @@ class KernelBuilder:
         if enable_arith:
             v_tmp4_block = self.alloc_scratch("v_tmp4_block", block_size * VLEN)
         
-        # Level 2 arithmetic selection: reuse existing scratch
-        # Use v_node_block[0] for vectors, allocate 4 words for scalars (minimal scratch)
+        # Level 2 arithmetic selection: reuse existing scratch (no new allocations)
+        # Use v_node_block[0] for vectors, v_tmp1-4 for scalars (scalar temps, safe during level 2)
         level2_base_addr = self.scratch_const(3)  # Level 2 starts at index 3
         level2_vecs_base = v_node_block[0]  # Reuse v_node_block[0] for level 2 vectors
         level2_tree_tmp_base = None  # Not needed for arithmetic selection
         level2_addr_temp = v_addr[0]  # Reuse v_addr[0] for address computation
-        # Allocate 4 words for scalars (minimal - will test if this fits)
-        try:
-            level2_scalars_temp = self.alloc_scratch("level2_scalars", 4)
-        except AssertionError:
-            # Scratch too tight - disable level 2 optimization
-            level2_vecs_base = None
-            level2_addr_temp = None
-            level2_scalars_temp = None
+        # Use scalar temps v_tmp1-4 for the 4 level 2 values (they're scalars, 1 word each)
+        # We'll use them as an array: level2_scalars_temp = v_tmp1, then v_tmp1+1, v_tmp1+2, v_tmp1+3
+        # But actually we need 4 consecutive words, so let's use v_tmp1_block[0:4] as scalars
+        level2_scalars_temp = v_tmp1_block  # Reuse first 4 words of v_tmp1_block as scalars
 
         max_special = min(self.max_special_level, forest_height)
         use_special = self.assume_zero_indices and max_special >= 0
@@ -1762,8 +1758,8 @@ class KernelBuilder:
             
             # Level 2: use arithmetic selection (VALU-only, reuse existing block temps)
             # Strategy: Load 4 scalars, broadcast, use arithmetic to select (no vselect/flow, no extra scratch)
-            # DISABLED: Needs refinement to avoid scratch conflicts
-            if False and level2_round:
+            # DISABLED: Scratch reuse needs refinement to avoid conflicts
+            if False and level2_round and level2_scalars_temp is not None:
                 # Load 4 level 2 values on-demand (reuse v_addr[0] for address, v_tmp1 for scalars)
                 slots.append(("alu", ("+", level2_addr_temp, self.scratch["forest_values_p"], level2_base_addr)))
                 for i in range(4):
@@ -1793,20 +1789,23 @@ class KernelBuilder:
                     slots.append(("valu", ("&", v_bit1, v_bit1, v_one)))
                     
                     # Two-level arithmetic selection (reuse v_tmp blocks)
-                    # Level 1: compute differences
-                    v_diff_01 = v_tmp1_block + bi * VLEN  # Reuse v_tmp1_block
-                    v_diff_23 = v_tmp2_block + bi * VLEN  # Reuse v_tmp2_block
+                    # Level 1: compute differences (reuse v_tmp blocks, careful with overwrites)
+                    # We'll use v_tmp1 for diff_01, v_tmp2 for diff_23, then overwrite for selections
+                    v_diff_01 = v_tmp1_block + bi * VLEN
+                    v_diff_23 = v_tmp2_block + bi * VLEN
                     slots.append(("valu", ("-", v_diff_01, level2_vecs + 1 * VLEN, level2_vecs + 0 * VLEN)))
                     slots.append(("valu", ("-", v_diff_23, level2_vecs + 3 * VLEN, level2_vecs + 2 * VLEN)))
                     
-                    # Select within each pair based on bit0 (reuse same temps)
-                    v_sel_low = v_tmp1_block + bi * VLEN  # Overwrite v_diff_01
-                    v_sel_high = v_tmp2_block + bi * VLEN  # Overwrite v_diff_23
+                    # Select within each pair based on bit0
+                    # v_sel_low overwrites v_diff_01, v_sel_high overwrites v_diff_23
+                    v_sel_low = v_tmp1_block + bi * VLEN
+                    v_sel_high = v_tmp2_block + bi * VLEN
                     slots.append(("valu", ("multiply_add", v_sel_low, v_bit0, v_diff_01, level2_vecs + 0 * VLEN)))
                     slots.append(("valu", ("multiply_add", v_sel_high, v_bit0, v_diff_23, level2_vecs + 2 * VLEN)))
                     
                     # Final selection between low/high based on bit1
-                    v_result = v_tmp3_block + bi * VLEN  # Reuse v_tmp3_block
+                    # Compute difference first, then multiply_add
+                    v_result = v_tmp3_block + bi * VLEN
                     slots.append(("valu", ("-", v_result, v_sel_high, v_sel_low)))
                     slots.append(("valu", ("multiply_add", node_buf + bi * VLEN, v_bit1, v_result, v_sel_low)))
                 
