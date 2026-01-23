@@ -161,7 +161,7 @@ class KernelBuilder:
         def bundle_loads():
             return len(bundle.get("load", []))
 
-        def find_pullable_load(start_idx, future_writes, lookahead=16):
+        def find_pullable_load(start_idx, future_writes, future_reads, lookahead=16):
             skipped_writes = set()
             skipped_reads = set()
             for j in range(start_idx, min(len(slots_info), start_idx + lookahead)):
@@ -178,6 +178,8 @@ class KernelBuilder:
                     elif reads & future_writes:
                         pass
                     elif writes & future_writes:
+                        pass
+                    elif writes & future_reads:
                         pass
                     elif writes & skipped_writes:
                         pass
@@ -209,7 +211,8 @@ class KernelBuilder:
 
             if engine != "load" and bundle_loads() < SLOT_LIMITS["load"]:
                 future_writes = bundle_writes | writes
-                pull_idx = find_pullable_load(i + 1, future_writes)
+                future_reads = bundle_reads | reads
+                pull_idx = find_pullable_load(i + 1, future_writes, future_reads)
                 if pull_idx is not None:
                     pull = slots_info[pull_idx]
                     slots_info[pull_idx] = None
