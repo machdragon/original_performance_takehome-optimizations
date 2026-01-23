@@ -1346,10 +1346,11 @@ class KernelBuilder:
         if enable_arith:
             v_tmp4_block = self.alloc_scratch("v_tmp4_block", block_size * VLEN)
         
-        # Level 2 where-tree: deferred due to scratch constraints with block_size=16
-        # Would need 4 words for scalars + reuse strategy, but block_size=16 uses too much scratch
+        # Level 2 where-tree: deferred - scratch too tight with block_size=16
+        # Structure ready: would reuse v_node_block[0] for vectors, need 4 words for scalars
+        # With block_size=16, we have ~284 words free, but allocation pattern prevents reuse
         level2_base_addr = self.scratch_const(3)  # Level 2 starts at index 3
-        level2_vecs_base = None  # Disabled - scratch too tight
+        level2_vecs_base = None  # Disabled
         level2_tree_tmp_base = None
         level2_addr_temp = None
         level2_scalars_temp = None
