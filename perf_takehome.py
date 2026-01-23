@@ -382,6 +382,11 @@ class KernelBuilder:
         n_nodes: int,
         batch_size: int,
         rounds: int,
+        # Default to writing indices back so external submission
+        # harnesses that check both values and indices see a
+        # fully updated memory image. Benchmark callers can
+        # still override this to False if they only care about
+        # value speed.
         write_indices: bool = True,
         write_indicies: bool | None = None,
     ):
@@ -1408,6 +1413,11 @@ class KernelBuilder:
                 use_prefetch = prefetch_active[round]
                 do_prefetch_next = prefetch_next[round]
                 node_prefetch = v_node_prefetch if use_prefetch else None
+                # Only true for arith rounds that have spare load
+                # bandwidth – consumer rounds that *use* prefetch
+                # but aren't arith still go through the normal
+                # pipelined path below, with use_prefetch guiding
+                # how block 0 is consumed.
                 special_round = info["arith_round"] and enable_prefetch
 
                 if pending_prev:
@@ -1449,6 +1459,12 @@ class KernelBuilder:
                     )
                     for block_idx in range(1, num_blocks):
                         buf_idx = block_idx % 2
+                        # Block 0 is prefetched; hash it (using the
+                        # prefetch buffer) while we load block 1
+                        # with the standard double-buffer path.
+                        # Note: block 0's indices have already been
+                        # advanced by its previous-round hash, so
+                        # the prefetch is for *next*-round indices.
                         hash_slots = vec_block_hash_only_slots(
                             all_block_vecs[block_idx],
                             buf_idx,
@@ -1498,6 +1514,12 @@ class KernelBuilder:
                                 info["node_arith"],
                             )
                         )
+                    # For num_blocks == 2 the following loop is
+                    # intentionally empty when start_block == 2:
+                    # block 1 is loaded here and then hashed as the
+                    # deferred epilogue in the next round, which
+                    # is how the cross-round pipeline keeps one
+                    # block "in flight" across iterations.
                     for block_idx in range(start_block, num_blocks):
                         prev_buf = (block_idx - 1) % 2
                         curr_buf = block_idx % 2
@@ -1520,7 +1542,11 @@ class KernelBuilder:
                     pending_prev = True
 
                 prev_info = info
-                # Prefetch only covers block 0; epilogue uses normal buffers.
+                # Prefetch only covers block 0; epilogue always
+                # uses the normal double-buffer path today. If we
+                # ever expand prefetch beyond block 0, this flag
+                # will need revisiting to allow prefetch-based
+                # epilogues again.
                 prev_use_prefetch = False
 
             if pending_prev:
