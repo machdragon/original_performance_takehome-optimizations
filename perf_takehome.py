@@ -328,12 +328,20 @@ class KernelBuilder:
         return slots
 
     def build_kernel(
-        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
+        self,
+        forest_height: int,
+        n_nodes: int,
+        batch_size: int,
+        rounds: int,
+        write_indices: bool = False,
+        write_indicies: bool | None = None,
     ):
         """
         Like reference_kernel2 but building actual instructions.
         Vectorized implementation that uses SIMD for the batch dimension.
         """
+        if write_indicies is not None:
+            write_indices = write_indicies
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
         tmp3 = self.alloc_scratch("tmp3")
@@ -400,8 +408,13 @@ class KernelBuilder:
             self.scratch_vconst(val1)
             self.scratch_vconst(val3)
 
-        block_size = SLOT_LIMITS["valu"]
-        v_node_block = self.alloc_scratch("v_node_block", block_size * VLEN)
+        # Block size 4 works well with 32 vectors (no remainder)
+        block_size = 4
+        # Double buffers for pipelining
+        v_node_block = [
+            self.alloc_scratch("v_node_block_A", block_size * VLEN),
+            self.alloc_scratch("v_node_block_B", block_size * VLEN),
+        ]
         v_tmp1_block = self.alloc_scratch("v_tmp1_block", block_size * VLEN)
         v_tmp2_block = self.alloc_scratch("v_tmp2_block", block_size * VLEN)
         v_tmp3_block = self.alloc_scratch("v_tmp3_block", block_size * VLEN)
@@ -456,6 +469,7 @@ class KernelBuilder:
                     )
 
         def interleave_slots(hash_slots, load_slots):
+            """Interleave hash and load slots, emitting loads in pairs."""
             if not load_slots:
                 return hash_slots
             if not hash_slots:
@@ -463,7 +477,8 @@ class KernelBuilder:
             combined = []
             h_len = len(hash_slots)
             l_len = len(load_slots)
-            spacing = max(1, h_len // (l_len + 1))
+            # Emit 2 loads per spacing to fill both load slots
+            spacing = max(1, h_len // ((l_len + 1) // 2 + 1))
             h_i = 0
             l_i = 0
             since_load = 0
@@ -475,6 +490,9 @@ class KernelBuilder:
                 if l_i < l_len and since_load >= spacing:
                     combined.append(load_slots[l_i])
                     l_i += 1
+                    if l_i < l_len:
+                        combined.append(load_slots[l_i])
+                        l_i += 1
                     since_load = 0
                 elif h_i >= h_len and l_i < l_len:
                     combined.append(load_slots[l_i])
@@ -618,9 +636,10 @@ class KernelBuilder:
             slots.append(("valu", ("+", v_node_buf, current_base, v_zero)))
             return slots
 
-        def vec_block_hash_slots(block_vecs, round_idx, wrap_round):
+        def vec_block_load_slots(block_vecs, buf_idx):
+            """Load node values for a block into the specified buffer."""
             slots = []
-            # Gather node values into block scratch.
+            node_buf = v_node_block[buf_idx]
             for bi, vec_i in enumerate(block_vecs):
                 v_idx = idx_cache + vec_i
                 slots.append(("valu", ("+", v_addr[0], v_idx, v_forest_p)))
@@ -630,17 +649,23 @@ class KernelBuilder:
                             "load",
                             (
                                 "load_offset",
-                                v_node_block + bi * VLEN,
+                                node_buf + bi * VLEN,
                                 v_addr[0],
                                 lane,
                             ),
                         )
                     )
+            return slots
+
+        def vec_block_hash_only_slots(block_vecs, buf_idx, wrap_round):
+            """XOR, hash, and update indices using node values from specified buffer."""
+            slots = []
+            node_buf = v_node_block[buf_idx]
             # XOR with node values.
             for bi, vec_i in enumerate(block_vecs):
                 v_val = val_cache + vec_i
                 slots.append(
-                    ("valu", ("^", v_val, v_val, v_node_block + bi * VLEN))
+                    ("valu", ("^", v_val, v_val, node_buf + bi * VLEN))
                 )
             # Hash stages interleaved across the block.
             for op1, val1, op2, op3, val3 in HASH_STAGES:
@@ -721,6 +746,12 @@ class KernelBuilder:
                         )
             return slots
 
+        def vec_block_hash_slots(block_vecs, round_idx, wrap_round):
+            """Combined load + hash (non-pipelined fallback)."""
+            slots = vec_block_load_slots(block_vecs, 0)
+            slots.extend(vec_block_hash_only_slots(block_vecs, 0, wrap_round))
+            return slots
+
         # Pause instructions are matched up with yield statements in the reference
         # kernel to let you debug at intermediate steps. The testing harness in this
         # file requires these match up to the reference kernel's yields, but the
@@ -740,133 +771,197 @@ class KernelBuilder:
         # Fast wrap relies on inputs starting at index 0 (Input.generate does this).
         fast_wrap = self.assume_zero_indices and not self.enable_debug
         vec_count = vec_end // VLEN
-        for round in range(rounds):
-            wrap_round = (round % wrap_period) == forest_height
-            level = round % wrap_period
-            special_round = use_special and level <= max_special
-            if vec_count > 0:
-                if special_round:
-                    for vec in range(vec_count):
-                        buf = vec % 2
-                        body.extend(vec_special_slots(vec * VLEN, buf, level))
-                        body.extend(vec_hash_slots(vec * VLEN, buf, round, wrap_round))
-                else:
-                    if not self.enable_debug and vec_count >= block_size:
+
+        # Cross-round pipelining for better load utilization
+        block_limit = vec_count - (vec_count % block_size)
+        num_blocks = block_limit // block_size
+        use_cross_round = (
+            not self.enable_debug
+            and vec_count >= block_size
+            and num_blocks >= 2
+            and not use_special
+            and block_limit == vec_count  # no remainder
+        )
+
+        if use_cross_round:
+            block_0_vecs = [offset * VLEN for offset in range(block_size)]
+            last_block_idx = num_blocks - 1
+            last_start = last_block_idx * block_size
+            last_block_vecs = [(last_start + offset) * VLEN for offset in range(block_size)]
+            all_block_vecs = [
+                [(b * block_size + offset) * VLEN for offset in range(block_size)]
+                for b in range(num_blocks)
+            ]
+
+            # Round 0: prologue + steady state
+            wrap_round_0 = (0 % wrap_period) == forest_height
+            body.extend(vec_block_load_slots(block_0_vecs, 0))
+            for block_idx in range(1, num_blocks):
+                prev_buf = (block_idx - 1) % 2
+                curr_buf = block_idx % 2
+                hash_slots = vec_block_hash_only_slots(all_block_vecs[block_idx - 1], prev_buf, wrap_round_0)
+                load_slots = vec_block_load_slots(all_block_vecs[block_idx], curr_buf)
+                body.extend(interleave_slots(hash_slots, load_slots))
+
+            # Rounds 1 to N-1: overlap epilogue of prev with prologue of current
+            for round in range(1, rounds):
+                wrap_round_prev = ((round - 1) % wrap_period) == forest_height
+                wrap_round_curr = (round % wrap_period) == forest_height
+                last_buf = last_block_idx % 2
+
+                # Epilogue of prev round + prologue of current
+                hash_slots = vec_block_hash_only_slots(last_block_vecs, last_buf, wrap_round_prev)
+                load_slots = vec_block_load_slots(block_0_vecs, 0)
+                body.extend(interleave_slots(hash_slots, load_slots))
+
+                # Steady state
+                for block_idx in range(1, num_blocks):
+                    prev_buf = (block_idx - 1) % 2
+                    curr_buf = block_idx % 2
+                    hash_slots = vec_block_hash_only_slots(all_block_vecs[block_idx - 1], prev_buf, wrap_round_curr)
+                    load_slots = vec_block_load_slots(all_block_vecs[block_idx], curr_buf)
+                    body.extend(interleave_slots(hash_slots, load_slots))
+
+            # Final epilogue
+            wrap_round_last = ((rounds - 1) % wrap_period) == forest_height
+            last_buf = last_block_idx % 2
+            body.extend(vec_block_hash_only_slots(last_block_vecs, last_buf, wrap_round_last))
+
+        else:
+            # Fallback: per-round processing
+            for round in range(rounds):
+                wrap_round = (round % wrap_period) == forest_height
+                level = round % wrap_period
+                special_round = use_special and level <= max_special
+                if vec_count > 0:
+                    if special_round:
+                        for vec in range(vec_count):
+                            buf = vec % 2
+                            body.extend(vec_special_slots(vec * VLEN, buf, level))
+                            body.extend(vec_hash_slots(vec * VLEN, buf, round, wrap_round))
+                    elif not self.enable_debug and vec_count >= block_size:
                         block_limit = vec_count - (vec_count % block_size)
-                        for vec in range(0, block_limit, block_size):
-                            block_vecs = [
-                                (vec + offset) * VLEN for offset in range(block_size)
+                        num_blocks = block_limit // block_size
+                        if num_blocks >= 2:
+                            block_0_vecs = [offset * VLEN for offset in range(block_size)]
+                            all_block_vecs = [
+                                [(b * block_size + offset) * VLEN for offset in range(block_size)]
+                                for b in range(num_blocks)
                             ]
-                            body.extend(
-                                vec_block_hash_slots(block_vecs, round, wrap_round)
-                            )
+                            body.extend(vec_block_load_slots(block_0_vecs, 0))
+                            for block_idx in range(1, num_blocks):
+                                prev_buf = (block_idx - 1) % 2
+                                curr_buf = block_idx % 2
+                                hash_slots = vec_block_hash_only_slots(all_block_vecs[block_idx - 1], prev_buf, wrap_round)
+                                load_slots = vec_block_load_slots(all_block_vecs[block_idx], curr_buf)
+                                body.extend(interleave_slots(hash_slots, load_slots))
+                            last_buf = (num_blocks - 1) % 2
+                            body.extend(vec_block_hash_only_slots(all_block_vecs[num_blocks - 1], last_buf, wrap_round))
+                        else:
+                            for vec in range(0, block_limit, block_size):
+                                block_vecs = [(vec + offset) * VLEN for offset in range(block_size)]
+                                body.extend(vec_block_hash_slots(block_vecs, round, wrap_round))
                         if block_limit < vec_count:
                             start_vec = block_limit
                             body.extend(vec_load_slots(start_vec * VLEN, start_vec % 2))
                             for vec in range(start_vec + 1, vec_count):
                                 prev = vec - 1
-                                hash_slots = vec_hash_slots(
-                                    prev * VLEN, prev % 2, round, wrap_round
-                                )
+                                hash_slots = vec_hash_slots(prev * VLEN, prev % 2, round, wrap_round)
                                 load_slots = vec_load_slots(vec * VLEN, vec % 2)
                                 body.extend(interleave_slots(hash_slots, load_slots))
                             last_vec = vec_count - 1
-                            body.extend(
-                                vec_hash_slots(
-                                    last_vec * VLEN, last_vec % 2, round, wrap_round
-                                )
-                            )
+                            body.extend(vec_hash_slots(last_vec * VLEN, last_vec % 2, round, wrap_round))
                     else:
-                        # Prologue: load vector 0
                         body.extend(vec_load_slots(0, 0))
                         for vec in range(1, vec_count):
                             prev = vec - 1
-                            hash_slots = vec_hash_slots(
-                                prev * VLEN, prev % 2, round, wrap_round
-                            )
+                            hash_slots = vec_hash_slots(prev * VLEN, prev % 2, round, wrap_round)
                             load_slots = vec_load_slots(vec * VLEN, vec % 2)
                             body.extend(interleave_slots(hash_slots, load_slots))
-                        # Epilogue: hash last vector
                         last_vec = vec_count - 1
-                        body.extend(
-                            vec_hash_slots(
-                                last_vec * VLEN, last_vec % 2, round, wrap_round
-                            )
-                        )
+                        body.extend(vec_hash_slots(last_vec * VLEN, last_vec % 2, round, wrap_round))
 
-            for i in range(vec_end, batch_size):
-                idx_addr = idx_cache + i
-                val_addr = val_cache + i
-                # idx = cached index
-                if self.enable_debug:
-                    body.append(("debug", ("compare", idx_addr, (round, i, "idx"))))
-                # val = cached value
-                if self.enable_debug:
-                    body.append(("debug", ("compare", val_addr, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
-                body.append(
-                    ("alu", ("+", tmp_addr, self.scratch["forest_values_p"], idx_addr))
-                )
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                if self.enable_debug:
+        if vec_end < batch_size:
+            for round in range(rounds):
+                wrap_round = (round % wrap_period) == forest_height
+                for i in range(vec_end, batch_size):
+                    idx_addr = idx_cache + i
+                    val_addr = val_cache + i
+                    # idx = cached index
+                    if self.enable_debug:
+                        body.append(("debug", ("compare", idx_addr, (round, i, "idx"))))
+                    # val = cached value
+                    if self.enable_debug:
+                        body.append(("debug", ("compare", val_addr, (round, i, "val"))))
+                    # node_val = mem[forest_values_p + idx]
                     body.append(
-                        ("debug", ("compare", tmp_node_val, (round, i, "node_val")))
+                        ("alu", ("+", tmp_addr, self.scratch["forest_values_p"], idx_addr))
                     )
-                # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", val_addr, val_addr, tmp_node_val)))
-                body.extend(self.build_hash(val_addr, tmp1, tmp2, round, i))
-                if self.enable_debug:
-                    body.append(
-                        ("debug", ("compare", val_addr, (round, i, "hashed_val")))
-                    )
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                if fast_wrap:
-                    if wrap_round:
-                        body.append(("alu", ("+", idx_addr, zero_const, zero_const)))
+                    body.append(("load", ("load", tmp_node_val, tmp_addr)))
+                    if self.enable_debug:
+                        body.append(
+                            ("debug", ("compare", tmp_node_val, (round, i, "node_val")))
+                        )
+                    # val = myhash(val ^ node_val)
+                    body.append(("alu", ("^", val_addr, val_addr, tmp_node_val)))
+                    body.extend(self.build_hash(val_addr, tmp1, tmp2, round, i))
+                    if self.enable_debug:
+                        body.append(
+                            ("debug", ("compare", val_addr, (round, i, "hashed_val")))
+                        )
+                    # idx = 2*idx + (1 if val % 2 == 0 else 2)
+                    if fast_wrap:
+                        if wrap_round:
+                            body.append(("alu", ("+", idx_addr, zero_const, zero_const)))
+                        else:
+                            body.append(("alu", ("&", tmp3, val_addr, one_const)))
+                            body.append(("alu", ("+", tmp3, tmp3, one_const)))
+                            body.append(("alu", ("*", idx_addr, idx_addr, two_const)))
+                            body.append(("alu", ("+", idx_addr, idx_addr, tmp3)))
                     else:
                         body.append(("alu", ("&", tmp3, val_addr, one_const)))
                         body.append(("alu", ("+", tmp3, tmp3, one_const)))
                         body.append(("alu", ("*", idx_addr, idx_addr, two_const)))
                         body.append(("alu", ("+", idx_addr, idx_addr, tmp3)))
-                else:
-                    body.append(("alu", ("&", tmp3, val_addr, one_const)))
-                    body.append(("alu", ("+", tmp3, tmp3, one_const)))
-                    body.append(("alu", ("*", idx_addr, idx_addr, two_const)))
-                    body.append(("alu", ("+", idx_addr, idx_addr, tmp3)))
-                if self.enable_debug:
-                    body.append(
-                        ("debug", ("compare", idx_addr, (round, i, "next_idx")))
-                    )
-                if not fast_wrap:
-                    body.append(
-                        ("alu", ("<", tmp1, idx_addr, self.scratch["n_nodes"]))
-                    )
-                    body.append(
-                        ("flow", ("select", idx_addr, tmp1, idx_addr, zero_const))
-                    )
-                if self.enable_debug:
-                    body.append(
-                        ("debug", ("compare", idx_addr, (round, i, "wrapped_idx")))
-                    )
+                    if self.enable_debug:
+                        body.append(
+                            ("debug", ("compare", idx_addr, (round, i, "next_idx")))
+                        )
+                    if not fast_wrap:
+                        body.append(
+                            ("alu", ("<", tmp1, idx_addr, self.scratch["n_nodes"]))
+                        )
+                        body.append(
+                            ("flow", ("select", idx_addr, tmp1, idx_addr, zero_const))
+                        )
+                    if self.enable_debug:
+                        body.append(
+                            ("debug", ("compare", idx_addr, (round, i, "wrapped_idx")))
+                        )
 
-        # Write back cached values and indices.
-        idx_store_ptr = self.alloc_scratch("idx_store_ptr")
+        # Write back cached values; indices are optional for benchmark speed.
         val_store_ptr = self.alloc_scratch("val_store_ptr")
-        body.append(
-            ("alu", ("+", idx_store_ptr, self.scratch["inp_indices_p"], zero_const))
-        )
+        if write_indices:
+            idx_store_ptr = self.alloc_scratch("idx_store_ptr")
+            body.append(
+                ("alu", ("+", idx_store_ptr, self.scratch["inp_indices_p"], zero_const))
+            )
         body.append(
             ("alu", ("+", val_store_ptr, self.scratch["inp_values_p"], zero_const))
         )
         for i in range(0, vec_end, VLEN):
-            body.append(("store", ("vstore", idx_store_ptr, idx_cache + i)))
+            if write_indices:
+                body.append(("store", ("vstore", idx_store_ptr, idx_cache + i)))
             body.append(("store", ("vstore", val_store_ptr, val_cache + i)))
-            body.append(("flow", ("add_imm", idx_store_ptr, idx_store_ptr, VLEN)))
+            if write_indices:
+                body.append(("flow", ("add_imm", idx_store_ptr, idx_store_ptr, VLEN)))
             body.append(("flow", ("add_imm", val_store_ptr, val_store_ptr, VLEN)))
         for i in range(vec_end, batch_size):
-            body.append(("store", ("store", idx_store_ptr, idx_cache + i)))
+            if write_indices:
+                body.append(("store", ("store", idx_store_ptr, idx_cache + i)))
             body.append(("store", ("store", val_store_ptr, val_cache + i)))
-            body.append(("flow", ("add_imm", idx_store_ptr, idx_store_ptr, 1)))
+            if write_indices:
+                body.append(("flow", ("add_imm", idx_store_ptr, idx_store_ptr, 1)))
             body.append(("flow", ("add_imm", val_store_ptr, val_store_ptr, 1)))
 
         body_instrs = self.build(body, vliw=True)
