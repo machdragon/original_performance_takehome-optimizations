@@ -27,8 +27,9 @@ Implemented & tested changes
 - Phase 22 (parameter specialization): added parameter dispatch and specialized build_kernel_10_16_256 with hardcoded constants,
   fully unrolled 16-round and 4-block loops. Unrolled vselect tree implemented (deferred due to scratch constraints).
   Two-round jump composition implemented (8 steps for 16 rounds). Specialized version was slower (2367) due to same helper
-  functions, so using general kernel for now. Current: 2095 cycles (matching general kernel with write_indices=False).
-  Need 608 more cycles saved to reach <1487 target.
+  functions, so using general kernel for now.
+- Phase 23 (bundler improvements): increased lookahead from 16 to 128 for better load pulling, added VALU pulling when
+  blocked on loads. Result: 2013 cycles (saved 82 cycles from 2095). Need 526 more cycles to reach <1487 target.
 
 Verification performed
 - `python3 perf_takehome.py Tests.test_kernel_cycles` after each phase (latest: 2095 cycles; Phase 17 default off).
