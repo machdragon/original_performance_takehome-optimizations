@@ -132,11 +132,23 @@ class KernelBuilder:
             for engine, slot in slots:
                 instrs.append({engine: [slot]})
             return instrs
-
         instrs = []
         bundle = {}
         bundle_reads = set()
         bundle_writes = set()
+
+        slots_info = []
+        for engine, slot in slots:
+            reads, writes, barrier = self._slot_reads_writes(engine, slot)
+            slots_info.append(
+                {
+                    "engine": engine,
+                    "slot": slot,
+                    "reads": reads,
+                    "writes": writes,
+                    "barrier": barrier,
+                }
+            )
 
         def flush():
             nonlocal bundle, bundle_reads, bundle_writes
@@ -146,23 +158,79 @@ class KernelBuilder:
             bundle_reads = set()
             bundle_writes = set()
 
-        for engine, slot in slots:
-            reads, writes, barrier = self._slot_reads_writes(engine, slot)
+        def bundle_loads():
+            return len(bundle.get("load", []))
+
+        def find_pullable_load(start_idx, future_writes, lookahead=16):
+            skipped_writes = set()
+            skipped_reads = set()
+            for j in range(start_idx, min(len(slots_info), start_idx + lookahead)):
+                info = slots_info[j]
+                if info is None:
+                    continue
+                if info["barrier"]:
+                    break
+                reads = info["reads"]
+                writes = info["writes"]
+                if info["engine"] == "load":
+                    if reads & skipped_writes:
+                        pass
+                    elif reads & future_writes:
+                        pass
+                    elif writes & future_writes:
+                        pass
+                    elif writes & skipped_writes:
+                        pass
+                    elif writes & skipped_reads:
+                        pass
+                    else:
+                        return j
+                skipped_reads.update(reads)
+                skipped_writes.update(writes)
+            return None
+
+        i = 0
+        while i < len(slots_info):
+            info = slots_info[i]
+            if info is None:
+                i += 1
+                continue
+            engine = info["engine"]
+            slot = info["slot"]
+            reads = info["reads"]
+            writes = info["writes"]
+            barrier = info["barrier"]
+
             if barrier:
                 flush()
                 instrs.append({engine: [slot]})
+                i += 1
                 continue
+
+            if engine != "load" and bundle_loads() < SLOT_LIMITS["load"]:
+                future_writes = bundle_writes | writes
+                pull_idx = find_pullable_load(i + 1, future_writes)
+                if pull_idx is not None:
+                    pull = slots_info[pull_idx]
+                    slots_info[pull_idx] = None
+                    bundle.setdefault("load", []).append(pull["slot"])
+                    bundle_reads.update(pull["reads"])
+                    bundle_writes.update(pull["writes"])
 
             if len(bundle.get(engine, [])) >= SLOT_LIMITS[engine]:
                 flush()
+                continue
             if reads & bundle_writes:
                 flush()
+                continue
             if writes & bundle_writes:
                 flush()
+                continue
 
             bundle.setdefault(engine, []).append(slot)
             bundle_reads.update(reads)
             bundle_writes.update(writes)
+            i += 1
 
         flush()
         return instrs
