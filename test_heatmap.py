@@ -6,15 +6,16 @@ Generates a heatmap matrix over (block_size, lookahead) combinations
 to visualize parameter cliffs and interaction effects.
 """
 
-import sys
+import argparse
 import csv
 from perf_takehome import do_kernel_test
 
-def test_heatmap():
+def parse_int_list(value):
+    return [int(v) for v in value.split(",") if v]
+
+
+def test_heatmap(block_sizes, lookahead_values, output_path):
     """Generate heatmap data for block_size x lookahead combinations."""
-    block_sizes = [4, 6, 8, 10, 12, 14, 16, 18]
-    lookahead_values = [512, 1024, 2048, 4096]
-    
     results = []
     baseline = None
     
@@ -81,13 +82,12 @@ def test_heatmap():
                 print(f"{block_size:3d}, {lookahead:5d}, {'N/A':>5s}, {status}: {e}")
     
     # Write CSV
-    csv_filename = "heatmap_results.csv"
-    with open(csv_filename, 'w', newline='') as f:
+    with open(output_path, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=['block_size', 'lookahead', 'cycles', 'status', 'vs_baseline'])
         writer.writeheader()
         writer.writerows(results)
-    
-    print(f"\nResults written to {csv_filename}")
+
+    print(f"\nResults written to {output_path}")
     
     # Generate summary statistics
     valid_results = [r for r in results if r['cycles'] is not None]
@@ -121,4 +121,12 @@ def test_heatmap():
     return results
 
 if __name__ == "__main__":
-    test_heatmap()
+    parser = argparse.ArgumentParser(description="Generate heatmap for block_size/lookahead combos")
+    parser.add_argument("--block-sizes", default="4,6,8,10,12,14,16,18")
+    parser.add_argument("--lookaheads", default="512,1024,2048,4096")
+    parser.add_argument("--output", default="heatmap_results.csv")
+    args = parser.parse_args()
+
+    block_sizes = parse_int_list(args.block_sizes)
+    lookahead_values = parse_int_list(args.lookaheads)
+    test_heatmap(block_sizes, lookahead_values, args.output)
