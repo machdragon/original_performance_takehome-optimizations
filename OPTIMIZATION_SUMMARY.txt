@@ -20,6 +20,8 @@ Implemented & tested changes
 - Phase 18 (analysis): load-bound investigation and vselect engine mismatch (flow, not valu); confirmed arith selection regressions.
 - Phase 19 (prefetch attempt): added optional lookahead prefetch buffer and scheduling to overlap arith rounds with next-round loads
   (enable_prefetch flag). With max_arith_level=2 + enable_prefetch=True, regressed to 2150 cycles; left off by default.
+- Phase 20 (prefetch schedule tweak): prefetch only block 0 during arith rounds and consume it in the next round. Improves
+  max_arith_level=2 + enable_prefetch=True to 2114 cycles (vs 2116 without prefetch), still above baseline.
 
 Verification performed
 - `python3 perf_takehome.py Tests.test_kernel_cycles` after each phase (latest: 2095 cycles; Phase 17 default off).

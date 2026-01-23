@@ -1408,7 +1408,7 @@ class KernelBuilder:
                 use_prefetch = prefetch_active[round]
                 do_prefetch_next = prefetch_next[round]
                 node_prefetch = v_node_prefetch if use_prefetch else None
-                special_round = use_prefetch or do_prefetch_next
+                special_round = info["arith_round"] and enable_prefetch
 
                 if pending_prev:
                     last_buf = last_block_idx % 2
@@ -1458,24 +1458,37 @@ class KernelBuilder:
                             info["node_arith"],
                             node_prefetch,
                         )
-                        # Prefetch one block behind so idx updates are already committed.
-                        load_slots = (
-                            vec_block_prefetch_slots(
-                                all_block_vecs[block_idx - 1], v_node_prefetch
+                        # Prefetch only block 0, issued one block behind so idx updates are committed.
+                        load_slots = []
+                        if do_prefetch_next and block_idx == 1:
+                            load_slots = vec_block_prefetch_slots(
+                                all_block_vecs[0], v_node_prefetch
                             )
-                            if do_prefetch_next
-                            else []
-                        )
                         body.extend(interleave_slots(hash_slots, load_slots))
-                    if do_prefetch_next:
-                        body.extend(
-                            vec_block_prefetch_slots(
-                                all_block_vecs[num_blocks - 1], v_node_prefetch
-                            )
-                        )
                     pending_prev = False
                 else:
-                    if not pending_prev:
+                    start_block = 1
+                    if use_prefetch:
+                        # Block 0 is prefetched; hash it while loading block 1.
+                        hash_slots = vec_block_hash_only_slots(
+                            block_0_vecs,
+                            0,
+                            info["wrap_round"],
+                            info["node_const"],
+                            info["node_pair"],
+                            info["node_arith"],
+                            node_prefetch,
+                        )
+                        load_slots = vec_block_load_slots(
+                            all_block_vecs[1],
+                            1,
+                            info["node_const"],
+                            info["node_pair"],
+                            info["node_arith"],
+                        )
+                        body.extend(interleave_slots(hash_slots, load_slots))
+                        start_block = 2
+                    elif not pending_prev:
                         body.extend(
                             vec_block_load_slots(
                                 block_0_vecs,
@@ -1483,10 +1496,9 @@ class KernelBuilder:
                                 info["node_const"],
                                 info["node_pair"],
                                 info["node_arith"],
-                                node_prefetch,
                             )
                         )
-                    for block_idx in range(1, num_blocks):
+                    for block_idx in range(start_block, num_blocks):
                         prev_buf = (block_idx - 1) % 2
                         curr_buf = block_idx % 2
                         hash_slots = vec_block_hash_only_slots(
@@ -1496,7 +1508,6 @@ class KernelBuilder:
                             info["node_const"],
                             info["node_pair"],
                             info["node_arith"],
-                            node_prefetch,
                         )
                         load_slots = vec_block_load_slots(
                             all_block_vecs[block_idx],
@@ -1504,13 +1515,13 @@ class KernelBuilder:
                             info["node_const"],
                             info["node_pair"],
                             info["node_arith"],
-                            node_prefetch,
                         )
                         body.extend(interleave_slots(hash_slots, load_slots))
                     pending_prev = True
 
                 prev_info = info
-                prev_use_prefetch = use_prefetch
+                # Prefetch only covers block 0; epilogue uses normal buffers.
+                prev_use_prefetch = False
 
             if pending_prev:
                 last_buf = last_block_idx % 2
