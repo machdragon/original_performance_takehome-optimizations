@@ -643,11 +643,12 @@ class KernelBuilder:
             forest_height, n_nodes, batch_size, rounds, write_indices
         )
     
-    def build_kernel_10_16_256(self, n_nodes: int, write_indices: bool = True):
+    def build_kernel_10_16_256(self, n_nodes: int, write_indices: bool = False):
         """
         Specialized kernel for (forest_height=10, rounds=16, batch_size=256).
         This is the benchmark case used in submission tests.
         Hardcoded constants: vec_count=32, block_size=8, num_blocks=4, wrap_period=11
+        Default write_indices=False for best performance (matches 2095 baseline)
         """
         # Hardcoded constants for (10, 16, 256)
         forest_height = 10
