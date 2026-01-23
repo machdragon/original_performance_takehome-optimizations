@@ -14,9 +14,10 @@ Implemented & tested changes
 - Phase 11 (uniform-round broadcast): when indices are known to be all zero (round % wrap_period == 0 with fast_wrap), skip address + load_offset and hash against a root-value vector. Cycle count: 2828.
 - Phase 12 (index multiply-add): replace vector index double + add with a single multiply_add using v_two, reducing VALU ops in fast_wrap path. Cycle count: 2469.
 - Phase 13 (larger blocks + level-1 parity): increase block_size to 8 and enable level-1 node_pair shortcut (now using multiply_add). Cycle count: 2293.
+- Phase 14 (zero-index init): when assume_zero_indices, initialize idx_cache with vbroadcast and skip index vloads; values still vloaded. Cycle count: 2260.
 
 Verification performed
-- `python3 perf_takehome.py Tests.test_kernel_cycles` after each phase (latest: 2293 cycles).
+- `python3 perf_takehome.py Tests.test_kernel_cycles` after each phase (latest: 2260 cycles).
 - Scalar tail sanity check with debug on: `do_kernel_test(4, 5, 10, enable_debug=True)` (last run prior to Phase 8).
 
 Flagged comments status
