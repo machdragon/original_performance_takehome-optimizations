@@ -707,31 +707,33 @@ class KernelBuilder:
         elif info["binary_round"]:
             # Level-1 pair - no loads needed
             return slots
-        elif info.get("level2_round", False) and level2_vecs_base is not None:
-            # Level 2: use unrolled where-tree with reused scratch
-            # Load scalars on-demand, broadcast to reused v_tmp2_block
+        elif info.get("level2_round", False):
+            # Level 2: use unrolled where-tree with v_node_block[0] reuse
+            # Load scalars on-demand, broadcast to v_node_block[0] (temporary storage)
             slots.append(("alu", ("+", level2_addr_temp, self.scratch["forest_values_p"], level2_base_addr)))
             for i in range(4):
                 slots.append(("load", ("load", level2_scalars_temp + i, level2_addr_temp)))
                 slots.append(("flow", ("add_imm", level2_addr_temp, level2_addr_temp, 1)))
             
-            # Broadcast to vectors (reuse v_tmp2_block - safe since level 2 rounds don't use it for hash)
+            # Broadcast to vectors (reuse v_node_block[0] - safe since we're not loading to it in level 2 rounds)
             level2_vecs = level2_vecs_base
             for i in range(4):
                 slots.append(("valu", ("vbroadcast", level2_vecs + i * VLEN, level2_scalars_temp + i)))
             
-            # For each vector in block, build where-tree (reuse tree temp space)
+            # For each vector in block, build where-tree
+            # Use v_node_block[0] + 4*VLEN as temp (we'll overwrite with selected values anyway)
             for bi, vec_i in enumerate(block_vecs):
                 v_idx = idx_cache + vec_i
                 v_level_start = self.scratch_vconst(3)
                 relative_idx_vec = self.alloc_scratch(f"rel_idx_l2_{bi}_{buf_idx}", VLEN)
                 slots.append(("valu", ("-", relative_idx_vec, v_idx, v_level_start)))
-                # Tree temp reused across vectors (blocks processed sequentially)
-                tree_temp = level2_tree_tmp_base
+                # Tree temp: use space after vectors in v_node_block[0], but we'll overwrite it
+                tree_temp = level2_vecs_base + 4 * VLEN  # After the 4 vectors
                 final_out, tree_slots = self.build_vselect_tree(
                     level2_vecs, relative_idx_vec, 4, tree_temp, info["round"], vec_i // VLEN
                 )
                 slots.extend(tree_slots)
+                # Copy selected value to node buffer (overwrites temp space, which is fine)
                 slots.append(("valu", ("+", node_buf + bi * VLEN, final_out, v_zero)))
             return slots
         
@@ -958,13 +960,15 @@ class KernelBuilder:
         self.add("valu", ("vbroadcast", v_level1_right, level1_right))
         self.add("valu", ("-", v_level1_diff, v_level1_left, v_level1_right))
 
-        # Level 2 where-tree: deferred due to scratch constraints
-        # Will optimize schedule and other areas first
+        # Level 2 where-tree: reuse v_node_block[0] for vectors during level 2 rounds
+        # Strategy: Use v_node_block[0] to store 4 level 2 vectors (32 words), then overwrite with selected values
+        # Safe because level 2 rounds use where-tree instead of loading to v_node_block[0]
         level2_base_addr = self.scratch_const(3)  # Level 2 starts at index 3
-        level2_vecs_base = None
-        level2_tree_tmp_base = None
-        level2_addr_temp = None
-        level2_scalars_temp = None
+        level2_vecs_base = v_node_block[0]  # Reuse v_node_block[0] for level 2 vectors
+        level2_tree_tmp_base = v_node_block[0] + 4 * VLEN  # Tree temps after vectors (but we'll overwrite)
+        # Allocate scratch for level 2 loading (reused across all level 2 rounds)
+        level2_addr_temp = self.alloc_scratch("level2_addr_temp")
+        level2_scalars_temp = self.alloc_scratch("level2_scalars_temp", 4)
 
         # Round info not needed - fully unrolled below
 
@@ -1341,6 +1345,14 @@ class KernelBuilder:
         v_tmp4_block = None
         if enable_arith:
             v_tmp4_block = self.alloc_scratch("v_tmp4_block", block_size * VLEN)
+        
+        # Level 2 where-tree: deferred due to scratch constraints with block_size=16
+        # Would need 4 words for scalars + reuse strategy, but block_size=16 uses too much scratch
+        level2_base_addr = self.scratch_const(3)  # Level 2 starts at index 3
+        level2_vecs_base = None  # Disabled - scratch too tight
+        level2_tree_tmp_base = None
+        level2_addr_temp = None
+        level2_scalars_temp = None
 
         max_special = min(self.max_special_level, forest_height)
         use_special = self.assume_zero_indices and max_special >= 0
@@ -1728,6 +1740,8 @@ class KernelBuilder:
             node_pair=None,
             node_arith=None,
             node_prefetch=None,
+            level2_round=False,
+            round_num=0,
         ):
             """Load node values for a block into the specified buffer."""
             slots = []
@@ -1738,6 +1752,42 @@ class KernelBuilder:
                 or node_prefetch is not None
             ):
                 return slots
+            
+            # Level 2: use unrolled where-tree with v_node_block[0] reuse (disabled - scratch too tight)
+            if False and level2_round:
+                # Load scalars on-demand, broadcast to v_node_block[0] (temporary storage)
+                # Reuse v_addr[0] for level2_addr_temp and v_tmp1 for level2_scalars_temp
+                slots.append(("alu", ("+", level2_addr_temp, self.scratch["forest_values_p"], level2_base_addr)))
+                for i in range(4):
+                    slots.append(("load", ("load", level2_scalars_temp + i, level2_addr_temp)))
+                    if i < 3:  # Don't increment on last iteration
+                        slots.append(("flow", ("add_imm", level2_addr_temp, level2_addr_temp, 1)))
+                
+                # Broadcast to vectors (reuse v_node_block[0] - safe since we're not loading to it in level 2 rounds)
+                level2_vecs = level2_vecs_base
+                for i in range(4):
+                    slots.append(("valu", ("vbroadcast", level2_vecs + i * VLEN, level2_scalars_temp + i)))
+                
+                # For each vector in block, build where-tree
+                node_buf = v_node_block[buf_idx]
+                # Reuse v_tmp2 and v_tmp3 for relative_idx_vec (they're only used during hash)
+                # We need one vector per block, so reuse across vectors in the block
+                relative_idx_vec = v_tmp2  # Reuse v_tmp2 (vector, only used during hash)
+                for bi, vec_i in enumerate(block_vecs):
+                    v_idx = idx_cache + vec_i
+                    v_level_start = self.scratch_vconst(3)
+                    slots.append(("valu", ("-", relative_idx_vec, v_idx, v_level_start)))
+                    # Tree temp: use space after vectors in v_node_block[0], but we'll overwrite it
+                    tree_temp = level2_vecs_base + 4 * VLEN  # After the 4 vectors
+                    final_out, tree_slots = self.build_vselect_tree(
+                        level2_vecs, relative_idx_vec, 4, tree_temp, round_num, vec_i // VLEN
+                    )
+                    slots.extend(tree_slots)
+                    # Copy selected value to node buffer (overwrites temp space, which is fine)
+                    slots.append(("valu", ("+", node_buf + bi * VLEN, final_out, v_zero)))
+                return slots
+            
+            # Regular load path for levels 3+
             node_buf = v_node_block[buf_idx]
             for bi, vec_i in enumerate(block_vecs):
                 v_idx = idx_cache + vec_i
@@ -2065,7 +2115,7 @@ class KernelBuilder:
         ):
             """Combined load + hash (non-pipelined fallback)."""
             slots = vec_block_load_slots(
-                block_vecs, 0, node_const, node_pair, node_arith, node_prefetch
+                block_vecs, 0, node_const, node_pair, node_arith, node_prefetch, False
             )
             slots.extend(
                 vec_block_hash_only_slots(
@@ -2212,6 +2262,7 @@ class KernelBuilder:
                     else None
                 )
                 node_arith = level_arith[level] if arith_round else None
+                level2_round = fast_wrap and level == 2
                 round_info.append(
                     {
                         "round": round,
@@ -2224,8 +2275,10 @@ class KernelBuilder:
                             node_const is None
                             and node_pair is None
                             and node_arith is None
+                            and not level2_round  # Level 2 uses where-tree, not loads
                         ),
                         "arith_round": arith_round,
+                        "level2_round": level2_round,
                     }
                 )
             if v_node_prefetch is not None:
@@ -2287,6 +2340,8 @@ class KernelBuilder:
                             info["node_pair"],
                             info["node_arith"],
                             node_prefetch,
+                            info.get("level2_round", False),
+                            info["round"],
                         )
                         body.extend(interleave_slots(hash_prev, load_slots))
 
@@ -2448,7 +2503,7 @@ class KernelBuilder:
                             ]
                             body.extend(
                                 vec_block_load_slots(
-                                    block_0_vecs, 0, node_const, node_pair, node_arith
+                                    block_0_vecs, 0, node_const, node_pair, node_arith, None, False
                                 )
                             )
                             for block_idx in range(1, num_blocks):
@@ -2468,6 +2523,8 @@ class KernelBuilder:
                                     node_const,
                                     node_pair,
                                     node_arith,
+                                    None,
+                                    False,
                                 )
                                 body.extend(interleave_slots(hash_slots, load_slots))
                             last_buf = (num_blocks - 1) % 2
