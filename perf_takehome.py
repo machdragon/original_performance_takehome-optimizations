@@ -760,11 +760,21 @@ class KernelBuilder:
                             body.extend(
                                 vec_block_hash_slots(block_vecs, round, wrap_round)
                             )
-                        for vec in range(block_limit, vec_count):
-                            buf = vec % 2
-                            body.extend(vec_load_slots(vec * VLEN, buf))
+                        if block_limit < vec_count:
+                            start_vec = block_limit
+                            body.extend(vec_load_slots(start_vec * VLEN, start_vec % 2))
+                            for vec in range(start_vec + 1, vec_count):
+                                prev = vec - 1
+                                hash_slots = vec_hash_slots(
+                                    prev * VLEN, prev % 2, round, wrap_round
+                                )
+                                load_slots = vec_load_slots(vec * VLEN, vec % 2)
+                                body.extend(interleave_slots(hash_slots, load_slots))
+                            last_vec = vec_count - 1
                             body.extend(
-                                vec_hash_slots(vec * VLEN, buf, round, wrap_round)
+                                vec_hash_slots(
+                                    last_vec * VLEN, last_vec % 2, round, wrap_round
+                                )
                             )
                     else:
                         # Prologue: load vector 0
