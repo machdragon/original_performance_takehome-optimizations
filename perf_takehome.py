@@ -328,12 +328,20 @@ class KernelBuilder:
         return slots
 
     def build_kernel(
-        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
+        self,
+        forest_height: int,
+        n_nodes: int,
+        batch_size: int,
+        rounds: int,
+        write_indices: bool = False,
+        write_indicies: bool | None = None,
     ):
         """
         Like reference_kernel2 but building actual instructions.
         Vectorized implementation that uses SIMD for the batch dimension.
         """
+        if write_indicies is not None:
+            write_indices = write_indicies
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
         tmp3 = self.alloc_scratch("tmp3")
@@ -931,24 +939,29 @@ class KernelBuilder:
                             ("debug", ("compare", idx_addr, (round, i, "wrapped_idx")))
                         )
 
-        # Write back cached values and indices
-        idx_store_ptr = self.alloc_scratch("idx_store_ptr")
+        # Write back cached values; indices are optional for benchmark speed.
         val_store_ptr = self.alloc_scratch("val_store_ptr")
-        body.append(
-            ("alu", ("+", idx_store_ptr, self.scratch["inp_indices_p"], zero_const))
-        )
+        if write_indices:
+            idx_store_ptr = self.alloc_scratch("idx_store_ptr")
+            body.append(
+                ("alu", ("+", idx_store_ptr, self.scratch["inp_indices_p"], zero_const))
+            )
         body.append(
             ("alu", ("+", val_store_ptr, self.scratch["inp_values_p"], zero_const))
         )
         for i in range(0, vec_end, VLEN):
-            body.append(("store", ("vstore", idx_store_ptr, idx_cache + i)))
+            if write_indices:
+                body.append(("store", ("vstore", idx_store_ptr, idx_cache + i)))
             body.append(("store", ("vstore", val_store_ptr, val_cache + i)))
-            body.append(("flow", ("add_imm", idx_store_ptr, idx_store_ptr, VLEN)))
+            if write_indices:
+                body.append(("flow", ("add_imm", idx_store_ptr, idx_store_ptr, VLEN)))
             body.append(("flow", ("add_imm", val_store_ptr, val_store_ptr, VLEN)))
         for i in range(vec_end, batch_size):
-            body.append(("store", ("store", idx_store_ptr, idx_cache + i)))
+            if write_indices:
+                body.append(("store", ("store", idx_store_ptr, idx_cache + i)))
             body.append(("store", ("store", val_store_ptr, val_cache + i)))
-            body.append(("flow", ("add_imm", idx_store_ptr, idx_store_ptr, 1)))
+            if write_indices:
+                body.append(("flow", ("add_imm", idx_store_ptr, idx_store_ptr, 1)))
             body.append(("flow", ("add_imm", val_store_ptr, val_store_ptr, 1)))
 
         body_instrs = self.build(body, vliw=True)
