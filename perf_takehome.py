@@ -167,9 +167,37 @@ class KernelBuilder:
         def bundle_loads():
             return len(bundle.get("load", []))
 
-        def find_pullable_load(start_idx, future_writes, future_reads, lookahead=16):
-            skipped_writes = set()
-            skipped_reads = set()
+        def engine_full(engine_name):
+            return len(bundle.get(engine_name, [])) >= SLOT_LIMITS[engine_name]
+
+        def add_to_bundle(info):
+            bundle.setdefault(info["engine"], []).append(info["slot"])
+            bundle_reads.update(info["reads"])
+            bundle_writes.update(info["writes"])
+
+        def can_add_now(info):
+            if engine_full(info["engine"]):
+                return False
+            if info["reads"] & bundle_writes:
+                return False
+            if info["writes"] & bundle_writes:
+                return False
+            return True
+
+        def find_pullable_slot(
+            start_idx,
+            future_writes,
+            engine_filter=None,
+            lookahead=16,
+            init_skipped_reads=None,
+            init_skipped_writes=None,
+        ):
+            skipped_writes = (
+                set() if init_skipped_writes is None else set(init_skipped_writes)
+            )
+            skipped_reads = (
+                set() if init_skipped_reads is None else set(init_skipped_reads)
+            )
             for j in range(start_idx, min(len(slots_info), start_idx + lookahead)):
                 info = slots_info[j]
                 if info is None:
@@ -178,21 +206,26 @@ class KernelBuilder:
                     break
                 reads = info["reads"]
                 writes = info["writes"]
-                if info["engine"] == "load":
-                    if reads & skipped_writes:
-                        pass
-                    elif reads & future_writes:
-                        pass
-                    elif writes & future_writes:
-                        pass
-                    elif writes & future_reads:
-                        pass
-                    elif writes & skipped_writes:
-                        pass
-                    elif writes & skipped_reads:
-                        pass
-                    else:
-                        return j
+                if engine_filter is not None and info["engine"] != engine_filter:
+                    skipped_reads.update(reads)
+                    skipped_writes.update(writes)
+                    continue
+                if engine_full(info["engine"]):
+                    skipped_reads.update(reads)
+                    skipped_writes.update(writes)
+                    continue
+                if reads & skipped_writes:
+                    pass
+                elif writes & skipped_writes:
+                    pass
+                elif writes & skipped_reads:
+                    pass
+                elif reads & future_writes:
+                    pass
+                elif writes & future_writes:
+                    pass
+                else:
+                    return j
                 skipped_reads.update(reads)
                 skipped_writes.update(writes)
             return None
@@ -216,29 +249,41 @@ class KernelBuilder:
                 continue
 
             if engine != "load" and bundle_loads() < SLOT_LIMITS["load"]:
-                future_writes = bundle_writes | writes
-                future_reads = bundle_reads | reads
-                pull_idx = find_pullable_load(i + 1, future_writes, future_reads)
-                if pull_idx is not None:
+                while bundle_loads() < SLOT_LIMITS["load"]:
+                    future_writes = bundle_writes | writes
+                    pull_idx = find_pullable_slot(
+                        i + 1,
+                        future_writes,
+                        engine_filter="load",
+                    )
+                    if pull_idx is None:
+                        break
                     pull = slots_info[pull_idx]
                     slots_info[pull_idx] = None
-                    bundle.setdefault("load", []).append(pull["slot"])
-                    bundle_reads.update(pull["reads"])
-                    bundle_writes.update(pull["writes"])
+                    add_to_bundle(pull)
 
-            if len(bundle.get(engine, [])) >= SLOT_LIMITS[engine]:
-                flush()
-                continue
-            if reads & bundle_writes:
-                flush()
-                continue
-            if writes & bundle_writes:
-                flush()
+            if not can_add_now(info):
+                if bundle:
+                    blocked_reads = reads
+                    blocked_writes = writes
+                    while True:
+                        pull_idx = find_pullable_slot(
+                            i + 1,
+                            bundle_writes,
+                            init_skipped_reads=blocked_reads,
+                            init_skipped_writes=blocked_writes,
+                        )
+                        if pull_idx is None:
+                            break
+                        pull = slots_info[pull_idx]
+                        slots_info[pull_idx] = None
+                        add_to_bundle(pull)
+                    flush()
+                else:
+                    flush()
                 continue
 
-            bundle.setdefault(engine, []).append(slot)
-            bundle_reads.update(reads)
-            bundle_writes.update(writes)
+            add_to_bundle(info)
             i += 1
 
         flush()
