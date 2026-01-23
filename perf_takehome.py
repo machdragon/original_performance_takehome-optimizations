@@ -378,7 +378,7 @@ class KernelBuilder:
 
     def build_vselect_tree(
         self,
-        level_values_base: int,
+        all_level_vecs: int,
         relative_idx_vec: int,
         level_size: int,
         temp_base: int,
@@ -386,14 +386,14 @@ class KernelBuilder:
         vec: int,
     ):
         """
-        Recursively build a vselect tree for small level gathers.
-        Similar to tinygrad's select_with_where_tree: halves the tree until one value.
-        Returns (final_output_vec_addr, slots_list).
+        Non-recursive, unrolled vselect tree for levels <=2 (up to 4 nodes).
+        Hardcoded layers to minimize slots and improve packing.
+        Assumes all_level_vecs is pre-broadcast (shared across vectors).
         
         Args:
-            level_values_base: Base address of scalar level values in scratch
+            all_level_vecs: Base address of pre-broadcast level vectors (level_size * VLEN words)
             relative_idx_vec: Vector register containing relative indices (idx - level_start)
-            level_size: Number of nodes in this level (must be power of 2)
+            level_size: Number of nodes in this level (must be power of 2, <= 4)
             temp_base: Base address for temporary vector storage
             round: Round number (for debug)
             vec: Vector index (for debug)
@@ -403,47 +403,72 @@ class KernelBuilder:
         """
         slots = []
         
-        if level_size == 1:
-            # Base case: broadcast the single value
-            out_vec = temp_base
-            scalar_val = level_values_base  # Single scalar
-            slots.append(("valu", ("vbroadcast", out_vec, scalar_val)))
+        if level_size <= 1:
+            # Base: direct leaf (pre-broadcast)
+            out = all_level_vecs
             if self.enable_debug:
                 slots.append(
                     (
                         "debug",
                         (
                             "vcompare",
-                            out_vec,
+                            out,
                             [(round, vec * VLEN + l, "node_val") for l in range(VLEN)],
                         ),
                     )
                 )
-            return out_vec, slots
+            return out, slots
 
-        mid = level_size // 2
-        # Recurse left and right
-        left_base = temp_base
-        left_out, left_slots = self.build_vselect_tree(
-            level_values_base, relative_idx_vec, mid, left_base, round, vec
-        )
-        slots.extend(left_slots)
+        current_out = all_level_vecs
+        rel_idx = relative_idx_vec
+        v_zero = self.scratch_vconst(0)
 
-        right_base = left_base + mid * VLEN  # Offset for right subtree temps
-        right_start = level_values_base + mid
-        right_out, right_slots = self.build_vselect_tree(
-            right_start, relative_idx_vec, level_size - mid, right_base, round, vec
-        )
-        slots.extend(right_slots)
+        # Layer 1: Select between first half and second half
+        mid1 = level_size // 2
+        v_mid1 = self.scratch_vconst(mid1)
+        go_left1 = self.alloc_scratch(f"go_left1_{vec}", VLEN)
+        slots.append(("valu", ("<", go_left1, rel_idx, v_mid1)))
 
-        # Select between left/right based on relative_idx < mid
-        v_mid = self.scratch_vconst(mid)
-        go_left_vec = self.alloc_scratch(f"go_left_vec_{level_size}_{vec}", VLEN)
-        slots.append(("valu", ("<", go_left_vec, relative_idx_vec, v_mid)))
+        left1 = current_out
+        right1 = current_out + mid1 * VLEN
+        out1 = temp_base
+        slots.append(("flow", ("vselect", out1, go_left1, left1, right1)))
 
-        # Final output
-        final_out = right_base + (level_size - mid) * VLEN  # Next temp slot
-        slots.append(("flow", ("vselect", final_out, go_left_vec, left_out, right_out)))
+        # Compute next relative index: subtract mid1 if we went right
+        # multiply_add: subtract_mid1 = go_left1 * 0 + (1 - go_left1) * mid1
+        # But we want: subtract_mid1 = (1 - go_left1) * mid1 = mid1 - go_left1 * mid1
+        # Simpler: use vselect to choose 0 or mid1 based on go_left1
+        subtract_mid1 = self.alloc_scratch(f"subtract_mid1_{vec}", VLEN)
+        slots.append(("flow", ("vselect", subtract_mid1, go_left1, v_zero, v_mid1)))
+        next_rel_idx1 = self.alloc_scratch(f"next_rel_idx1_{vec}", VLEN)
+        slots.append(("valu", ("-", next_rel_idx1, rel_idx, subtract_mid1)))
+
+        # Layer 2: Select within the chosen half (only if level_size > 2)
+        if level_size > 2:
+            mid2 = mid1 // 2
+            v_mid2 = self.scratch_vconst(mid2)
+            go_left2 = self.alloc_scratch(f"go_left2_{vec}", VLEN)
+            slots.append(("valu", ("<", go_left2, next_rel_idx1, v_mid2)))
+
+            left2 = out1
+            right2 = out1 + mid2 * VLEN
+            out2 = temp_base + VLEN  # Reuse temp space
+            slots.append(("flow", ("vselect", out2, go_left2, left2, right2)))
+            final_out = out2
+        else:
+            final_out = out1
+
+        if self.enable_debug:
+            slots.append(
+                (
+                    "debug",
+                    (
+                        "vcompare",
+                        final_out,
+                        [(round, vec * VLEN + l, "node_val") for l in range(VLEN)],
+                    ),
+                )
+            )
 
         return final_out, slots
 
@@ -519,7 +544,7 @@ class KernelBuilder:
 
     def _vec_block_load_slots_specialized(
         self, block_vecs, buf_idx, info, v_root_node, v_level1_right, v_level1_diff,
-        idx_cache, v_forest_p, v_addr, v_node_block
+        idx_cache, v_forest_p, v_addr, v_node_block, level2_values, level2_base_addr, level2_tree_tmp, v_zero, v_tmp1_block
     ):
         """Load node values for a block using specialized optimizations."""
         slots = []
@@ -531,8 +556,36 @@ class KernelBuilder:
         elif info["binary_round"]:
             # Level-1 pair - no loads needed
             return slots
+        elif info.get("level2_round", False) and level2_values is not None:
+            # Level 2: use unrolled where-tree (if scratch allows)
+            # Load scalars on-demand, then broadcast and build tree
+            level2_addr = self.alloc_scratch("level2_addr_temp")
+            slots.append(("alu", ("+", level2_addr, self.scratch["forest_values_p"], level2_base_addr)))
+            level2_scalars = self.alloc_scratch("level2_scalars_temp", 4)
+            for i in range(4):
+                slots.append(("load", ("load", level2_scalars + i, level2_addr)))
+                slots.append(("flow", ("add_imm", level2_addr, level2_addr, 1)))
+            
+            # Broadcast to vectors (reuse v_node_block temporarily for broadcasts)
+            level2_vecs = v_node_block[buf_idx]  # Temporary reuse
+            for i in range(4):
+                slots.append(("valu", ("vbroadcast", level2_vecs + i * VLEN, level2_scalars + i)))
+            
+            # For each vector in block, build where-tree
+            tree_temp = v_tmp1_block  # Reuse block temp
+            for bi, vec_i in enumerate(block_vecs):
+                v_idx = idx_cache + vec_i
+                v_level_start = self.scratch_vconst(3)
+                relative_idx_vec = self.alloc_scratch(f"rel_idx_l2_{bi}_{buf_idx}", VLEN)
+                slots.append(("valu", ("-", relative_idx_vec, v_idx, v_level_start)))
+                final_out, tree_slots = self.build_vselect_tree(
+                    level2_vecs, relative_idx_vec, 4, tree_temp + bi * 4 * VLEN, info["round"], vec_i // VLEN
+                )
+                slots.extend(tree_slots)
+                slots.append(("valu", ("+", node_buf + bi * VLEN, final_out, v_zero)))
+            return slots
         
-        # Regular load path for all levels (where-tree deferred to after unrolling)
+        # Regular load path for levels 3+
         for bi, vec_i in enumerate(block_vecs):
             v_idx = idx_cache + vec_i
             slots.append(("valu", ("+", v_addr[0], v_idx, v_forest_p)))
@@ -750,9 +803,10 @@ class KernelBuilder:
         self.add("valu", ("vbroadcast", v_level1_right, level1_right))
         self.add("valu", ("-", v_level1_diff, v_level1_left, v_level1_right))
 
-        # Level 2 where-tree optimization deferred due to scratch constraints
-        # Will integrate after unrolling optimizations
-        level2_vecs = None
+        # Level 2 where-tree: deferred due to scratch constraints
+        # Will use on-demand loading in the load function to avoid pre-allocation
+        level2_values = None
+        level2_base_addr = self.scratch_const(3)  # Level 2 starts at index 3
         level2_tree_tmp = None
 
         # Round info not needed - fully unrolled below
@@ -773,13 +827,14 @@ class KernelBuilder:
 
         # Helper to emit a single round's processing with unrolled blocks
         def emit_round(round_num, level, wrap_round, uniform_round, binary_round):
+            level2_round = fast_wrap and level == 2
             info = {
                 "round": round_num,
                 "level": level,
                 "wrap_round": wrap_round,
                 "uniform_round": uniform_round,
                 "binary_round": binary_round,
-                "level2_round": False,
+                "level2_round": level2_round,
                 "level3_round": False,
                 "level4_round": False,
             }
@@ -788,7 +843,7 @@ class KernelBuilder:
             # Load block 0
             round_body.extend(self._vec_block_load_slots_specialized(
                 block_0_vecs, 0, info, v_root_node, v_level1_right, v_level1_diff,
-                idx_cache, v_forest_p, v_addr, v_node_block
+                idx_cache, v_forest_p, v_addr, v_node_block, level2_values, level2_base_addr, level2_tree_tmp, v_zero, v_tmp1_block
             ))
 
             # Unroll blocks 1-3 (num_blocks=4, so blocks 0,1,2,3)
@@ -801,7 +856,7 @@ class KernelBuilder:
             )
             load_slots_1 = self._vec_block_load_slots_specialized(
                 all_block_vecs[1], 1, info, v_root_node, v_level1_right, v_level1_diff,
-                idx_cache, v_forest_p, v_addr, v_node_block
+                idx_cache, v_forest_p, v_addr, v_node_block, level2_values, level2_base_addr, level2_tree_tmp, v_zero, v_tmp1_block
             )
             round_body.extend(self._interleave_slots(hash_slots_1, load_slots_1))
             
@@ -814,7 +869,7 @@ class KernelBuilder:
             )
             load_slots_2 = self._vec_block_load_slots_specialized(
                 all_block_vecs[2], 0, info, v_root_node, v_level1_right, v_level1_diff,
-                idx_cache, v_forest_p, v_addr, v_node_block
+                idx_cache, v_forest_p, v_addr, v_node_block, level2_values, level2_base_addr, level2_tree_tmp, v_zero, v_tmp1_block
             )
             round_body.extend(self._interleave_slots(hash_slots_2, load_slots_2))
             
@@ -827,7 +882,7 @@ class KernelBuilder:
             )
             load_slots_3 = self._vec_block_load_slots_specialized(
                 all_block_vecs[3], 1, info, v_root_node, v_level1_right, v_level1_diff,
-                idx_cache, v_forest_p, v_addr, v_node_block
+                idx_cache, v_forest_p, v_addr, v_node_block, level2_values, level2_base_addr, level2_tree_tmp, v_zero, v_tmp1_block
             )
             round_body.extend(self._interleave_slots(hash_slots_3, load_slots_3))
             
