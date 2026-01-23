@@ -166,6 +166,10 @@ def main():
             "enable_level2_where": True,
             "enable_prefetch": True,
         }),
+        ("Level3 where + prefetch", {
+            "enable_level3_where": True,
+            "enable_prefetch": True,
+        }),
     ])
     
     print("Testing optimizations...\n")
