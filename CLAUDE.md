@@ -43,7 +43,7 @@ python3 -c "from perf_takehome import do_kernel_test; do_kernel_test(4, 5, 10, e
 - `N_CORES = 1` (single-core only)
 - `SCRATCH_SIZE = 1536`
 - `BASELINE = 147734` cycles
-- Current best: **2828 cycles** (with `write_indices=False`, see OPTIMIZATION_SUMMARY.txt for history)
+- Current best: **2469 cycles** (with `write_indices=False`, see OPTIMIZATION_SUMMARY.txt for history)
 
 ## Constraints
 
