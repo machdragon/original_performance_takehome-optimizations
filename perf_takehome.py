@@ -2619,7 +2619,7 @@ def do_kernel_test(
     if enable_prefetch is None:
         enable_prefetch = False
     if lookahead is None:
-        lookahead = 512
+        lookahead = 1024
     if block_size is None:
         block_size = 16
     if enable_second_pass is None:
