@@ -382,7 +382,7 @@ class KernelBuilder:
         n_nodes: int,
         batch_size: int,
         rounds: int,
-        write_indices: bool = False,
+        write_indices: bool = True,
         write_indicies: bool | None = None,
     ):
         """
