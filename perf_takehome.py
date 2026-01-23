@@ -44,8 +44,8 @@ class KernelBuilder:
         max_special_level: int = -1,
         max_arith_level: int = -1,
         enable_prefetch: bool = False,
-        lookahead: int = 512,
-        block_size: int = 16,  # Optimized: 16 gives best performance (1928 cycles)
+        lookahead: int = 1024,  # Optimized: 1024 with block_size=16 gives 1923 cycles
+        block_size: int = 16,  # Optimized: 16 gives best performance (1928->1923 with lookahead=1024)
         enable_second_pass: bool = False,
         enable_latency_aware: bool = False,
     ):
