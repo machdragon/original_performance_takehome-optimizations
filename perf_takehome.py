@@ -695,7 +695,7 @@ class KernelBuilder:
 
     def _vec_block_load_slots_specialized(
         self, block_vecs, buf_idx, info, v_root_node, v_level1_right, v_level1_diff,
-        idx_cache, v_forest_p, v_addr, v_node_block, level2_base_addr, level2_vecs_base, level2_tree_tmp_base, level2_addr_temp, level2_scalars_temp, v_zero
+        idx_cache, v_forest_p, v_addr, v_node_block, level2_base_addr_const, level2_vecs_base, level2_tree_tmp_base, level2_addr_temp, level2_scalars_temp, v_zero
     ):
         """Load node values for a block using specialized optimizations."""
         slots = []
@@ -710,7 +710,7 @@ class KernelBuilder:
         elif info.get("level2_round", False):
             # Level 2: use unrolled where-tree with v_node_block[0] reuse
             # Load scalars on-demand, broadcast to v_node_block[0] (temporary storage)
-            slots.append(("alu", ("+", level2_addr_temp, self.scratch["forest_values_p"], level2_base_addr)))
+            slots.append(("alu", ("+", level2_addr_temp, self.scratch["forest_values_p"], level2_base_addr_const)))
             for i in range(4):
                 slots.append(("load", ("load", level2_scalars_temp + i, level2_addr_temp)))
                 slots.append(("flow", ("add_imm", level2_addr_temp, level2_addr_temp, 1)))
@@ -1016,7 +1016,7 @@ class KernelBuilder:
             # Round 1: Load block 0
             step_body.extend(self._vec_block_load_slots_specialized(
                 block_0_vecs, 0, info1, v_root_node, v_level1_right, v_level1_diff,
-                idx_cache, v_forest_p, v_addr, v_node_block, level2_base_addr, level2_vecs_base, level2_tree_tmp_base, level2_addr_temp, level2_scalars_temp, v_zero
+                idx_cache, v_forest_p, v_addr, v_node_block, level2_base_addr_const, level2_vecs_base, level2_tree_tmp_base, level2_addr_temp, level2_scalars_temp, v_zero
             ))
             
             # Round 1: Process blocks 1-3
@@ -1031,7 +1031,7 @@ class KernelBuilder:
                 )
                 load_slots = self._vec_block_load_slots_specialized(
                     all_block_vecs[block_idx], curr_buf, info1, v_root_node, v_level1_right, v_level1_diff,
-                    idx_cache, v_forest_p, v_addr, v_node_block, level2_base_addr, level2_vecs_base, level2_tree_tmp_base, level2_addr_temp, level2_scalars_temp, v_zero
+                    idx_cache, v_forest_p, v_addr, v_node_block, level2_base_addr_const, level2_vecs_base, level2_tree_tmp_base, level2_addr_temp, level2_scalars_temp, v_zero
                 )
                 step_body.extend(self._interleave_slots(hash_slots, load_slots))
             
@@ -1046,7 +1046,7 @@ class KernelBuilder:
             # Round 2: Load block 0 (using updated indices from round 1)
             step_body.extend(self._vec_block_load_slots_specialized(
                 block_0_vecs, 0, info2, v_root_node, v_level1_right, v_level1_diff,
-                idx_cache, v_forest_p, v_addr, v_node_block, level2_base_addr, level2_vecs_base, level2_tree_tmp_base, level2_addr_temp, level2_scalars_temp, v_zero
+                idx_cache, v_forest_p, v_addr, v_node_block, level2_base_addr_const, level2_vecs_base, level2_tree_tmp_base, level2_addr_temp, level2_scalars_temp, v_zero
             ))
             
             # Round 2: Process blocks 1-3
@@ -1061,7 +1061,7 @@ class KernelBuilder:
                 )
                 load_slots = self._vec_block_load_slots_specialized(
                     all_block_vecs[block_idx], curr_buf, info2, v_root_node, v_level1_right, v_level1_diff,
-                    idx_cache, v_forest_p, v_addr, v_node_block, level2_base_addr, level2_vecs_base, level2_tree_tmp_base, level2_addr_temp, level2_scalars_temp, v_zero
+                    idx_cache, v_forest_p, v_addr, v_node_block, level2_base_addr_const, level2_vecs_base, level2_tree_tmp_base, level2_addr_temp, level2_scalars_temp, v_zero
                 )
                 step_body.extend(self._interleave_slots(hash_slots, load_slots))
             
@@ -1086,7 +1086,7 @@ class KernelBuilder:
             # Load block 0
             round_body.extend(self._vec_block_load_slots_specialized(
                 block_0_vecs, 0, info, v_root_node, v_level1_right, v_level1_diff,
-                idx_cache, v_forest_p, v_addr, v_node_block, level2_base_addr, level2_vecs_base, level2_tree_tmp_base, level2_addr_temp, level2_scalars_temp, v_zero
+                idx_cache, v_forest_p, v_addr, v_node_block, level2_base_addr_const, level2_vecs_base, level2_tree_tmp_base, level2_addr_temp, level2_scalars_temp, v_zero
             ))
 
             # Unroll blocks 1-3 (num_blocks=4, so blocks 0,1,2,3)
@@ -1099,7 +1099,7 @@ class KernelBuilder:
             )
             load_slots_1 = self._vec_block_load_slots_specialized(
                 all_block_vecs[1], 1, info, v_root_node, v_level1_right, v_level1_diff,
-                idx_cache, v_forest_p, v_addr, v_node_block, level2_base_addr, level2_vecs_base, level2_tree_tmp_base, level2_addr_temp, level2_scalars_temp, v_zero
+                idx_cache, v_forest_p, v_addr, v_node_block, level2_base_addr_const, level2_vecs_base, level2_tree_tmp_base, level2_addr_temp, level2_scalars_temp, v_zero
             )
             round_body.extend(self._interleave_slots(hash_slots_1, load_slots_1))
             
@@ -1112,7 +1112,7 @@ class KernelBuilder:
             )
             load_slots_2 = self._vec_block_load_slots_specialized(
                 all_block_vecs[2], 0, info, v_root_node, v_level1_right, v_level1_diff,
-                idx_cache, v_forest_p, v_addr, v_node_block, level2_base_addr, level2_vecs_base, level2_tree_tmp_base, level2_addr_temp, level2_scalars_temp, v_zero
+                idx_cache, v_forest_p, v_addr, v_node_block, level2_base_addr_const, level2_vecs_base, level2_tree_tmp_base, level2_addr_temp, level2_scalars_temp, v_zero
             )
             round_body.extend(self._interleave_slots(hash_slots_2, load_slots_2))
             
@@ -1125,7 +1125,7 @@ class KernelBuilder:
             )
             load_slots_3 = self._vec_block_load_slots_specialized(
                 all_block_vecs[3], 1, info, v_root_node, v_level1_right, v_level1_diff,
-                idx_cache, v_forest_p, v_addr, v_node_block, level2_base_addr, level2_vecs_base, level2_tree_tmp_base, level2_addr_temp, level2_scalars_temp, v_zero
+                idx_cache, v_forest_p, v_addr, v_node_block, level2_base_addr_const, level2_vecs_base, level2_tree_tmp_base, level2_addr_temp, level2_scalars_temp, v_zero
             )
             round_body.extend(self._interleave_slots(hash_slots_3, load_slots_3))
             
@@ -1347,15 +1347,15 @@ class KernelBuilder:
             v_tmp4_block = self.alloc_scratch("v_tmp4_block", block_size * VLEN)
         
         # Level 2 arithmetic selection: reuse existing scratch (no new allocations)
-        # Use v_node_block[0] for vectors, v_tmp1-4 for scalars (scalar temps, safe during level 2)
-        level2_base_addr = self.scratch_const(3)  # Level 2 starts at index 3
+        # Use v_node_block[0] for vectors, scalar temps for the 4 level 2 values
+        level2_base_addr_const = self.scratch_const(3)  # Level 2 starts at index 3 (scratch address of constant)
         level2_vecs_base = v_node_block[0]  # Reuse v_node_block[0] for level 2 vectors
         level2_tree_tmp_base = None  # Not needed for arithmetic selection
         level2_addr_temp = v_addr[0]  # Reuse v_addr[0] for address computation
-        # Use scalar temps v_tmp1-4 for the 4 level 2 values (they're scalars, 1 word each)
-        # We'll use them as an array: level2_scalars_temp = v_tmp1, then v_tmp1+1, v_tmp1+2, v_tmp1+3
-        # But actually we need 4 consecutive words, so let's use v_tmp1_block[0:4] as scalars
-        level2_scalars_temp = v_tmp1_block  # Reuse first 4 words of v_tmp1_block as scalars
+        # Use v_tmp1, v_tmp2, v_tmp3, v_tmp3 (scalar vector temps) - use first word of each as scalar
+        # v_tmp4 might not be available if enable_arith=False, so reuse v_tmp3 for 4th value
+        level2_scalars_list = [v_tmp1, v_tmp2, v_tmp3, v_tmp3]  # Use v_tmp3 twice for 4th value if v_tmp4 unavailable
+        level2_scalars_temp = None  # Not used directly, use level2_scalars_list instead
 
         max_special = min(self.max_special_level, forest_height)
         use_special = self.assume_zero_indices and max_special >= 0
@@ -1758,19 +1758,24 @@ class KernelBuilder:
             
             # Level 2: use arithmetic selection (VALU-only, reuse existing block temps)
             # Strategy: Load 4 scalars, broadcast, use arithmetic to select (no vselect/flow, no extra scratch)
-            # DISABLED: Scratch reuse needs refinement to avoid conflicts
-            if False and level2_round and level2_scalars_temp is not None:
-                # Load 4 level 2 values on-demand (reuse v_addr[0] for address, v_tmp1 for scalars)
-                slots.append(("alu", ("+", level2_addr_temp, self.scratch["forest_values_p"], level2_base_addr)))
+            # Key insight: Do arithmetic selection DURING load phase to maintain pipelining (unlike Phase 17)
+            # This avoids the pipeline bubble that caused Phase 17 regression
+            # TEMPORARILY DISABLED: Debugging IndexError
+            if False and level2_round and level2_vecs_base is not None:
+                # Load 4 level 2 values on-demand (reuse v_addr[0] for address, scalar temps for values)
+                # level2_base_addr_const is scratch address where constant 3 is stored
+                slots.append(("alu", ("+", level2_addr_temp, self.scratch["forest_values_p"], level2_base_addr_const)))
+                # Use v_tmp1, v_tmp2, v_tmp3, v_tmp3 directly (first word of each vector as scalar)
+                level2_scalars = [v_tmp1, v_tmp2, v_tmp3, v_tmp3]  # Define locally to avoid closure issues
                 for i in range(4):
-                    slots.append(("load", ("load", level2_scalars_temp + i, level2_addr_temp)))
+                    slots.append(("load", ("load", level2_scalars[i], level2_addr_temp)))  # Load to first word of vector temp
                     if i < 3:
                         slots.append(("flow", ("add_imm", level2_addr_temp, level2_addr_temp, 1)))
                 
                 # Broadcast to vectors (reuse v_node_block[0] temporarily)
                 level2_vecs = level2_vecs_base
                 for i in range(4):
-                    slots.append(("valu", ("vbroadcast", level2_vecs + i * VLEN, level2_scalars_temp + i)))
+                    slots.append(("valu", ("vbroadcast", level2_vecs + i * VLEN, level2_scalars[i])))
                 
                 # For each vector, use arithmetic selection (reuse block temps)
                 node_buf = v_node_block[buf_idx]
