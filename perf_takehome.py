@@ -192,7 +192,7 @@ class KernelBuilder:
             start_idx,
             future_writes,
             engine_filter=None,
-            lookahead=128,  # Increased from 16 for better load pulling
+            lookahead=512,  # Optimized: 512 gives best performance (1980 cycles)
             init_skipped_reads=None,
             init_skipped_writes=None,
         ):
