@@ -1346,14 +1346,20 @@ class KernelBuilder:
         if enable_arith:
             v_tmp4_block = self.alloc_scratch("v_tmp4_block", block_size * VLEN)
         
-        # Level 2 where-tree: deferred - scratch too tight with block_size=16
-        # Structure ready: would reuse v_node_block[0] for vectors, need 4 words for scalars
-        # With block_size=16, we have ~284 words free, but allocation pattern prevents reuse
+        # Level 2 arithmetic selection: reuse existing scratch
+        # Use v_node_block[0] for vectors, allocate 4 words for scalars (minimal scratch)
         level2_base_addr = self.scratch_const(3)  # Level 2 starts at index 3
-        level2_vecs_base = None  # Disabled
-        level2_tree_tmp_base = None
-        level2_addr_temp = None
-        level2_scalars_temp = None
+        level2_vecs_base = v_node_block[0]  # Reuse v_node_block[0] for level 2 vectors
+        level2_tree_tmp_base = None  # Not needed for arithmetic selection
+        level2_addr_temp = v_addr[0]  # Reuse v_addr[0] for address computation
+        # Allocate 4 words for scalars (minimal - will test if this fits)
+        try:
+            level2_scalars_temp = self.alloc_scratch("level2_scalars", 4)
+        except AssertionError:
+            # Scratch too tight - disable level 2 optimization
+            level2_vecs_base = None
+            level2_addr_temp = None
+            level2_scalars_temp = None
 
         max_special = min(self.max_special_level, forest_height)
         use_special = self.assume_zero_indices and max_special >= 0
@@ -1754,38 +1760,56 @@ class KernelBuilder:
             ):
                 return slots
             
-            # Level 2: use unrolled where-tree with v_node_block[0] reuse (disabled - scratch too tight)
+            # Level 2: use arithmetic selection (VALU-only, reuse existing block temps)
+            # Strategy: Load 4 scalars, broadcast, use arithmetic to select (no vselect/flow, no extra scratch)
+            # DISABLED: Needs refinement to avoid scratch conflicts
             if False and level2_round:
-                # Load scalars on-demand, broadcast to v_node_block[0] (temporary storage)
-                # Reuse v_addr[0] for level2_addr_temp and v_tmp1 for level2_scalars_temp
+                # Load 4 level 2 values on-demand (reuse v_addr[0] for address, v_tmp1 for scalars)
                 slots.append(("alu", ("+", level2_addr_temp, self.scratch["forest_values_p"], level2_base_addr)))
                 for i in range(4):
                     slots.append(("load", ("load", level2_scalars_temp + i, level2_addr_temp)))
-                    if i < 3:  # Don't increment on last iteration
+                    if i < 3:
                         slots.append(("flow", ("add_imm", level2_addr_temp, level2_addr_temp, 1)))
                 
-                # Broadcast to vectors (reuse v_node_block[0] - safe since we're not loading to it in level 2 rounds)
+                # Broadcast to vectors (reuse v_node_block[0] temporarily)
                 level2_vecs = level2_vecs_base
                 for i in range(4):
                     slots.append(("valu", ("vbroadcast", level2_vecs + i * VLEN, level2_scalars_temp + i)))
                 
-                # For each vector in block, build where-tree
+                # For each vector, use arithmetic selection (reuse block temps)
                 node_buf = v_node_block[buf_idx]
-                # Reuse v_tmp2 and v_tmp3 for relative_idx_vec (they're only used during hash)
-                # We need one vector per block, so reuse across vectors in the block
-                relative_idx_vec = v_tmp2  # Reuse v_tmp2 (vector, only used during hash)
                 for bi, vec_i in enumerate(block_vecs):
                     v_idx = idx_cache + vec_i
                     v_level_start = self.scratch_vconst(3)
-                    slots.append(("valu", ("-", relative_idx_vec, v_idx, v_level_start)))
-                    # Tree temp: use space after vectors in v_node_block[0], but we'll overwrite it
-                    tree_temp = level2_vecs_base + 4 * VLEN  # After the 4 vectors
-                    final_out, tree_slots = self.build_vselect_tree(
-                        level2_vecs, relative_idx_vec, 4, tree_temp, round_num, vec_i // VLEN
-                    )
-                    slots.extend(tree_slots)
-                    # Copy selected value to node buffer (overwrites temp space, which is fine)
-                    slots.append(("valu", ("+", node_buf + bi * VLEN, final_out, v_zero)))
+                    v_offset = v_tmp2_block + bi * VLEN  # Reuse v_tmp2_block
+                    v_bit0 = v_tmp1_block + bi * VLEN   # Reuse v_tmp1_block
+                    v_bit1 = v_tmp3_block + bi * VLEN   # Reuse v_tmp3_block
+                    
+                    # Compute relative index and extract bits
+                    slots.append(("valu", ("-", v_offset, v_idx, v_level_start)))
+                    v_one = self.scratch_vconst(1)
+                    slots.append(("valu", ("&", v_bit0, v_offset, v_one)))
+                    slots.append(("valu", (">>", v_bit1, v_offset, self.scratch_vconst(1))))
+                    slots.append(("valu", ("&", v_bit1, v_bit1, v_one)))
+                    
+                    # Two-level arithmetic selection (reuse v_tmp blocks)
+                    # Level 1: compute differences
+                    v_diff_01 = v_tmp1_block + bi * VLEN  # Reuse v_tmp1_block
+                    v_diff_23 = v_tmp2_block + bi * VLEN  # Reuse v_tmp2_block
+                    slots.append(("valu", ("-", v_diff_01, level2_vecs + 1 * VLEN, level2_vecs + 0 * VLEN)))
+                    slots.append(("valu", ("-", v_diff_23, level2_vecs + 3 * VLEN, level2_vecs + 2 * VLEN)))
+                    
+                    # Select within each pair based on bit0 (reuse same temps)
+                    v_sel_low = v_tmp1_block + bi * VLEN  # Overwrite v_diff_01
+                    v_sel_high = v_tmp2_block + bi * VLEN  # Overwrite v_diff_23
+                    slots.append(("valu", ("multiply_add", v_sel_low, v_bit0, v_diff_01, level2_vecs + 0 * VLEN)))
+                    slots.append(("valu", ("multiply_add", v_sel_high, v_bit0, v_diff_23, level2_vecs + 2 * VLEN)))
+                    
+                    # Final selection between low/high based on bit1
+                    v_result = v_tmp3_block + bi * VLEN  # Reuse v_tmp3_block
+                    slots.append(("valu", ("-", v_result, v_sel_high, v_sel_low)))
+                    slots.append(("valu", ("multiply_add", node_buf + bi * VLEN, v_bit1, v_result, v_sel_low)))
+                
                 return slots
             
             # Regular load path for levels 3+
