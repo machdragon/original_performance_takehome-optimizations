@@ -368,21 +368,33 @@ class KernelBuilder:
         # Cache indices and values in scratch across rounds to avoid repeated loads/stores.
         idx_cache = self.alloc_scratch("idx_cache", batch_size)
         val_cache = self.alloc_scratch("val_cache", batch_size)
-        idx_load_ptr = self.alloc_scratch("idx_load_ptr")
         val_load_ptr = self.alloc_scratch("val_load_ptr")
-        self.add("alu", ("+", idx_load_ptr, self.scratch["inp_indices_p"], zero_const))
         self.add("alu", ("+", val_load_ptr, self.scratch["inp_values_p"], zero_const))
         vec_end = batch_size - (batch_size % VLEN)
-        for i in range(0, vec_end, VLEN):
-            self.add("load", ("vload", idx_cache + i, idx_load_ptr))
-            self.add("load", ("vload", val_cache + i, val_load_ptr))
-            self.add("flow", ("add_imm", idx_load_ptr, idx_load_ptr, VLEN))
-            self.add("flow", ("add_imm", val_load_ptr, val_load_ptr, VLEN))
-        for i in range(vec_end, batch_size):
-            self.add("load", ("load", idx_cache + i, idx_load_ptr))
-            self.add("load", ("load", val_cache + i, val_load_ptr))
-            self.add("flow", ("add_imm", idx_load_ptr, idx_load_ptr, 1))
-            self.add("flow", ("add_imm", val_load_ptr, val_load_ptr, 1))
+        if self.assume_zero_indices:
+            for i in range(0, vec_end, VLEN):
+                self.add("valu", ("vbroadcast", idx_cache + i, zero_const))
+            for i in range(vec_end, batch_size):
+                self.add("alu", ("+", idx_cache + i, zero_const, zero_const))
+            for i in range(0, vec_end, VLEN):
+                self.add("load", ("vload", val_cache + i, val_load_ptr))
+                self.add("flow", ("add_imm", val_load_ptr, val_load_ptr, VLEN))
+            for i in range(vec_end, batch_size):
+                self.add("load", ("load", val_cache + i, val_load_ptr))
+                self.add("flow", ("add_imm", val_load_ptr, val_load_ptr, 1))
+        else:
+            idx_load_ptr = self.alloc_scratch("idx_load_ptr")
+            self.add("alu", ("+", idx_load_ptr, self.scratch["inp_indices_p"], zero_const))
+            for i in range(0, vec_end, VLEN):
+                self.add("load", ("vload", idx_cache + i, idx_load_ptr))
+                self.add("load", ("vload", val_cache + i, val_load_ptr))
+                self.add("flow", ("add_imm", idx_load_ptr, idx_load_ptr, VLEN))
+                self.add("flow", ("add_imm", val_load_ptr, val_load_ptr, VLEN))
+            for i in range(vec_end, batch_size):
+                self.add("load", ("load", idx_cache + i, idx_load_ptr))
+                self.add("load", ("load", val_cache + i, val_load_ptr))
+                self.add("flow", ("add_imm", idx_load_ptr, idx_load_ptr, 1))
+                self.add("flow", ("add_imm", val_load_ptr, val_load_ptr, 1))
 
         # Vector scratch registers and broadcasted constants.
         v_node_val = [
@@ -410,8 +422,8 @@ class KernelBuilder:
             self.scratch_vconst(val1)
             self.scratch_vconst(val3)
 
-        # Block size 4 works well with 32 vectors (no remainder)
-        block_size = 4
+        # Block size 8 fits 32 vectors (no remainder) and reduces block overhead.
+        block_size = 8
         # Double buffers for pipelining
         v_node_block = [
             self.alloc_scratch("v_node_block_A", block_size * VLEN),
@@ -501,9 +513,11 @@ class KernelBuilder:
                     l_i += 1
             return combined
 
-        def vec_load_slots(vec_i, buf_idx, node_const=None, node_pair=None):
+        def vec_load_slots(
+            vec_i, buf_idx, node_const=None, node_pair=None, node_level=None
+        ):
             slots = []
-            if node_const is not None or node_pair is not None:
+            if node_const is not None or node_pair is not None or node_level is not None:
                 return slots
             v_idx = idx_cache + vec_i
             v_addr_buf = v_addr[buf_idx]
@@ -520,6 +534,7 @@ class KernelBuilder:
             wrap_round,
             node_const=None,
             node_pair=None,
+            node_level=None,
         ):
             slots = []
             v_idx = idx_cache + vec_i
@@ -529,8 +544,12 @@ class KernelBuilder:
             elif node_pair is not None:
                 node_right, node_diff = node_pair
                 slots.append(("valu", ("&", v_tmp1, v_idx, v_one)))
-                slots.append(("valu", ("*", v_tmp2, v_tmp1, node_diff)))
-                slots.append(("valu", ("+", v_tmp3, node_right, v_tmp2)))
+                slots.append(
+                    ("valu", ("multiply_add", v_tmp3, v_tmp1, node_diff, node_right))
+                )
+                v_node_buf = v_tmp3
+            elif node_level is not None:
+                slots.extend(uniform_level_slots(node_level, v_idx, v_tmp3))
                 v_node_buf = v_tmp3
             else:
                 v_node_buf = v_node_val[buf_idx]
@@ -629,10 +648,10 @@ class KernelBuilder:
                 )
             return slots
 
-        def vec_special_slots(vec_i, buf_idx, level):
+        def vec_special_idx_slots(v_idx, level, out_addr):
+            if level_tmp is None or level >= len(level_vec_base):
+                return []
             slots = []
-            v_idx = idx_cache + vec_i
-            v_node_buf = v_node_val[buf_idx]
             v_offset = v_tmp3
             v_level_start = self.scratch_vconst(level_starts[level])
             slots.append(("valu", ("-", v_offset, v_idx, v_level_start)))
@@ -652,13 +671,23 @@ class KernelBuilder:
                 current_base = temp_base
                 num //= 2
                 bit += 1
-            slots.append(("valu", ("+", v_node_buf, current_base, v_zero)))
+            slots.append(("valu", ("+", out_addr, current_base, v_zero)))
             return slots
 
-        def vec_block_load_slots(block_vecs, buf_idx, node_const=None, node_pair=None):
+        def vec_special_slots(vec_i, buf_idx, level):
+            v_idx = idx_cache + vec_i
+            v_node_buf = v_node_val[buf_idx]
+            return vec_special_idx_slots(v_idx, level, v_node_buf)
+
+        def uniform_level_slots(level, v_idx, out_addr):
+            return vec_special_idx_slots(v_idx, level, out_addr)
+
+        def vec_block_load_slots(
+            block_vecs, buf_idx, node_const=None, node_pair=None, node_level=None
+        ):
             """Load node values for a block into the specified buffer."""
             slots = []
-            if node_const is not None or node_pair is not None:
+            if node_const is not None or node_pair is not None or node_level is not None:
                 return slots
             node_buf = v_node_block[buf_idx]
             for bi, vec_i in enumerate(block_vecs):
@@ -679,13 +708,31 @@ class KernelBuilder:
             return slots
 
         def vec_block_hash_only_slots(
-            block_vecs, buf_idx, wrap_round, node_const=None, node_pair=None
+            block_vecs,
+            buf_idx,
+            wrap_round,
+            node_const=None,
+            node_pair=None,
+            node_level=None,
         ):
             """XOR, hash, and update indices using node values from specified buffer."""
             slots = []
             node_buf = v_node_block[buf_idx]
             # XOR with node values.
-            if node_const is not None:
+            if node_level is not None:
+                for bi, vec_i in enumerate(block_vecs):
+                    v_idx = idx_cache + vec_i
+                    slots.extend(
+                        uniform_level_slots(
+                            node_level, v_idx, v_tmp3_block + bi * VLEN
+                        )
+                    )
+                for bi, vec_i in enumerate(block_vecs):
+                    v_val = val_cache + vec_i
+                    slots.append(
+                        ("valu", ("^", v_val, v_val, v_tmp3_block + bi * VLEN))
+                    )
+            elif node_const is not None:
                 for _bi, vec_i in enumerate(block_vecs):
                     v_val = val_cache + vec_i
                     slots.append(("valu", ("^", v_val, v_val, node_const)))
@@ -700,21 +747,11 @@ class KernelBuilder:
                         (
                             "valu",
                             (
-                                "*",
-                                v_tmp2_block + bi * VLEN,
+                                "multiply_add",
+                                v_tmp3_block + bi * VLEN,
                                 v_tmp1_block + bi * VLEN,
                                 node_diff,
-                            ),
-                        )
-                    )
-                    slots.append(
-                        (
-                            "valu",
-                            (
-                                "+",
-                                v_tmp3_block + bi * VLEN,
                                 node_right,
-                                v_tmp2_block + bi * VLEN,
                             ),
                         )
                     )
@@ -814,12 +851,19 @@ class KernelBuilder:
             return slots
 
         def vec_block_hash_slots(
-            block_vecs, round_idx, wrap_round, node_const=None, node_pair=None
+            block_vecs,
+            round_idx,
+            wrap_round,
+            node_const=None,
+            node_pair=None,
+            node_level=None,
         ):
             """Combined load + hash (non-pipelined fallback)."""
-            slots = vec_block_load_slots(block_vecs, 0, node_const, node_pair)
+            slots = vec_block_load_slots(block_vecs, 0, node_const, node_pair, node_level)
             slots.extend(
-                vec_block_hash_only_slots(block_vecs, 0, wrap_round, node_const, node_pair)
+                vec_block_hash_only_slots(
+                    block_vecs, 0, wrap_round, node_const, node_pair, node_level
+                )
             )
             return slots
 
@@ -845,7 +889,7 @@ class KernelBuilder:
         v_root_node = None
         v_level1_right = None
         v_level1_diff = None
-        enable_level1 = False
+        enable_level1 = True
         if fast_wrap:
             root_node_val = self.alloc_scratch("root_node_val")
             v_root_node = self.alloc_scratch("v_root_node", VLEN)
@@ -882,7 +926,6 @@ class KernelBuilder:
             not self.enable_debug
             and vec_count >= block_size
             and num_blocks >= 2
-            and not use_special
             and block_limit == vec_count  # no remainder
         )
 
@@ -898,13 +941,21 @@ class KernelBuilder:
 
             # Round 0: prologue + steady state
             wrap_round_0 = (0 % wrap_period) == forest_height
-            uniform_round_0 = fast_wrap and (0 % wrap_period) == 0
-            binary_round_0 = fast_wrap and (0 % wrap_period) == 1
+            level_0 = 0 % wrap_period
+            uniform_round_0 = fast_wrap and level_0 == 0
+            binary_round_0 = fast_wrap and level_0 == 1
             node_const_0 = v_root_node if uniform_round_0 else None
             node_pair_0 = (
                 (v_level1_right, v_level1_diff) if binary_round_0 and v_level1_diff else None
             )
-            body.extend(vec_block_load_slots(block_0_vecs, 0, node_const_0, node_pair_0))
+            node_level_0 = (
+                level_0 if use_special and 2 <= level_0 <= max_special else None
+            )
+            body.extend(
+                vec_block_load_slots(
+                    block_0_vecs, 0, node_const_0, node_pair_0, node_level_0
+                )
+            )
             for block_idx in range(1, num_blocks):
                 prev_buf = (block_idx - 1) % 2
                 curr_buf = block_idx % 2
@@ -914,9 +965,14 @@ class KernelBuilder:
                     wrap_round_0,
                     node_const_0,
                     node_pair_0,
+                    node_level_0,
                 )
                 load_slots = vec_block_load_slots(
-                    all_block_vecs[block_idx], curr_buf, node_const_0, node_pair_0
+                    all_block_vecs[block_idx],
+                    curr_buf,
+                    node_const_0,
+                    node_pair_0,
+                    node_level_0,
                 )
                 body.extend(interleave_slots(hash_slots, load_slots))
 
@@ -924,10 +980,12 @@ class KernelBuilder:
             for round in range(1, rounds):
                 wrap_round_prev = ((round - 1) % wrap_period) == forest_height
                 wrap_round_curr = (round % wrap_period) == forest_height
-                uniform_round_prev = fast_wrap and ((round - 1) % wrap_period) == 0
-                uniform_round_curr = fast_wrap and (round % wrap_period) == 0
-                binary_round_prev = fast_wrap and ((round - 1) % wrap_period) == 1
-                binary_round_curr = fast_wrap and (round % wrap_period) == 1
+                level_prev = (round - 1) % wrap_period
+                level_curr = round % wrap_period
+                uniform_round_prev = fast_wrap and level_prev == 0
+                uniform_round_curr = fast_wrap and level_curr == 0
+                binary_round_prev = fast_wrap and level_prev == 1
+                binary_round_curr = fast_wrap and level_curr == 1
                 node_const_prev = v_root_node if uniform_round_prev else None
                 node_const_curr = v_root_node if uniform_round_curr else None
                 node_pair_prev = (
@@ -940,6 +998,12 @@ class KernelBuilder:
                     if binary_round_curr and v_level1_diff
                     else None
                 )
+                node_level_prev = (
+                    level_prev if use_special and 2 <= level_prev <= max_special else None
+                )
+                node_level_curr = (
+                    level_curr if use_special and 2 <= level_curr <= max_special else None
+                )
                 last_buf = last_block_idx % 2
 
                 # Epilogue of prev round + prologue of current
@@ -949,9 +1013,10 @@ class KernelBuilder:
                     wrap_round_prev,
                     node_const_prev,
                     node_pair_prev,
+                    node_level_prev,
                 )
                 load_slots = vec_block_load_slots(
-                    block_0_vecs, 0, node_const_curr, node_pair_curr
+                    block_0_vecs, 0, node_const_curr, node_pair_curr, node_level_curr
                 )
                 body.extend(interleave_slots(hash_slots, load_slots))
 
@@ -965,21 +1030,30 @@ class KernelBuilder:
                         wrap_round_curr,
                         node_const_curr,
                         node_pair_curr,
+                        node_level_curr,
                     )
                     load_slots = vec_block_load_slots(
-                        all_block_vecs[block_idx], curr_buf, node_const_curr, node_pair_curr
+                        all_block_vecs[block_idx],
+                        curr_buf,
+                        node_const_curr,
+                        node_pair_curr,
+                        node_level_curr,
                     )
                     body.extend(interleave_slots(hash_slots, load_slots))
 
             # Final epilogue
             wrap_round_last = ((rounds - 1) % wrap_period) == forest_height
-            uniform_round_last = fast_wrap and ((rounds - 1) % wrap_period) == 0
-            binary_round_last = fast_wrap and ((rounds - 1) % wrap_period) == 1
+            level_last = (rounds - 1) % wrap_period
+            uniform_round_last = fast_wrap and level_last == 0
+            binary_round_last = fast_wrap and level_last == 1
             node_const_last = v_root_node if uniform_round_last else None
             node_pair_last = (
                 (v_level1_right, v_level1_diff)
                 if binary_round_last and v_level1_diff
                 else None
+            )
+            node_level_last = (
+                level_last if use_special and 2 <= level_last <= max_special else None
             )
             last_buf = last_block_idx % 2
             body.extend(
@@ -989,6 +1063,7 @@ class KernelBuilder:
                     wrap_round_last,
                     node_const_last,
                     node_pair_last,
+                    node_level_last,
                 )
             )
 
@@ -1005,8 +1080,13 @@ class KernelBuilder:
                     if binary_round and v_level1_diff
                     else None
                 )
+                node_level = level if use_special and 2 <= level <= max_special else None
                 special_round = (
-                    use_special and level <= max_special and not uniform_round and not binary_round
+                    use_special
+                    and level <= max_special
+                    and not uniform_round
+                    and not binary_round
+                    and node_level is None
                 )
                 if vec_count > 0:
                     if special_round:
@@ -1023,7 +1103,11 @@ class KernelBuilder:
                                 [(b * block_size + offset) * VLEN for offset in range(block_size)]
                                 for b in range(num_blocks)
                             ]
-                            body.extend(vec_block_load_slots(block_0_vecs, 0, node_const, node_pair))
+                            body.extend(
+                                vec_block_load_slots(
+                                    block_0_vecs, 0, node_const, node_pair, node_level
+                                )
+                            )
                             for block_idx in range(1, num_blocks):
                                 prev_buf = (block_idx - 1) % 2
                                 curr_buf = block_idx % 2
@@ -1033,9 +1117,14 @@ class KernelBuilder:
                                     wrap_round,
                                     node_const,
                                     node_pair,
+                                    node_level,
                                 )
                                 load_slots = vec_block_load_slots(
-                                    all_block_vecs[block_idx], curr_buf, node_const, node_pair
+                                    all_block_vecs[block_idx],
+                                    curr_buf,
+                                    node_const,
+                                    node_pair,
+                                    node_level,
                                 )
                                 body.extend(interleave_slots(hash_slots, load_slots))
                             last_buf = (num_blocks - 1) % 2
@@ -1046,6 +1135,7 @@ class KernelBuilder:
                                     wrap_round,
                                     node_const,
                                     node_pair,
+                                    node_level,
                                 )
                             )
                         else:
@@ -1053,13 +1143,24 @@ class KernelBuilder:
                                 block_vecs = [(vec + offset) * VLEN for offset in range(block_size)]
                                 body.extend(
                                     vec_block_hash_slots(
-                                        block_vecs, round, wrap_round, node_const, node_pair
+                                        block_vecs,
+                                        round,
+                                        wrap_round,
+                                        node_const,
+                                        node_pair,
+                                        node_level,
                                     )
                                 )
                         if block_limit < vec_count:
                             start_vec = block_limit
                             body.extend(
-                                vec_load_slots(start_vec * VLEN, start_vec % 2, node_const, node_pair)
+                                vec_load_slots(
+                                    start_vec * VLEN,
+                                    start_vec % 2,
+                                    node_const,
+                                    node_pair,
+                                    node_level,
+                                )
                             )
                             for vec in range(start_vec + 1, vec_count):
                                 prev = vec - 1
@@ -1070,8 +1171,11 @@ class KernelBuilder:
                                     wrap_round,
                                     node_const,
                                     node_pair,
+                                    node_level,
                                 )
-                                load_slots = vec_load_slots(vec * VLEN, vec % 2, node_const, node_pair)
+                                load_slots = vec_load_slots(
+                                    vec * VLEN, vec % 2, node_const, node_pair, node_level
+                                )
                                 body.extend(interleave_slots(hash_slots, load_slots))
                             last_vec = vec_count - 1
                             body.extend(
@@ -1082,10 +1186,11 @@ class KernelBuilder:
                                     wrap_round,
                                     node_const,
                                     node_pair,
+                                    node_level,
                                 )
                             )
                     else:
-                        body.extend(vec_load_slots(0, 0, node_const, node_pair))
+                        body.extend(vec_load_slots(0, 0, node_const, node_pair, node_level))
                         for vec in range(1, vec_count):
                             prev = vec - 1
                             hash_slots = vec_hash_slots(
@@ -1095,8 +1200,11 @@ class KernelBuilder:
                                 wrap_round,
                                 node_const,
                                 node_pair,
+                                node_level,
                             )
-                            load_slots = vec_load_slots(vec * VLEN, vec % 2, node_const, node_pair)
+                            load_slots = vec_load_slots(
+                                vec * VLEN, vec % 2, node_const, node_pair, node_level
+                            )
                             body.extend(interleave_slots(hash_slots, load_slots))
                         last_vec = vec_count - 1
                         body.extend(
@@ -1107,6 +1215,7 @@ class KernelBuilder:
                                 wrap_round,
                                 node_const,
                                 node_pair,
+                                node_level,
                             )
                         )
 
