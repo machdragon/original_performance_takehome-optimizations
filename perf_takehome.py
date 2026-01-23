@@ -888,6 +888,7 @@ class KernelBuilder:
             node_buf = v_node_block[buf_idx]
             for bi, vec_i in enumerate(block_vecs):
                 v_idx = idx_cache + vec_i
+                # Offset is recomputed into bit each phase; could be cached to save VALU ops.
                 bit = v_tmp1_block + bi * VLEN
                 t0 = v_tmp2_block + bi * VLEN
                 t1 = v_tmp3_block + bi * VLEN
@@ -1252,6 +1253,7 @@ class KernelBuilder:
                         self.add("load", ("load", odd_val, level_addr))
                         if pair < (level_size // 2) - 1:
                             self.add("flow", ("add_imm", level_addr, level_addr, 1))
+                        # base is even-indexed value; diff=odd-even makes bit=1 select odd.
                         self.add("alu", ("-", diff_val, odd_val, even_val))
                         v_base = self.alloc_scratch(
                             f"v_level{level}_base_{2 * pair}", VLEN
