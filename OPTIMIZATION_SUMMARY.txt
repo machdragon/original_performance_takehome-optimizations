@@ -24,20 +24,23 @@ Remaining optimization plan
    - Measure cycles and slot utilization; keep the best default.
 
 2) Gather pressure reduction (valid)
-   - Revisit early-level gather bypass with better scheduling and tighter scratch usage.
+   - Revisit early-level gather bypass with better scheduling and tighter scratch usage (Phase 8 regressed).
    - Consider partial prefetch of node values per round to reduce load_offset count.
 
 3) Bundler refinements (valid)
    - Add optional latency-aware rules to the load-aware bundler without reordering hazards.
    - Consider a second-pass reorder within bundles to keep load limits saturated.
 
-4) Gray-area experiments (treat as optimizations; validate on benchmark)
-   - Skip final index write-back (values-only check) behind a flag.
-   - Drop pause instructions in perf builds.
+4) Gray-area experiments (workflow-driven; validate on benchmark)
+   - Drop pause instructions in submission-only builds (local harness depends on pause/yield alignment).
    - Specialize for fixed benchmark params (forest_height=10, rounds=16, batch_size=256) while keeping a general fallback.
-   - Skip scalar tail/writeback paths when batch_size is a known multiple of VLEN.
+   - Skip scalar tail/writeback paths when batch_size is a known multiple of VLEN (general, not test-specific).
+
+5) Deferred (intent risk)
+   - Skipping index write-back could pass current submission checks but likely violates intent; avoid unless explicitly requested.
 
 Notes
 - Debug mode can be re-enabled via KernelBuilder(enable_debug=True).
 - Fast wrap assumes Input.generate indices start at 0; set assume_zero_indices=False for general inputs.
 - max_special_level >= 0 enables the early-level gather bypass; default remains -1 due to regression.
+- Wrap periodicity is a structural invariant (forest_height + 1 rounds to exceed bounds when starting at root).
