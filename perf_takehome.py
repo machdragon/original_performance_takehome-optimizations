@@ -192,7 +192,7 @@ class KernelBuilder:
             start_idx,
             future_writes,
             engine_filter=None,
-            lookahead=32,  # Increased from 16 for better load pulling
+            lookahead=128,  # Increased from 16 for better load pulling
             init_skipped_reads=None,
             init_skipped_writes=None,
         ):
@@ -252,6 +252,7 @@ class KernelBuilder:
                 i += 1
                 continue
 
+            # Try to pull loads when we have non-load ops
             if engine != "load" and bundle_loads() < SLOT_LIMITS["load"]:
                 while bundle_loads() < SLOT_LIMITS["load"]:
                     future_writes = bundle_writes | writes
@@ -265,11 +266,28 @@ class KernelBuilder:
                     pull = slots_info[pull_idx]
                     slots_info[pull_idx] = None
                     add_to_bundle(pull)
+            
+            # Try to pull VALU ops when blocked on loads
+            if engine == "load" and bundle_loads() >= SLOT_LIMITS["load"]:
+                # We're at load limit, try to pull VALU ops to fill the bundle
+                while not engine_full("valu") and bundle_loads() >= SLOT_LIMITS["load"]:
+                    future_writes = bundle_writes | writes
+                    pull_idx = find_pullable_slot(
+                        i + 1,
+                        future_writes,
+                        engine_filter="valu",
+                    )
+                    if pull_idx is None:
+                        break
+                    pull = slots_info[pull_idx]
+                    slots_info[pull_idx] = None
+                    add_to_bundle(pull)
 
             if not can_add_now(info):
                 if bundle:
                     blocked_reads = reads
                     blocked_writes = writes
+                    # Try to pull any available ops before flushing
                     while True:
                         pull_idx = find_pullable_slot(
                             i + 1,
