@@ -44,7 +44,8 @@ class KernelBuilder:
         max_special_level: int = -1,
         max_arith_level: int = -1,
         enable_prefetch: bool = False,
-        enable_flow_select: bool = False,
+        enable_level2_where: bool = False,
+        enable_two_round_fusion: bool = False,
         lookahead: int = 1024,  # Optimized: 1024 with block_size=16 gives 1923 cycles
         block_size: int = 16,  # Optimized: 16 gives best performance (1928->1923 with lookahead=1024)
         enable_second_pass: bool = False,
@@ -63,7 +64,8 @@ class KernelBuilder:
         self.max_special_level = max_special_level
         self.max_arith_level = max_arith_level
         self.enable_prefetch = enable_prefetch
-        self.enable_flow_select = enable_flow_select
+        self.enable_level2_where = enable_level2_where
+        self.enable_two_round_fusion = enable_two_round_fusion
         self.lookahead = lookahead
         self.block_size = block_size
         self.enable_second_pass = enable_second_pass
@@ -836,6 +838,8 @@ class KernelBuilder:
         
         # Parameter-specialized kernel dispatch for benchmark cases
         if (forest_height, rounds, batch_size) == (10, 16, 256):
+            if self.enable_two_round_fusion:
+                return self.build_kernel_10_16_256_OLD(n_nodes, write_indices)
             return self.build_kernel_10_16_256(n_nodes, write_indices)
         # Add other benchmark combinations as needed:
         # elif (forest_height, rounds, batch_size) == (8, 12, 128):
@@ -1298,20 +1302,45 @@ class KernelBuilder:
                 self.add("flow", ("add_imm", idx_load_ptr, idx_load_ptr, 1))
             self.add("flow", ("add_imm", val_load_ptr, val_load_ptr, 1))
 
+        vec_count = vec_end // VLEN
+        block_size = self.block_size
+        block_limit = vec_count - (vec_count % block_size)
+        num_blocks = block_limit // block_size
+        max_special = min(self.max_special_level, forest_height)
+        use_special = self.assume_zero_indices and max_special >= 0
+        use_cross_round = (
+            not self.enable_debug
+            and vec_count >= block_size
+            and num_blocks >= 2
+            and not use_special
+            and block_limit == vec_count
+        )
+
         enable_arith = self.max_arith_level >= 2
 
         # Vector scratch registers and broadcasted constants.
-        v_node_val = [
-            self.alloc_scratch("v_node_val_0", VLEN),
-            self.alloc_scratch("v_node_val_1", VLEN),
-        ]
-        v_addr = [
-            self.alloc_scratch("v_addr_0", VLEN),
-            self.alloc_scratch("v_addr_1", VLEN),
-        ]
+        v_node_val_0 = self.alloc_scratch("v_node_val_0", VLEN)
+        v_addr_0 = self.alloc_scratch("v_addr_0", VLEN)
+        if use_cross_round:
+            # Block pipeline doesn't use per-vec buffers; alias to avoid extra scratch.
+            v_node_val = [v_node_val_0, v_node_val_0]
+            v_addr = [v_addr_0, v_addr_0]
+        else:
+            v_node_val = [
+                v_node_val_0,
+                self.alloc_scratch("v_node_val_1", VLEN),
+            ]
+            v_addr = [
+                v_addr_0,
+                self.alloc_scratch("v_addr_1", VLEN),
+            ]
         v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
-        v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
-        v_tmp3 = self.alloc_scratch("v_tmp3", VLEN)
+        if use_cross_round:
+            v_tmp2 = v_tmp1
+            v_tmp3 = v_tmp1
+        else:
+            v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
+            v_tmp3 = self.alloc_scratch("v_tmp3", VLEN)
         v_tmp4 = None
         if enable_arith:
             v_tmp4 = self.alloc_scratch("v_tmp4", VLEN)
@@ -1334,8 +1363,6 @@ class KernelBuilder:
             self.scratch_vconst(val1)
             self.scratch_vconst(val3)
 
-        # Block size configurable via self.block_size (default 8)
-        block_size = self.block_size
         # Double buffers for pipelining
         v_node_block = [
             self.alloc_scratch("v_node_block_A", block_size * VLEN),
@@ -1347,20 +1374,15 @@ class KernelBuilder:
         v_tmp4_block = None
         if enable_arith:
             v_tmp4_block = self.alloc_scratch("v_tmp4_block", block_size * VLEN)
-        
-        # Level 2 arithmetic selection: reuse existing scratch (no new allocations)
-        # Use v_node_block[0] for vectors, scalar temps for the 4 level 2 values
-        level2_base_addr_const = self.scratch_const(3)  # Level 2 starts at index 3 (scratch address of constant)
-        level2_vecs_base = v_node_block[0]  # Reuse v_node_block[0] for level 2 vectors
-        level2_tree_tmp_base = None  # Not needed for arithmetic selection
-        level2_addr_temp = v_addr[0]  # Reuse v_addr[0] for address computation
-        # Use v_tmp1, v_tmp2, v_tmp3, v_tmp3 (scalar vector temps) - use first word of each as scalar
-        # v_tmp4 might not be available if enable_arith=False, so reuse v_tmp3 for 4th value
-        level2_scalars_list = [v_tmp1, v_tmp2, v_tmp3, v_tmp3]  # Use v_tmp3 twice for 4th value if v_tmp4 unavailable
-        level2_scalars_temp = None  # Not used directly, use level2_scalars_list instead
 
-        max_special = min(self.max_special_level, forest_height)
-        use_special = self.assume_zero_indices and max_special >= 0
+        # Level 2 where-tree selection (optional): load 4 nodes once per round, vselect per vector.
+        enable_level2_where = self.enable_level2_where
+        level2_base_addr_const = self.scratch_const(3)
+        level2_vecs_base = v_node_block[0]  # Reuse v_node_block[0] for the 4 level-2 vectors.
+        # Reuse scratch to avoid extra allocations when prefetch is enabled.
+        level2_addr_temp = tmp1
+        level2_scalars_base = v_tmp1  # Use first 4 lanes as scalar temps.
+
         level_vec_base = []
         level_sizes = []
         level_starts = []
@@ -1602,7 +1624,7 @@ class KernelBuilder:
             if node_const is not None:
                 v_node_buf = node_const
             elif node_pair is not None:
-                if self.enable_flow_select and v_level1_left is not None:
+                if self.enable_level2_where and v_level1_left is not None:
                     node_right, _node_diff = node_pair
                     slots.append(("valu", ("&", v_tmp1, v_idx, v_one)))
                     slots.append(
@@ -1857,6 +1879,31 @@ class KernelBuilder:
                     )
             return slots
 
+        def level2_prepare_slots():
+            if not (enable_level2_where and enable_prefetch):
+                return []
+            slots = []
+            slots.append(
+                (
+                    "alu",
+                    (
+                        "+",
+                        level2_addr_temp,
+                        self.scratch["forest_values_p"],
+                        level2_base_addr_const,
+                    ),
+                )
+            )
+            for i in range(4):
+                slots.append(("load", ("load", level2_scalars_base + i, level2_addr_temp)))
+                if i < 3:
+                    slots.append(("flow", ("add_imm", level2_addr_temp, level2_addr_temp, 1)))
+            for i in range(4):
+                slots.append(
+                    ("valu", ("vbroadcast", level2_vecs_base + i * VLEN, level2_scalars_base + i))
+                )
+            return slots
+
         def emit_level_select_block_slots(block_vecs, buf_idx, node_arith):
             level = node_arith["level"]
             v_start = node_arith["v_start"]
@@ -2004,17 +2051,39 @@ class KernelBuilder:
             node_pair=None,
             node_arith=None,
             node_prefetch=None,
+            level2_round=False,
         ):
             """XOR, hash, and update indices using node values from specified buffer."""
             slots = []
             node_buf = v_node_block[buf_idx]
             # XOR with node values.
-            if node_const is not None:
+            if level2_round:
+                node0 = level2_vecs_base
+                node1 = level2_vecs_base + VLEN
+                node2 = level2_vecs_base + 2 * VLEN
+                node3 = level2_vecs_base + 3 * VLEN
+                v_level_start = self.scratch_vconst(3)
+                for bi, vec_i in enumerate(block_vecs):
+                    v_idx = idx_cache + vec_i
+                    v_val = val_cache + vec_i
+                    v_offset = v_tmp1_block + bi * VLEN
+                    v_go_left1 = v_tmp2_block + bi * VLEN
+                    v_left = v_tmp3_block + bi * VLEN
+                    slots.append(("valu", ("-", v_offset, v_idx, v_level_start)))
+                    slots.append(("valu", ("<", v_go_left1, v_offset, v_two)))
+                    slots.append(("valu", ("<", v_left, v_offset, v_one)))
+                    slots.append(("flow", ("vselect", v_left, v_left, node0, node1)))
+                    slots.append(("valu", ("-", v_offset, v_offset, v_two)))
+                    slots.append(("valu", ("<", v_offset, v_offset, v_one)))
+                    slots.append(("flow", ("vselect", v_offset, v_offset, node2, node3)))
+                    slots.append(("flow", ("vselect", v_offset, v_go_left1, v_left, v_offset)))
+                    slots.append(("valu", ("^", v_val, v_val, v_offset)))
+            elif node_const is not None:
                 for _bi, vec_i in enumerate(block_vecs):
                     v_val = val_cache + vec_i
                     slots.append(("valu", ("^", v_val, v_val, node_const)))
             elif node_pair is not None:
-                if self.enable_flow_select and v_level1_left is not None:
+                if self.enable_level2_where and v_level1_left is not None:
                     node_right, _node_diff = node_pair
                     for bi, vec_i in enumerate(block_vecs):
                         v_idx = idx_cache + vec_i
@@ -2293,24 +2362,20 @@ class KernelBuilder:
                         "bases": v_level_bases,
                         "diffs": v_level_diffs,
                     }
-        vec_count = vec_end // VLEN
-        # Cross-round pipelining for better load utilization
-        block_limit = vec_count - (vec_count % block_size)
-        num_blocks = block_limit // block_size
-        use_cross_round = (
-            not self.enable_debug
-            and vec_count >= block_size
-            and num_blocks >= 2
-            and not use_special
-            and block_limit == vec_count  # no remainder
-        )
+        # Cross-round pipelining for better load utilization.
         v_node_prefetch = None
-        # Prefetch relies on arith rounds and the cross-round pipeline to create room for lookahead loads.
+        # Prefetch relies on cross-round pipeline; used for arith rounds and level-2 where-tree rounds.
         enable_prefetch = (
-            self.enable_prefetch and enable_arith and rounds > 1 and use_cross_round
+            self.enable_prefetch
+            and rounds > 1
+            and use_cross_round
+            and (enable_arith or enable_level2_where)
         )
         if enable_prefetch:
-            v_node_prefetch = self.alloc_scratch("v_node_prefetch", vec_count * VLEN)
+            # Prefetch buffer only needs block 0 (block_size vectors).
+            v_node_prefetch = self.alloc_scratch(
+                "v_node_prefetch", block_size * VLEN
+            )
 
         round_info = []
         prefetch_active = [False] * rounds
@@ -2328,7 +2393,11 @@ class KernelBuilder:
                     else None
                 )
                 node_arith = level_arith[level] if arith_round else None
-                level2_round = fast_wrap and level == 2
+                # Level-2 where-tree is only valid when the prefetch path is active
+                # (it relies on level2_prepare_slots + prefetch buffer).
+                level2_round = (
+                    fast_wrap and enable_level2_where and enable_prefetch and level == 2
+                )
                 round_info.append(
                     {
                         "round": round,
@@ -2348,11 +2417,11 @@ class KernelBuilder:
                     }
                 )
             if v_node_prefetch is not None:
-                # Prefetch the next round's node values when an arith round appears.
+                # Prefetch the next round's node values when an arith or level-2 round appears.
                 for round in range(rounds - 1):
                     info = round_info[round]
                     next_info = round_info[round + 1]
-                    if info["arith_round"] and next_info["load_needed"]:
+                    if (info["arith_round"] or info["level2_round"]) and next_info["load_needed"]:
                         prefetch_next[round] = True
                         prefetch_active[round + 1] = True
 
@@ -2382,7 +2451,11 @@ class KernelBuilder:
                 # but aren't arith still go through the normal
                 # pipelined path below, with use_prefetch guiding
                 # how block 0 is consumed.
-                special_round = info["arith_round"] and enable_prefetch
+                special_round = enable_prefetch and (
+                    info["arith_round"] or info["level2_round"]
+                )
+                level2_prep = level2_prepare_slots() if info["level2_round"] else []
+                level2_prepared = False
 
                 if pending_prev:
                     last_buf = last_block_idx % 2
@@ -2395,8 +2468,12 @@ class KernelBuilder:
                         prev_info["node_pair"],
                         prev_info["node_arith"],
                         prev_node_prefetch,
+                        prev_info["level2_round"],
                     )
-                    if special_round:
+                    if info["level2_round"]:
+                        body.extend(interleave_slots(hash_prev, level2_prep))
+                        level2_prepared = True
+                    elif special_round:
                         body.extend(hash_prev)
                     else:
                         load_slots = vec_block_load_slots(
@@ -2411,6 +2488,10 @@ class KernelBuilder:
                         )
                         body.extend(interleave_slots(hash_prev, load_slots))
 
+                if info["level2_round"] and not level2_prepared:
+                    body.extend(level2_prep)
+                    level2_prepared = True
+
                 if special_round:
                     body.extend(
                         vec_block_hash_only_slots(
@@ -2421,6 +2502,7 @@ class KernelBuilder:
                             info["node_pair"],
                             info["node_arith"],
                             node_prefetch,
+                            info["level2_round"],
                         )
                     )
                     for block_idx in range(1, num_blocks):
@@ -2439,6 +2521,7 @@ class KernelBuilder:
                             info["node_pair"],
                             info["node_arith"],
                             node_prefetch,
+                            info["level2_round"],
                         )
                         # Prefetch only block 0, issued one block behind so idx updates are committed.
                         load_slots = []
@@ -2460,6 +2543,7 @@ class KernelBuilder:
                             info["node_pair"],
                             info["node_arith"],
                             node_prefetch,
+                            info["level2_round"],
                         )
                         load_slots = vec_block_load_slots(
                             all_block_vecs[1],
@@ -2496,6 +2580,8 @@ class KernelBuilder:
                             info["node_const"],
                             info["node_pair"],
                             info["node_arith"],
+                            None,
+                            info["level2_round"],
                         )
                         load_slots = vec_block_load_slots(
                             all_block_vecs[block_idx],
@@ -2797,7 +2883,8 @@ def do_kernel_test(
     max_special_level: int | None = None,
     max_arith_level: int | None = None,
     enable_prefetch: bool | None = None,
-    enable_flow_select: bool | None = None,
+    enable_level2_where: bool | None = None,
+    enable_two_round_fusion: bool | None = None,
     lookahead: int | None = None,
     block_size: int | None = None,
     enable_second_pass: bool | None = None,
@@ -2821,8 +2908,11 @@ def do_kernel_test(
         max_arith_level = -1
     if enable_prefetch is None:
         enable_prefetch = False
-    if enable_flow_select is None:
-        enable_flow_select = False
+    if enable_level2_where is None:
+        # Default: tie level-2 where-tree to the same flag combo used in sweeps.
+        enable_level2_where = (max_arith_level >= 2 and enable_prefetch)
+    if enable_two_round_fusion is None:
+        enable_two_round_fusion = False
     if lookahead is None:
         lookahead = 1024
     if block_size is None:
@@ -2841,7 +2931,8 @@ def do_kernel_test(
         max_special_level=max_special_level,
         max_arith_level=max_arith_level,
         enable_prefetch=enable_prefetch,
-        enable_flow_select=enable_flow_select,
+        enable_level2_where=enable_level2_where,
+        enable_two_round_fusion=enable_two_round_fusion,
         lookahead=lookahead,
         block_size=block_size,
         enable_second_pass=enable_second_pass,

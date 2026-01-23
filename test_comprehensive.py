@@ -127,6 +127,28 @@ def main():
             print(f"{status} {name:30s} {cycles:5d} ({diff:+5d})")
             all_results.append((name, cycles, diff))
     print()
+
+    # Category 6: Fusion + where-tree
+    print("="*80)
+    print("CATEGORY 6: Fused Rounds and Where-Tree")
+    print("="*80)
+    fusion_tests = [
+        ("Level2 where + Prefetch", {"enable_level2_where": True, "enable_prefetch": True}),
+        ("Level2 arith (max=2)", {"max_arith_level": 2}),
+        ("Level2 arith + Prefetch", {"max_arith_level": 2, "enable_prefetch": True}),
+        ("Two-round fusion", {"enable_two_round_fusion": True}),
+        ("Two-round fusion + Prefetch", {"enable_two_round_fusion": True, "enable_prefetch": True}),
+        ("Fusion + Level2 where", {"enable_two_round_fusion": True, "enable_level2_where": True, "enable_prefetch": True}),
+    ]
+    for name, kwargs in fusion_tests:
+        full_kwargs = {"block_size": best_block, "lookahead": best_lookahead, **kwargs}
+        cycles = test(name, **full_kwargs)
+        if cycles:
+            diff = cycles - baseline
+            status = "✓" if diff < 0 else "✗" if diff > 0 else "="
+            print(f"{status} {name:30s} {cycles:5d} ({diff:+5d})")
+            all_results.append((name, cycles, diff))
+    print()
     
     # Summary
     print("="*80)

@@ -6,7 +6,40 @@ Tests different optimization combinations and measures impact.
 
 import sys
 import os
-from perf_takehome import do_kernel_test
+import math
+from perf_takehome import do_kernel_test, KernelBuilder
+from problem import Tree
+
+SLOT_LIMITS = {"alu": 12, "valu": 6, "load": 2, "store": 2, "flow": 1}
+REPORT_UTILIZATION = False
+
+def build_and_analyze(forest_height, rounds, batch_size, **kwargs):
+    """Build kernel and return (load_bound, util_pct, idle_pct)."""
+    forest = Tree.generate(forest_height)
+    kb = KernelBuilder(**kwargs)
+    kb.build_kernel(forest.height, len(forest.values), batch_size, rounds)
+    total_cycles = len(kb.instrs)
+    ops = {eng: 0 for eng in SLOT_LIMITS}
+    used_cycles = {eng: 0 for eng in SLOT_LIMITS}
+    for bundle in kb.instrs:
+        for eng, slots in bundle.items():
+            if eng == "debug":
+                continue
+            ops[eng] += len(slots)
+            if slots:
+                used_cycles[eng] += 1
+    load_bound = math.ceil(ops["load"] / SLOT_LIMITS["load"]) if ops["load"] else 0
+    util_pct = {
+        eng: (ops[eng] / (total_cycles * SLOT_LIMITS[eng]))
+        if total_cycles > 0 else 0.0
+        for eng in SLOT_LIMITS
+    }
+    idle_pct = {
+        eng: (1 - (used_cycles[eng] / total_cycles))
+        if total_cycles > 0 else 0.0
+        for eng in SLOT_LIMITS
+    }
+    return load_bound, util_pct, idle_pct
 
 # Store original lookahead value
 ORIGINAL_LOOKAHEAD = 128
@@ -15,6 +48,14 @@ def test_optimization(name, **kwargs):
     """Test a single optimization and return cycle count."""
     try:
         result = do_kernel_test(10, 16, 256, **kwargs)
+        if REPORT_UTILIZATION and result is not None:
+            load_bound, util, idle = build_and_analyze(10, 16, 256, **kwargs)
+            print(
+                f"  Load bound: {load_bound} cycles | "
+                f"util load {util['load']:.1%} valu {util['valu']:.1%} "
+                f"alu {util['alu']:.1%} flow {util['flow']:.1%} | "
+                f"idle valu {idle['valu']:.1%} flow {idle['flow']:.1%}"
+            )
         return result
     except Exception as e:
         print(f"  ERROR: {e}")
@@ -104,6 +145,26 @@ def main():
     optimizations.extend([
         ("No assume_zero_indices", {
             "assume_zero_indices": False,
+        }),
+    ])
+
+    # Category 5: Fusion + overlap combos
+    optimizations.extend([
+        ("Two-round fusion", {
+            "enable_two_round_fusion": True,
+        }),
+        ("Two-round fusion + prefetch", {
+            "enable_two_round_fusion": True,
+            "enable_prefetch": True,
+        }),
+        ("Two-round fusion + level2 where", {
+            "enable_two_round_fusion": True,
+            "enable_level2_where": True,
+            "enable_prefetch": True,
+        }),
+        ("Level2 where + prefetch", {
+            "enable_level2_where": True,
+            "enable_prefetch": True,
         }),
     ])
     
