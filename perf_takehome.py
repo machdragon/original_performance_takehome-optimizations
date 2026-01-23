@@ -43,6 +43,7 @@ class KernelBuilder:
         assume_zero_indices: bool = True,
         max_special_level: int = -1,
         max_arith_level: int = -1,
+        enable_prefetch: bool = False,
     ):
         self.instrs = []
         self.scratch = {}
@@ -54,6 +55,7 @@ class KernelBuilder:
         self.assume_zero_indices = assume_zero_indices
         self.max_special_level = max_special_level
         self.max_arith_level = max_arith_level
+        self.enable_prefetch = enable_prefetch
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -570,9 +572,21 @@ class KernelBuilder:
                     l_i += 1
             return combined
 
-        def vec_load_slots(vec_i, buf_idx, node_const=None, node_pair=None, node_arith=None):
+        def vec_load_slots(
+            vec_i,
+            buf_idx,
+            node_const=None,
+            node_pair=None,
+            node_arith=None,
+            node_prefetch=None,
+        ):
             slots = []
-            if node_const is not None or node_pair is not None or node_arith is not None:
+            if (
+                node_const is not None
+                or node_pair is not None
+                or node_arith is not None
+                or node_prefetch is not None
+            ):
                 return slots
             v_idx = idx_cache + vec_i
             v_addr_buf = v_addr[buf_idx]
@@ -713,6 +727,7 @@ class KernelBuilder:
             node_const=None,
             node_pair=None,
             node_arith=None,
+            node_prefetch=None,
         ):
             slots = []
             v_idx = idx_cache + vec_i
@@ -726,6 +741,8 @@ class KernelBuilder:
                     ("valu", ("multiply_add", v_tmp3, v_tmp1, node_diff, node_right))
                 )
                 v_node_buf = v_tmp3
+            elif node_prefetch is not None:
+                v_node_buf = node_prefetch + vec_i
             elif node_arith is not None:
                 select_slots, v_node_buf = emit_level_select_slots(
                     v_idx, buf_idx, node_arith
@@ -855,11 +872,21 @@ class KernelBuilder:
             return slots
 
         def vec_block_load_slots(
-            block_vecs, buf_idx, node_const=None, node_pair=None, node_arith=None
+            block_vecs,
+            buf_idx,
+            node_const=None,
+            node_pair=None,
+            node_arith=None,
+            node_prefetch=None,
         ):
             """Load node values for a block into the specified buffer."""
             slots = []
-            if node_const is not None or node_pair is not None or node_arith is not None:
+            if (
+                node_const is not None
+                or node_pair is not None
+                or node_arith is not None
+                or node_prefetch is not None
+            ):
                 return slots
             node_buf = v_node_block[buf_idx]
             for bi, vec_i in enumerate(block_vecs):
@@ -876,6 +903,18 @@ class KernelBuilder:
                                 lane,
                             ),
                         )
+                    )
+            return slots
+
+        def vec_block_prefetch_slots(block_vecs, prefetch_base):
+            """Load node values for a block into a persistent prefetch buffer."""
+            slots = []
+            for vec_i in block_vecs:
+                v_idx = idx_cache + vec_i
+                slots.append(("valu", ("+", v_addr[0], v_idx, v_forest_p)))
+                for lane in range(VLEN):
+                    slots.append(
+                        ("load", ("load_offset", prefetch_base + vec_i, v_addr[0], lane))
                     )
             return slots
 
@@ -1025,6 +1064,7 @@ class KernelBuilder:
             node_const=None,
             node_pair=None,
             node_arith=None,
+            node_prefetch=None,
         ):
             """XOR, hash, and update indices using node values from specified buffer."""
             slots = []
@@ -1057,6 +1097,12 @@ class KernelBuilder:
                     v_val = val_cache + vec_i
                     slots.append(
                         ("valu", ("^", v_val, v_val, v_tmp3_block + bi * VLEN))
+                    )
+            elif node_prefetch is not None:
+                for _bi, vec_i in enumerate(block_vecs):
+                    v_val = val_cache + vec_i
+                    slots.append(
+                        ("valu", ("^", v_val, v_val, node_prefetch + vec_i))
                     )
             elif node_arith is not None:
                 select_slots, node_base = emit_level_select_block_slots(
@@ -1165,12 +1211,21 @@ class KernelBuilder:
             node_const=None,
             node_pair=None,
             node_arith=None,
+            node_prefetch=None,
         ):
             """Combined load + hash (non-pipelined fallback)."""
-            slots = vec_block_load_slots(block_vecs, 0, node_const, node_pair, node_arith)
+            slots = vec_block_load_slots(
+                block_vecs, 0, node_const, node_pair, node_arith, node_prefetch
+            )
             slots.extend(
                 vec_block_hash_only_slots(
-                    block_vecs, 0, wrap_round, node_const, node_pair, node_arith
+                    block_vecs,
+                    0,
+                    wrap_round,
+                    node_const,
+                    node_pair,
+                    node_arith,
+                    node_prefetch,
                 )
             )
             return slots
@@ -1273,6 +1328,10 @@ class KernelBuilder:
                         "diffs": v_level_diffs,
                     }
         vec_count = vec_end // VLEN
+        v_node_prefetch = None
+        enable_prefetch = self.enable_prefetch and enable_arith and rounds > 1
+        if enable_prefetch and vec_count > 0:
+            v_node_prefetch = self.alloc_scratch("v_node_prefetch", vec_count * VLEN)
 
         # Cross-round pipelining for better load utilization
         block_limit = vec_count - (vec_count % block_size)
@@ -1285,135 +1344,185 @@ class KernelBuilder:
             and block_limit == vec_count  # no remainder
         )
 
+        round_info = []
+        prefetch_active = [False] * rounds
+        prefetch_next = [False] * rounds
+        if use_cross_round:
+            for round in range(rounds):
+                level = round % wrap_period
+                uniform_round = fast_wrap and level == 0
+                binary_round = fast_wrap and level == 1
+                arith_round = fast_wrap and level in level_arith
+                node_const = v_root_node if uniform_round else None
+                node_pair = (
+                    (v_level1_right, v_level1_diff)
+                    if binary_round and v_level1_diff
+                    else None
+                )
+                node_arith = level_arith[level] if arith_round else None
+                round_info.append(
+                    {
+                        "round": round,
+                        "level": level,
+                        "wrap_round": level == forest_height,
+                        "node_const": node_const,
+                        "node_pair": node_pair,
+                        "node_arith": node_arith,
+                        "load_needed": (
+                            node_const is None
+                            and node_pair is None
+                            and node_arith is None
+                        ),
+                        "arith_round": arith_round,
+                    }
+                )
+            if v_node_prefetch is not None:
+                # Prefetch the next round's node values when an arith round appears.
+                for round in range(rounds - 1):
+                    info = round_info[round]
+                    next_info = round_info[round + 1]
+                    if info["arith_round"] and next_info["load_needed"]:
+                        prefetch_next[round] = True
+                        prefetch_active[round + 1] = True
+
         if use_cross_round:
             block_0_vecs = [offset * VLEN for offset in range(block_size)]
             last_block_idx = num_blocks - 1
             last_start = last_block_idx * block_size
-            last_block_vecs = [(last_start + offset) * VLEN for offset in range(block_size)]
+            last_block_vecs = [
+                (last_start + offset) * VLEN for offset in range(block_size)
+            ]
             all_block_vecs = [
                 [(b * block_size + offset) * VLEN for offset in range(block_size)]
                 for b in range(num_blocks)
             ]
 
-            # Round 0: prologue + steady state
-            wrap_round_0 = (0 % wrap_period) == forest_height
-            level_0 = 0 % wrap_period
-            uniform_round_0 = fast_wrap and level_0 == 0
-            binary_round_0 = fast_wrap and level_0 == 1
-            arith_round_0 = fast_wrap and level_0 in level_arith
-            node_const_0 = v_root_node if uniform_round_0 else None
-            node_pair_0 = (
-                (v_level1_right, v_level1_diff) if binary_round_0 and v_level1_diff else None
-            )
-            node_arith_0 = level_arith[level_0] if arith_round_0 else None
-            body.extend(
-                vec_block_load_slots(
-                    block_0_vecs, 0, node_const_0, node_pair_0, node_arith_0
-                )
-            )
-            for block_idx in range(1, num_blocks):
-                prev_buf = (block_idx - 1) % 2
-                curr_buf = block_idx % 2
-                hash_slots = vec_block_hash_only_slots(
-                    all_block_vecs[block_idx - 1],
-                    prev_buf,
-                    wrap_round_0,
-                    node_const_0,
-                    node_pair_0,
-                    node_arith_0,
-                )
-                load_slots = vec_block_load_slots(
-                    all_block_vecs[block_idx], curr_buf, node_const_0, node_pair_0, node_arith_0
-                )
-                body.extend(interleave_slots(hash_slots, load_slots))
+            pending_prev = False
+            prev_info = None
+            prev_use_prefetch = False
 
-            # Rounds 1 to N-1: overlap epilogue of prev with prologue of current
-            for round in range(1, rounds):
-                wrap_round_prev = ((round - 1) % wrap_period) == forest_height
-                wrap_round_curr = (round % wrap_period) == forest_height
-                level_prev = (round - 1) % wrap_period
-                level_curr = round % wrap_period
-                uniform_round_prev = fast_wrap and level_prev == 0
-                uniform_round_curr = fast_wrap and level_curr == 0
-                binary_round_prev = fast_wrap and level_prev == 1
-                binary_round_curr = fast_wrap and level_curr == 1
-                arith_round_prev = fast_wrap and level_prev in level_arith
-                arith_round_curr = fast_wrap and level_curr in level_arith
-                node_const_prev = v_root_node if uniform_round_prev else None
-                node_const_curr = v_root_node if uniform_round_curr else None
-                node_pair_prev = (
-                    (v_level1_right, v_level1_diff)
-                    if binary_round_prev and v_level1_diff
-                    else None
-                )
-                node_pair_curr = (
-                    (v_level1_right, v_level1_diff)
-                    if binary_round_curr and v_level1_diff
-                    else None
-                )
-                node_arith_prev = level_arith[level_prev] if arith_round_prev else None
-                node_arith_curr = level_arith[level_curr] if arith_round_curr else None
+            for round in range(rounds):
+                info = round_info[round]
+                use_prefetch = prefetch_active[round]
+                do_prefetch_next = prefetch_next[round]
+                node_prefetch = v_node_prefetch if use_prefetch else None
+                special_round = use_prefetch or do_prefetch_next
+
+                if pending_prev:
+                    last_buf = last_block_idx % 2
+                    prev_node_prefetch = v_node_prefetch if prev_use_prefetch else None
+                    hash_prev = vec_block_hash_only_slots(
+                        last_block_vecs,
+                        last_buf,
+                        prev_info["wrap_round"],
+                        prev_info["node_const"],
+                        prev_info["node_pair"],
+                        prev_info["node_arith"],
+                        prev_node_prefetch,
+                    )
+                    if special_round:
+                        body.extend(hash_prev)
+                    else:
+                        load_slots = vec_block_load_slots(
+                            block_0_vecs,
+                            0,
+                            info["node_const"],
+                            info["node_pair"],
+                            info["node_arith"],
+                            node_prefetch,
+                        )
+                        body.extend(interleave_slots(hash_prev, load_slots))
+
+                if special_round:
+                    body.extend(
+                        vec_block_hash_only_slots(
+                            block_0_vecs,
+                            0,
+                            info["wrap_round"],
+                            info["node_const"],
+                            info["node_pair"],
+                            info["node_arith"],
+                            node_prefetch,
+                        )
+                    )
+                    for block_idx in range(1, num_blocks):
+                        buf_idx = block_idx % 2
+                        hash_slots = vec_block_hash_only_slots(
+                            all_block_vecs[block_idx],
+                            buf_idx,
+                            info["wrap_round"],
+                            info["node_const"],
+                            info["node_pair"],
+                            info["node_arith"],
+                            node_prefetch,
+                        )
+                        load_slots = (
+                            vec_block_prefetch_slots(
+                                all_block_vecs[block_idx - 1], v_node_prefetch
+                            )
+                            if do_prefetch_next
+                            else []
+                        )
+                        body.extend(interleave_slots(hash_slots, load_slots))
+                    if do_prefetch_next:
+                        body.extend(
+                            vec_block_prefetch_slots(
+                                all_block_vecs[num_blocks - 1], v_node_prefetch
+                            )
+                        )
+                    pending_prev = False
+                else:
+                    if not pending_prev:
+                        body.extend(
+                            vec_block_load_slots(
+                                block_0_vecs,
+                                0,
+                                info["node_const"],
+                                info["node_pair"],
+                                info["node_arith"],
+                                node_prefetch,
+                            )
+                        )
+                    for block_idx in range(1, num_blocks):
+                        prev_buf = (block_idx - 1) % 2
+                        curr_buf = block_idx % 2
+                        hash_slots = vec_block_hash_only_slots(
+                            all_block_vecs[block_idx - 1],
+                            prev_buf,
+                            info["wrap_round"],
+                            info["node_const"],
+                            info["node_pair"],
+                            info["node_arith"],
+                            node_prefetch,
+                        )
+                        load_slots = vec_block_load_slots(
+                            all_block_vecs[block_idx],
+                            curr_buf,
+                            info["node_const"],
+                            info["node_pair"],
+                            info["node_arith"],
+                            node_prefetch,
+                        )
+                        body.extend(interleave_slots(hash_slots, load_slots))
+                    pending_prev = True
+
+                prev_info = info
+                prev_use_prefetch = use_prefetch
+
+            if pending_prev:
                 last_buf = last_block_idx % 2
-
-                # Epilogue of prev round + prologue of current
-                hash_slots = vec_block_hash_only_slots(
-                    last_block_vecs,
-                    last_buf,
-                    wrap_round_prev,
-                    node_const_prev,
-                    node_pair_prev,
-                    node_arith_prev,
-                )
-                load_slots = vec_block_load_slots(
-                    block_0_vecs, 0, node_const_curr, node_pair_curr, node_arith_curr
-                )
-                body.extend(interleave_slots(hash_slots, load_slots))
-
-                # Steady state
-                for block_idx in range(1, num_blocks):
-                    prev_buf = (block_idx - 1) % 2
-                    curr_buf = block_idx % 2
-                    hash_slots = vec_block_hash_only_slots(
-                        all_block_vecs[block_idx - 1],
-                        prev_buf,
-                        wrap_round_curr,
-                        node_const_curr,
-                        node_pair_curr,
-                        node_arith_curr,
+                node_prefetch = v_node_prefetch if prev_use_prefetch else None
+                body.extend(
+                    vec_block_hash_only_slots(
+                        last_block_vecs,
+                        last_buf,
+                        prev_info["wrap_round"],
+                        prev_info["node_const"],
+                        prev_info["node_pair"],
+                        prev_info["node_arith"],
+                        node_prefetch,
                     )
-                    load_slots = vec_block_load_slots(
-                        all_block_vecs[block_idx],
-                        curr_buf,
-                        node_const_curr,
-                        node_pair_curr,
-                        node_arith_curr,
-                    )
-                    body.extend(interleave_slots(hash_slots, load_slots))
-
-            # Final epilogue
-            wrap_round_last = ((rounds - 1) % wrap_period) == forest_height
-            level_last = (rounds - 1) % wrap_period
-            uniform_round_last = fast_wrap and level_last == 0
-            binary_round_last = fast_wrap and level_last == 1
-            arith_round_last = fast_wrap and level_last in level_arith
-            node_const_last = v_root_node if uniform_round_last else None
-            node_pair_last = (
-                (v_level1_right, v_level1_diff)
-                if binary_round_last and v_level1_diff
-                else None
-            )
-            node_arith_last = level_arith[level_last] if arith_round_last else None
-            last_buf = last_block_idx % 2
-            body.extend(
-                vec_block_hash_only_slots(
-                    last_block_vecs,
-                    last_buf,
-                    wrap_round_last,
-                    node_const_last,
-                    node_pair_last,
-                    node_arith_last,
                 )
-            )
 
         else:
             # Fallback: per-round processing
@@ -1679,6 +1788,7 @@ def do_kernel_test(
     assume_zero_indices: bool | None = None,
     max_special_level: int | None = None,
     max_arith_level: int | None = None,
+    enable_prefetch: bool | None = None,
 ):
     print(f"{forest_height=}, {rounds=}, {batch_size=}")
     random.seed(seed)
@@ -1694,11 +1804,14 @@ def do_kernel_test(
         max_special_level = -1
     if max_arith_level is None:
         max_arith_level = -1
+    if enable_prefetch is None:
+        enable_prefetch = False
     kb = KernelBuilder(
         enable_debug=enable_debug,
         assume_zero_indices=assume_zero_indices,
         max_special_level=max_special_level,
         max_arith_level=max_arith_level,
+        enable_prefetch=enable_prefetch,
     )
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
     # print(kb.instrs)
