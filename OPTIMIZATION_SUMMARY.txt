@@ -11,9 +11,10 @@ Implemented & tested changes
 - Phase 8 (gather bypass): optional early-level prefetch + vselect tree, gated by max_special_level. Regressed (6433 vs 6374), so disabled by default.
 - Phase 9 (block interleave): block-level hash staging to fill VALU slots + pipelined remainder path. Cycle count: 4269.
 - Phase 10 (block pipelining): double-buffered block loads, cross-round pipelining, 2-load interleaving, block_size=4. Index write-back gated by write_indices (default False). Cycle count: 2906.
+- Phase 11 (uniform-round broadcast): when indices are known to be all zero (round % wrap_period == 0 with fast_wrap), skip address + load_offset and hash against a root-value vector. Cycle count: 2828.
 
 Verification performed
-- `python3 perf_takehome.py Tests.test_kernel_cycles` after each phase (latest: 2906 cycles).
+- `python3 perf_takehome.py Tests.test_kernel_cycles` after each phase (latest: 2828 cycles).
 - Scalar tail sanity check with debug on: `do_kernel_test(4, 5, 10, enable_debug=True)` (last run prior to Phase 8).
 
 Flagged comments status
@@ -21,8 +22,6 @@ Flagged comments status
 
 Remaining optimization plan
 1) Gather pressure reduction (valid, high potential)
-   - Uniform-index optimization: rounds where all indices are 0 (level 0) can use 1 load + broadcast instead of 256 loads.
-   - Detected: rounds 0, 11 have 1 unique index per vector; potential savings of ~500 loads per uniform round.
    - Partial deduplication for early rounds (1-3, 12-14) where uniqueness is low.
 
 2) Bundler refinements (valid)
@@ -41,6 +40,7 @@ Remaining optimization plan
 Completed from previous plan:
 - Block scheduling + load overlap: implemented as cross-round pipelining with block_size=4 (Phase 10).
 - Skip index write-back: implemented as write_indices flag (default False) for benchmark perf.
+- Uniform-index optimization: implemented as uniform-round broadcast (Phase 11).
 
 Notes
 - Debug mode can be re-enabled via KernelBuilder(enable_debug=True).
