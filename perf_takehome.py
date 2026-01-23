@@ -2393,7 +2393,11 @@ class KernelBuilder:
                     else None
                 )
                 node_arith = level_arith[level] if arith_round else None
-                level2_round = fast_wrap and enable_level2_where and enable_prefetch and level == 2
+                # Level-2 where-tree is only valid when the prefetch path is active
+                # (it relies on level2_prepare_slots + prefetch buffer).
+                level2_round = (
+                    fast_wrap and enable_level2_where and enable_prefetch and level == 2
+                )
                 round_info.append(
                     {
                         "round": round,
@@ -2905,9 +2909,8 @@ def do_kernel_test(
     if enable_prefetch is None:
         enable_prefetch = False
     if enable_level2_where is None:
-        enable_level2_where = False
-        if max_arith_level is not None and max_arith_level >= 2 and enable_prefetch:
-            enable_level2_where = True
+        # Default: tie level-2 where-tree to the same flag combo used in sweeps.
+        enable_level2_where = (max_arith_level >= 2 and enable_prefetch)
     if enable_two_round_fusion is None:
         enable_two_round_fusion = False
     if lookahead is None:
