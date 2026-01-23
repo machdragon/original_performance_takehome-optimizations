@@ -835,6 +835,11 @@ class KernelBuilder:
                         block_limit = vec_count - (vec_count % block_size)
                         num_blocks = block_limit // block_size
                         if num_blocks >= 2:
+                            block_0_vecs = [offset * VLEN for offset in range(block_size)]
+                            all_block_vecs = [
+                                [(b * block_size + offset) * VLEN for offset in range(block_size)]
+                                for b in range(num_blocks)
+                            ]
                             body.extend(vec_block_load_slots(block_0_vecs, 0))
                             for block_idx in range(1, num_blocks):
                                 prev_buf = (block_idx - 1) % 2
@@ -868,71 +873,82 @@ class KernelBuilder:
                         last_vec = vec_count - 1
                         body.extend(vec_hash_slots(last_vec * VLEN, last_vec % 2, round, wrap_round))
 
-            for i in range(vec_end, batch_size):
-                idx_addr = idx_cache + i
-                val_addr = val_cache + i
-                # idx = cached index
-                if self.enable_debug:
-                    body.append(("debug", ("compare", idx_addr, (round, i, "idx"))))
-                # val = cached value
-                if self.enable_debug:
-                    body.append(("debug", ("compare", val_addr, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
-                body.append(
-                    ("alu", ("+", tmp_addr, self.scratch["forest_values_p"], idx_addr))
-                )
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                if self.enable_debug:
+        if vec_end < batch_size:
+            for round in range(rounds):
+                wrap_round = (round % wrap_period) == forest_height
+                for i in range(vec_end, batch_size):
+                    idx_addr = idx_cache + i
+                    val_addr = val_cache + i
+                    # idx = cached index
+                    if self.enable_debug:
+                        body.append(("debug", ("compare", idx_addr, (round, i, "idx"))))
+                    # val = cached value
+                    if self.enable_debug:
+                        body.append(("debug", ("compare", val_addr, (round, i, "val"))))
+                    # node_val = mem[forest_values_p + idx]
                     body.append(
-                        ("debug", ("compare", tmp_node_val, (round, i, "node_val")))
+                        ("alu", ("+", tmp_addr, self.scratch["forest_values_p"], idx_addr))
                     )
-                # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", val_addr, val_addr, tmp_node_val)))
-                body.extend(self.build_hash(val_addr, tmp1, tmp2, round, i))
-                if self.enable_debug:
-                    body.append(
-                        ("debug", ("compare", val_addr, (round, i, "hashed_val")))
-                    )
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                if fast_wrap:
-                    if wrap_round:
-                        body.append(("alu", ("+", idx_addr, zero_const, zero_const)))
+                    body.append(("load", ("load", tmp_node_val, tmp_addr)))
+                    if self.enable_debug:
+                        body.append(
+                            ("debug", ("compare", tmp_node_val, (round, i, "node_val")))
+                        )
+                    # val = myhash(val ^ node_val)
+                    body.append(("alu", ("^", val_addr, val_addr, tmp_node_val)))
+                    body.extend(self.build_hash(val_addr, tmp1, tmp2, round, i))
+                    if self.enable_debug:
+                        body.append(
+                            ("debug", ("compare", val_addr, (round, i, "hashed_val")))
+                        )
+                    # idx = 2*idx + (1 if val % 2 == 0 else 2)
+                    if fast_wrap:
+                        if wrap_round:
+                            body.append(("alu", ("+", idx_addr, zero_const, zero_const)))
+                        else:
+                            body.append(("alu", ("&", tmp3, val_addr, one_const)))
+                            body.append(("alu", ("+", tmp3, tmp3, one_const)))
+                            body.append(("alu", ("*", idx_addr, idx_addr, two_const)))
+                            body.append(("alu", ("+", idx_addr, idx_addr, tmp3)))
                     else:
                         body.append(("alu", ("&", tmp3, val_addr, one_const)))
                         body.append(("alu", ("+", tmp3, tmp3, one_const)))
                         body.append(("alu", ("*", idx_addr, idx_addr, two_const)))
                         body.append(("alu", ("+", idx_addr, idx_addr, tmp3)))
-                else:
-                    body.append(("alu", ("&", tmp3, val_addr, one_const)))
-                    body.append(("alu", ("+", tmp3, tmp3, one_const)))
-                    body.append(("alu", ("*", idx_addr, idx_addr, two_const)))
-                    body.append(("alu", ("+", idx_addr, idx_addr, tmp3)))
-                if self.enable_debug:
-                    body.append(
-                        ("debug", ("compare", idx_addr, (round, i, "next_idx")))
-                    )
-                if not fast_wrap:
-                    body.append(
-                        ("alu", ("<", tmp1, idx_addr, self.scratch["n_nodes"]))
-                    )
-                    body.append(
-                        ("flow", ("select", idx_addr, tmp1, idx_addr, zero_const))
-                    )
-                if self.enable_debug:
-                    body.append(
-                        ("debug", ("compare", idx_addr, (round, i, "wrapped_idx")))
-                    )
+                    if self.enable_debug:
+                        body.append(
+                            ("debug", ("compare", idx_addr, (round, i, "next_idx")))
+                        )
+                    if not fast_wrap:
+                        body.append(
+                            ("alu", ("<", tmp1, idx_addr, self.scratch["n_nodes"]))
+                        )
+                        body.append(
+                            ("flow", ("select", idx_addr, tmp1, idx_addr, zero_const))
+                        )
+                    if self.enable_debug:
+                        body.append(
+                            ("debug", ("compare", idx_addr, (round, i, "wrapped_idx")))
+                        )
 
-        # Write back cached values (skip indices - submission only checks values)
+        # Write back cached values and indices
+        idx_store_ptr = self.alloc_scratch("idx_store_ptr")
         val_store_ptr = self.alloc_scratch("val_store_ptr")
+        body.append(
+            ("alu", ("+", idx_store_ptr, self.scratch["inp_indices_p"], zero_const))
+        )
         body.append(
             ("alu", ("+", val_store_ptr, self.scratch["inp_values_p"], zero_const))
         )
         for i in range(0, vec_end, VLEN):
+            body.append(("store", ("vstore", idx_store_ptr, idx_cache + i)))
             body.append(("store", ("vstore", val_store_ptr, val_cache + i)))
+            body.append(("flow", ("add_imm", idx_store_ptr, idx_store_ptr, VLEN)))
             body.append(("flow", ("add_imm", val_store_ptr, val_store_ptr, VLEN)))
         for i in range(vec_end, batch_size):
+            body.append(("store", ("store", idx_store_ptr, idx_cache + i)))
             body.append(("store", ("store", val_store_ptr, val_cache + i)))
+            body.append(("flow", ("add_imm", idx_store_ptr, idx_store_ptr, 1)))
             body.append(("flow", ("add_imm", val_store_ptr, val_store_ptr, 1)))
 
         body_instrs = self.build(body, vliw=True)
