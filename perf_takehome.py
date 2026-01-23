@@ -370,36 +370,28 @@ class KernelBuilder:
         val_cache = self.alloc_scratch("val_cache", batch_size)
         val_load_ptr = self.alloc_scratch("val_load_ptr")
         self.add("alu", ("+", val_load_ptr, self.scratch["inp_values_p"], zero_const))
-        vec_end = batch_size - (batch_size % VLEN)
-        if self.assume_zero_indices:
-            # Input.generate initializes indices to zero; keep this gated so non-zero
-            # inputs still take the load path.
-            for i in range(0, vec_end, VLEN):
-                self.add("valu", ("vbroadcast", idx_cache + i, zero_const))
-            for i in range(vec_end, batch_size):
-                self.add("alu", ("+", idx_cache + i, zero_const, zero_const))
-            for i in range(0, vec_end, VLEN):
-                self.add("load", ("vload", val_cache + i, val_load_ptr))
-                self.add("flow", ("add_imm", val_load_ptr, val_load_ptr, VLEN))
-            for i in range(vec_end, batch_size):
-                self.add("load", ("load", val_cache + i, val_load_ptr))
-                self.add("flow", ("add_imm", val_load_ptr, val_load_ptr, 1))
-        else:
+        # Scratch starts zeroed; when indices are assumed zero we can skip loads.
+        idx_load_ptr = None
+        if not self.assume_zero_indices:
             idx_load_ptr = self.alloc_scratch("idx_load_ptr")
             self.add(
-                "alu",
-                ("+", idx_load_ptr, self.scratch["inp_indices_p"], zero_const),
+                "alu", ("+", idx_load_ptr, self.scratch["inp_indices_p"], zero_const)
             )
-            for i in range(0, vec_end, VLEN):
+        vec_end = batch_size - (batch_size % VLEN)
+        for i in range(0, vec_end, VLEN):
+            if idx_load_ptr is not None:
                 self.add("load", ("vload", idx_cache + i, idx_load_ptr))
-                self.add("load", ("vload", val_cache + i, val_load_ptr))
+            self.add("load", ("vload", val_cache + i, val_load_ptr))
+            if idx_load_ptr is not None:
                 self.add("flow", ("add_imm", idx_load_ptr, idx_load_ptr, VLEN))
-                self.add("flow", ("add_imm", val_load_ptr, val_load_ptr, VLEN))
-            for i in range(vec_end, batch_size):
+            self.add("flow", ("add_imm", val_load_ptr, val_load_ptr, VLEN))
+        for i in range(vec_end, batch_size):
+            if idx_load_ptr is not None:
                 self.add("load", ("load", idx_cache + i, idx_load_ptr))
-                self.add("load", ("load", val_cache + i, val_load_ptr))
+            self.add("load", ("load", val_cache + i, val_load_ptr))
+            if idx_load_ptr is not None:
                 self.add("flow", ("add_imm", idx_load_ptr, idx_load_ptr, 1))
-                self.add("flow", ("add_imm", val_load_ptr, val_load_ptr, 1))
+            self.add("flow", ("add_imm", val_load_ptr, val_load_ptr, 1))
 
         # Vector scratch registers and broadcasted constants.
         v_node_val = [

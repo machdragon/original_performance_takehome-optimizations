@@ -14,10 +14,10 @@ Implemented & tested changes
 - Phase 11 (uniform-round broadcast): when indices are known to be all zero (round % wrap_period == 0 with fast_wrap), skip address + load_offset and hash against a root-value vector. Cycle count: 2828.
 - Phase 12 (index multiply-add): replace vector index double + add with a single multiply_add using v_two, reducing VALU ops in fast_wrap path. Cycle count: 2469.
 - Phase 13 (larger blocks + level-1 parity): increase block_size to 8 and enable level-1 node_pair shortcut (now using multiply_add). Cycle count: 2293.
-- Phase 14 (zero-index init): when assume_zero_indices, initialize idx_cache with vbroadcast and skip index vloads; values still vloaded. Cycle count: 2260.
+- Phase 15 (zero-index init): skip loading idx_cache when assume_zero_indices; rely on zeroed scratch to seed indices. Cycle count: 2228.
 
 Verification performed
-- `python3 perf_takehome.py Tests.test_kernel_cycles` after each phase (latest: 2260 cycles).
+- `python3 perf_takehome.py Tests.test_kernel_cycles` after each phase (latest: 2228 cycles).
 - Scalar tail sanity check with debug on: `do_kernel_test(4, 5, 10, enable_debug=True)` (last run prior to Phase 8).
 
 Flagged comments status
@@ -52,4 +52,4 @@ Notes
 - Fast wrap assumes Input.generate indices start at 0; set assume_zero_indices=False for general inputs.
 - max_special_level >= 0 enables the early-level gather bypass; default remains -1 due to regression.
 - Wrap periodicity is a structural invariant (forest_height + 1 rounds to exceed bounds when starting at root).
-- Phase 13 (2293 cycles) still sits above the 2164 cycle threshold; further optimization is required.
+- Phase 15 (2228 cycles) still sits above the 2164 cycle threshold; further optimization is required.
