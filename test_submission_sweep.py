@@ -21,7 +21,12 @@ def parse_int_list(value):
 def parse_rounds(value):
     if "-" in value:
         start, end = value.split("-", 1)
-        return list(range(int(start), int(end) + 1))
+        start_int = int(start)
+        end_int = int(end)
+        if start_int > end_int:
+            # Inverted range results in empty list
+            return []
+        return list(range(start_int, end_int + 1))
     return parse_int_list(value)
 
 
@@ -41,7 +46,10 @@ def run_sweep(
     if verbose:
         print("Submission sweep settings:")
         print(f"  heights: {heights}")
-        print(f"  rounds: {rounds[0]}..{rounds[-1]} ({len(rounds)} values)")
+        if rounds:
+            print(f"  rounds: {rounds[0]}..{rounds[-1]} ({len(rounds)} values)")
+        else:
+            print(f"  rounds: (empty)")
         print(f"  batches: {batches}")
         print("  kernel:")
         print(f"    block_size={block_size}, lookahead={lookahead}")
@@ -119,6 +127,9 @@ def main():
     heights = parse_int_list(args.heights)
     rounds = parse_rounds(args.rounds)
     batches = parse_int_list(args.batches)
+
+    if not rounds:
+        parser.error(f"Invalid rounds range: '{args.rounds}' results in empty list (did you use an inverted range like '10-5'?)")
 
     results, summary = run_sweep(
         heights,
