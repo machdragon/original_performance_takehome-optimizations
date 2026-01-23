@@ -51,3 +51,4 @@ Notes
 - Fast wrap assumes Input.generate indices start at 0; set assume_zero_indices=False for general inputs.
 - max_special_level >= 0 enables the early-level gather bypass; default remains -1 due to regression.
 - Wrap periodicity is a structural invariant (forest_height + 1 rounds to exceed bounds when starting at root).
+- Phase 13 (2293 cycles) still sits above the 2164 cycle threshold; further optimization is required.
