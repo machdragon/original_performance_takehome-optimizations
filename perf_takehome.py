@@ -37,7 +37,12 @@ from problem import (
 
 
 class KernelBuilder:
-    def __init__(self, enable_debug: bool = False, assume_zero_indices: bool = True):
+    def __init__(
+        self,
+        enable_debug: bool = False,
+        assume_zero_indices: bool = True,
+        max_special_level: int = -1,
+    ):
         self.instrs = []
         self.scratch = {}
         self.scratch_debug = {}
@@ -46,6 +51,7 @@ class KernelBuilder:
         self.vconst_map = {}
         self.enable_debug = enable_debug
         self.assume_zero_indices = assume_zero_indices
+        self.max_special_level = max_special_level
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -394,6 +400,55 @@ class KernelBuilder:
             self.scratch_vconst(val1)
             self.scratch_vconst(val3)
 
+        max_special = min(self.max_special_level, forest_height)
+        use_special = self.assume_zero_indices and max_special >= 0
+        level_vec_base = []
+        level_sizes = []
+        level_starts = []
+        level_tmp = None
+        if use_special:
+            level_total = (1 << (max_special + 1)) - 1
+            level_values = self.alloc_scratch("level_values", level_total)
+            level_vecs = self.alloc_scratch("level_vecs", level_total * VLEN)
+            level_tmp = self.alloc_scratch("level_tmp_vecs", (1 << max_special) * VLEN)
+            level_addr = self.alloc_scratch("level_addr")
+            offset = 0
+            for level in range(max_special + 1):
+                level_size = 1 << level
+                level_start = level_size - 1
+                level_vec_base.append(level_vecs + offset * VLEN)
+                level_sizes.append(level_size)
+                level_starts.append(level_start)
+                # Load level values once and broadcast into vectors.
+                self.add(
+                    "alu",
+                    (
+                        "+",
+                        level_addr,
+                        self.scratch["forest_values_p"],
+                        self.scratch_const(level_start),
+                    ),
+                )
+                vec_chunks = level_size // VLEN
+                tail = level_size % VLEN
+                for _ in range(vec_chunks):
+                    self.add("load", ("vload", level_values + offset, level_addr))
+                    self.add("flow", ("add_imm", level_addr, level_addr, VLEN))
+                    offset += VLEN
+                for _ in range(tail):
+                    self.add("load", ("load", level_values + offset, level_addr))
+                    self.add("flow", ("add_imm", level_addr, level_addr, 1))
+                    offset += 1
+                for p in range(level_size):
+                    self.add(
+                        "valu",
+                        (
+                            "vbroadcast",
+                            level_vecs + (offset - level_size + p) * VLEN,
+                            level_values + (offset - level_size + p),
+                        ),
+                    )
+
         def interleave_slots(hash_slots, load_slots):
             if not load_slots:
                 return hash_slots
@@ -531,6 +586,32 @@ class KernelBuilder:
                 )
             return slots
 
+        def vec_special_slots(vec_i, buf_idx, level):
+            slots = []
+            v_idx = idx_cache + vec_i
+            v_node_buf = v_node_val[buf_idx]
+            v_offset = v_tmp3
+            v_level_start = self.scratch_vconst(level_starts[level])
+            slots.append(("valu", ("-", v_offset, v_idx, v_level_start)))
+            current_base = level_vec_base[level]
+            num = level_sizes[level]
+            bit = 0
+            temp_base = level_tmp
+            while num > 1:
+                v_bit = self.scratch_vconst(bit)
+                slots.append(("valu", (">>", v_tmp1, v_offset, v_bit)))
+                slots.append(("valu", ("&", v_tmp2, v_tmp1, v_one)))
+                for pair in range(num // 2):
+                    low = current_base + (2 * pair) * VLEN
+                    high = low + VLEN
+                    out = temp_base + pair * VLEN
+                    slots.append(("flow", ("vselect", out, v_tmp2, high, low)))
+                current_base = temp_base
+                num //= 2
+                bit += 1
+            slots.append(("valu", ("+", v_node_buf, current_base, v_zero)))
+            return slots
+
         # Pause instructions are matched up with yield statements in the reference
         # kernel to let you debug at intermediate steps. The testing harness in this
         # file requires these match up to the reference kernel's yields, but the
@@ -552,19 +633,29 @@ class KernelBuilder:
         vec_count = vec_end // VLEN
         for round in range(rounds):
             wrap_round = (round % wrap_period) == forest_height
+            level = round % wrap_period
+            special_round = use_special and level <= max_special
             if vec_count > 0:
-                # Prologue: load vector 0
-                body.extend(vec_load_slots(0, 0))
-                for vec in range(1, vec_count):
-                    prev = vec - 1
-                    hash_slots = vec_hash_slots(prev * VLEN, prev % 2, round, wrap_round)
-                    load_slots = vec_load_slots(vec * VLEN, vec % 2)
-                    body.extend(interleave_slots(hash_slots, load_slots))
-                # Epilogue: hash last vector
-                last_vec = vec_count - 1
-                body.extend(
-                    vec_hash_slots(last_vec * VLEN, last_vec % 2, round, wrap_round)
-                )
+                if special_round:
+                    for vec in range(vec_count):
+                        buf = vec % 2
+                        body.extend(vec_special_slots(vec * VLEN, buf, level))
+                        body.extend(vec_hash_slots(vec * VLEN, buf, round, wrap_round))
+                else:
+                    # Prologue: load vector 0
+                    body.extend(vec_load_slots(0, 0))
+                    for vec in range(1, vec_count):
+                        prev = vec - 1
+                        hash_slots = vec_hash_slots(
+                            prev * VLEN, prev % 2, round, wrap_round
+                        )
+                        load_slots = vec_load_slots(vec * VLEN, vec % 2)
+                        body.extend(interleave_slots(hash_slots, load_slots))
+                    # Epilogue: hash last vector
+                    last_vec = vec_count - 1
+                    body.extend(
+                        vec_hash_slots(last_vec * VLEN, last_vec % 2, round, wrap_round)
+                    )
 
             for i in range(vec_end, batch_size):
                 idx_addr = idx_cache + i
@@ -657,6 +748,7 @@ def do_kernel_test(
     prints: bool = False,
     enable_debug: bool | None = None,
     assume_zero_indices: bool | None = None,
+    max_special_level: int | None = None,
 ):
     print(f"{forest_height=}, {rounds=}, {batch_size=}")
     random.seed(seed)
@@ -668,8 +760,12 @@ def do_kernel_test(
         enable_debug = trace
     if assume_zero_indices is None:
         assume_zero_indices = True
+    if max_special_level is None:
+        max_special_level = -1
     kb = KernelBuilder(
-        enable_debug=enable_debug, assume_zero_indices=assume_zero_indices
+        enable_debug=enable_debug,
+        assume_zero_indices=assume_zero_indices,
+        max_special_level=max_special_level,
     )
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
     # print(kb.instrs)
