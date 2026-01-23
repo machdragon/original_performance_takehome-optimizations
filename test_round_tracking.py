@@ -6,7 +6,7 @@ Tracks cycle count per round to identify high-cost rounds and bottlenecks.
 """
 
 import sys
-from problem import Machine, build_mem_image, Tree, Input
+from problem import Machine, build_mem_image, Tree, Input, CoreState
 from perf_takehome import KernelBuilder, reference_kernel2
 import random
 
@@ -51,12 +51,13 @@ def track_rounds(forest_height=10, rounds=16, batch_size=256, seed=123):
     cycles_at_pause = []
     
     # Run until first pause (after setup)
+    # machine.run() leaves the core PAUSED; we flip it back to RUNNING to keep iterating.
     while machine.cores[0].state.name != "PAUSED" and machine.cores[0].state.name != "STOPPED":
         machine.run()
         if machine.cores[0].state.name == "PAUSED":
             cycles_at_pause.append(machine.cycle)
             pause_count += 1
-            machine.cores[0].state = machine.cores[0].state.__class__(1)  # RUNNING
+            machine.cores[0].state = CoreState.RUNNING
             if pause_count > rounds:
                 break
     

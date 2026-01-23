@@ -10,6 +10,7 @@ import shutil
 
 def test_lookahead(lookahead_value):
     """Test a specific lookahead value."""
+    # This edits perf_takehome.py in-place; avoid concurrent runs.
     # Read the file
     with open('perf_takehome.py', 'r') as f:
         content = f.read()

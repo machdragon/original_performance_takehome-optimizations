@@ -83,6 +83,7 @@ def main():
                 avg_cycles = summary["avg"]
                 runs = summary["runs"]
                 total = summary["total"]
+                # runs/total reflect the height/round/batch ranges; single-value ranges yield runs=1.
 
             results.append(
                 {

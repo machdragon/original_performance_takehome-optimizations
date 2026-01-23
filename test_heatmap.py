@@ -36,6 +36,7 @@ def test_heatmap(block_sizes, lookahead_values, output_path):
                 )
                 
                 if baseline is None:
+                    # Baseline is the first successful run in iteration order.
                     baseline = cycles
                 
                 status = "OK"

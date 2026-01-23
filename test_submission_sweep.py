@@ -65,6 +65,7 @@ def run_sweep(
                             assume_zero_indices=assume_zero,
                         )
                     else:
+                        # Silent mode intentionally suppresses all output; failures show up as cycles=None.
                         with contextlib.redirect_stdout(io.StringIO()):
                             with contextlib.redirect_stderr(io.StringIO()):
                                 cycles = do_kernel_test(
