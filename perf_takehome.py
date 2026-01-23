@@ -1329,8 +1329,10 @@ class KernelBuilder:
                     }
         vec_count = vec_end // VLEN
         v_node_prefetch = None
+        # Prefetch relies on arith rounds to create room for lookahead loads.
         enable_prefetch = self.enable_prefetch and enable_arith and rounds > 1
         if enable_prefetch and vec_count > 0:
+            # Only consumed by the cross-round pipeline when enabled.
             v_node_prefetch = self.alloc_scratch("v_node_prefetch", vec_count * VLEN)
 
         # Cross-round pipelining for better load utilization
@@ -1397,7 +1399,7 @@ class KernelBuilder:
                 for b in range(num_blocks)
             ]
 
-            pending_prev = False
+            pending_prev = False  # Tracks deferred epilogue so we don't double-hash a round.
             prev_info = None
             prev_use_prefetch = False
 
@@ -1456,6 +1458,7 @@ class KernelBuilder:
                             info["node_arith"],
                             node_prefetch,
                         )
+                        # Prefetch one block behind so idx updates are already committed.
                         load_slots = (
                             vec_block_prefetch_slots(
                                 all_block_vecs[block_idx - 1], v_node_prefetch
