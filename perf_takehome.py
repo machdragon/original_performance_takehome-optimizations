@@ -44,6 +44,7 @@ class KernelBuilder:
         max_special_level: int = -1,
         max_arith_level: int = -1,
         enable_prefetch: bool = False,
+        enable_flow_select: bool = False,
         lookahead: int = 1024,  # Optimized: 1024 with block_size=16 gives 1923 cycles
         block_size: int = 16,  # Optimized: 16 gives best performance (1928->1923 with lookahead=1024)
         enable_second_pass: bool = False,
@@ -62,6 +63,7 @@ class KernelBuilder:
         self.max_special_level = max_special_level
         self.max_arith_level = max_arith_level
         self.enable_prefetch = enable_prefetch
+        self.enable_flow_select = enable_flow_select
         self.lookahead = lookahead
         self.block_size = block_size
         self.enable_second_pass = enable_second_pass
@@ -1600,12 +1602,20 @@ class KernelBuilder:
             if node_const is not None:
                 v_node_buf = node_const
             elif node_pair is not None:
-                node_right, node_diff = node_pair
-                slots.append(("valu", ("&", v_tmp1, v_idx, v_one)))
-                slots.append(
-                    ("valu", ("multiply_add", v_tmp3, v_tmp1, node_diff, node_right))
-                )
-                v_node_buf = v_tmp3
+                if self.enable_flow_select and v_level1_left is not None:
+                    node_right, _node_diff = node_pair
+                    slots.append(("valu", ("&", v_tmp1, v_idx, v_one)))
+                    slots.append(
+                        ("flow", ("vselect", v_tmp3, v_tmp1, v_level1_left, node_right))
+                    )
+                    v_node_buf = v_tmp3
+                else:
+                    node_right, node_diff = node_pair
+                    slots.append(("valu", ("&", v_tmp1, v_idx, v_one)))
+                    slots.append(
+                        ("valu", ("multiply_add", v_tmp3, v_tmp1, node_diff, node_right))
+                    )
+                    v_node_buf = v_tmp3
             elif node_prefetch is not None:
                 v_node_buf = node_prefetch + vec_i
             elif node_arith is not None:
@@ -2004,29 +2014,55 @@ class KernelBuilder:
                     v_val = val_cache + vec_i
                     slots.append(("valu", ("^", v_val, v_val, node_const)))
             elif node_pair is not None:
-                node_right, node_diff = node_pair
-                for bi, vec_i in enumerate(block_vecs):
-                    v_idx = idx_cache + vec_i
-                    slots.append(
-                        ("valu", ("&", v_tmp1_block + bi * VLEN, v_idx, v_one))
-                    )
-                    slots.append(
-                        (
-                            "valu",
-                            (
-                                "multiply_add",
-                                v_tmp3_block + bi * VLEN,
-                                v_tmp1_block + bi * VLEN,
-                                node_diff,
-                                node_right,
-                            ),
+                if self.enable_flow_select and v_level1_left is not None:
+                    node_right, _node_diff = node_pair
+                    for bi, vec_i in enumerate(block_vecs):
+                        v_idx = idx_cache + vec_i
+                        slots.append(
+                            ("valu", ("&", v_tmp1_block + bi * VLEN, v_idx, v_one))
                         )
-                    )
-                for bi, vec_i in enumerate(block_vecs):
-                    v_val = val_cache + vec_i
-                    slots.append(
-                        ("valu", ("^", v_val, v_val, v_tmp3_block + bi * VLEN))
-                    )
+                    for bi, _vec_i in enumerate(block_vecs):
+                        slots.append(
+                            (
+                                "flow",
+                                (
+                                    "vselect",
+                                    v_tmp3_block + bi * VLEN,
+                                    v_tmp1_block + bi * VLEN,
+                                    v_level1_left,
+                                    node_right,
+                                ),
+                            )
+                        )
+                    for bi, vec_i in enumerate(block_vecs):
+                        v_val = val_cache + vec_i
+                        slots.append(
+                            ("valu", ("^", v_val, v_val, v_tmp3_block + bi * VLEN))
+                        )
+                else:
+                    node_right, node_diff = node_pair
+                    for bi, vec_i in enumerate(block_vecs):
+                        v_idx = idx_cache + vec_i
+                        slots.append(
+                            ("valu", ("&", v_tmp1_block + bi * VLEN, v_idx, v_one))
+                        )
+                        slots.append(
+                            (
+                                "valu",
+                                (
+                                    "multiply_add",
+                                    v_tmp3_block + bi * VLEN,
+                                    v_tmp1_block + bi * VLEN,
+                                    node_diff,
+                                    node_right,
+                                ),
+                            )
+                        )
+                    for bi, vec_i in enumerate(block_vecs):
+                        v_val = val_cache + vec_i
+                        slots.append(
+                            ("valu", ("^", v_val, v_val, v_tmp3_block + bi * VLEN))
+                        )
             elif node_prefetch is not None:
                 for _bi, vec_i in enumerate(block_vecs):
                     v_val = val_cache + vec_i
@@ -2179,6 +2215,7 @@ class KernelBuilder:
         fast_wrap = self.assume_zero_indices and not self.enable_debug
         root_node_val = None
         v_root_node = None
+        v_level1_left = None
         v_level1_right = None
         v_level1_diff = None
         level_arith = {}
@@ -2760,6 +2797,7 @@ def do_kernel_test(
     max_special_level: int | None = None,
     max_arith_level: int | None = None,
     enable_prefetch: bool | None = None,
+    enable_flow_select: bool | None = None,
     lookahead: int | None = None,
     block_size: int | None = None,
     enable_second_pass: bool | None = None,
@@ -2783,6 +2821,8 @@ def do_kernel_test(
         max_arith_level = -1
     if enable_prefetch is None:
         enable_prefetch = False
+    if enable_flow_select is None:
+        enable_flow_select = False
     if lookahead is None:
         lookahead = 1024
     if block_size is None:
@@ -2801,6 +2841,7 @@ def do_kernel_test(
         max_special_level=max_special_level,
         max_arith_level=max_arith_level,
         enable_prefetch=enable_prefetch,
+        enable_flow_select=enable_flow_select,
         lookahead=lookahead,
         block_size=block_size,
         enable_second_pass=enable_second_pass,
