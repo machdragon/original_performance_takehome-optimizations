@@ -43,8 +43,8 @@ class KernelBuilder:
         assume_zero_indices: bool = True,
         max_special_level: int = -1,
         max_arith_level: int = -1,
-        enable_prefetch: bool = False,
-        enable_level2_where: bool = False,
+        enable_prefetch: bool = True,
+        enable_level2_where: bool = True,
         enable_two_round_fusion: bool = False,
         enable_level3_where: bool = False,
         lookahead: int = 1024,  # Optimized: 1024 with block_size=16 gives 1923 cycles
@@ -3016,10 +3016,9 @@ def do_kernel_test(
     if max_arith_level is None:
         max_arith_level = -1
     if enable_prefetch is None:
-        enable_prefetch = False
+        enable_prefetch = True
     if enable_level2_where is None:
-        # Default: tie level-2 where-tree to the same flag combo used in sweeps.
-        enable_level2_where = (max_arith_level >= 2 and enable_prefetch)
+        enable_level2_where = True
     if enable_two_round_fusion is None:
         enable_two_round_fusion = False
     if enable_level3_where is None:
