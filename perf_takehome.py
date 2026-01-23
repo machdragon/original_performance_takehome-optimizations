@@ -372,6 +372,8 @@ class KernelBuilder:
         self.add("alu", ("+", val_load_ptr, self.scratch["inp_values_p"], zero_const))
         vec_end = batch_size - (batch_size % VLEN)
         if self.assume_zero_indices:
+            # Input.generate initializes indices to zero; keep this gated so non-zero
+            # inputs still take the load path.
             for i in range(0, vec_end, VLEN):
                 self.add("valu", ("vbroadcast", idx_cache + i, zero_const))
             for i in range(vec_end, batch_size):
