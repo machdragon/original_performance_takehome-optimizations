@@ -48,6 +48,8 @@ class KernelBuilder:
         enable_level2_valu: bool = False,
         enable_two_round_fusion: bool = False,
         enable_level3_where: bool = False,
+        enable_level4_where: bool = False,
+        alias_tmp3_block: bool = False,
         lookahead: int = 1024,  # Optimized: 1024 with block_size=16 gives 1923 cycles
         block_size: int = 16,  # Optimized: 16 gives best performance (1928->1923 with lookahead=1024)
         enable_second_pass: bool = False,
@@ -70,6 +72,8 @@ class KernelBuilder:
         self.enable_level2_valu = enable_level2_valu
         self.enable_two_round_fusion = enable_two_round_fusion
         self.enable_level3_where = enable_level3_where
+        self.enable_level4_where = enable_level4_where
+        self.alias_tmp3_block = alias_tmp3_block
         self.lookahead = lookahead
         self.block_size = block_size
         self.enable_second_pass = enable_second_pass
@@ -1367,6 +1371,19 @@ class KernelBuilder:
             self.scratch_vconst(val1)
             self.scratch_vconst(val3)
 
+        # Feature flags for optional selection paths
+        enable_level2_where = self.enable_level2_where
+        enable_level2_valu = self.enable_level2_valu
+        enable_level3_where = self.enable_level3_where
+        # Experimental: level-4 where-tree is disabled by default (fails correctness when enabled).
+        enable_level4_where = (
+            self.enable_level4_where
+            and forest_height == 10
+            and rounds == 16
+            and batch_size == 256
+            and block_size >= 16
+        )
+
         # Double buffers for pipelining
         v_node_block = [
             self.alloc_scratch("v_node_block_A", block_size * VLEN),
@@ -1374,15 +1391,22 @@ class KernelBuilder:
         ]
         v_tmp1_block = self.alloc_scratch("v_tmp1_block", block_size * VLEN)
         v_tmp2_block = self.alloc_scratch("v_tmp2_block", block_size * VLEN)
-        v_tmp3_block = self.alloc_scratch("v_tmp3_block", block_size * VLEN)
+        # Optionally alias v_tmp3_block to v_tmp2_block to free 128 words.
+        alias_tmp3_block = self.alias_tmp3_block and not (
+            enable_arith
+            or enable_level2_valu
+            or enable_level3_where
+            or enable_level4_where
+        )
+        if alias_tmp3_block:
+            v_tmp3_block = v_tmp2_block
+        else:
+            v_tmp3_block = self.alloc_scratch("v_tmp3_block", block_size * VLEN)
         v_tmp4_block = None
         if enable_arith:
             v_tmp4_block = self.alloc_scratch("v_tmp4_block", block_size * VLEN)
 
         # Level 2 where-tree selection (optional): load 4 nodes once per round, vselect per vector.
-        enable_level2_where = self.enable_level2_where
-        enable_level2_valu = self.enable_level2_valu
-        enable_level3_where = self.enable_level3_where
         level2_base_addr_const = self.scratch_const(3)
         level2_vecs_base = v_node_block[0]  # Reuse v_node_block[0] for the 4 level-2 vectors.
         # Reuse scratch to avoid extra allocations when prefetch is enabled.
@@ -1390,6 +1414,8 @@ class KernelBuilder:
         level2_scalars_base = v_tmp1  # Use first 4 lanes as scalar temps.
         level3_base_addr_const = None
         level3_vecs_base = v_node_block[0]  # Reuse v_node_block[0] for the 8 level-3 vectors.
+        level4_base_addr_const = self.scratch_const(15)
+        level4_vecs_base = v_node_block[0]  # Reuse v_node_block[0] for the 16 level-4 vectors.
 
         level_vec_base = []
         level_sizes = []
@@ -1936,6 +1962,30 @@ class KernelBuilder:
                     slots.append(("flow", ("add_imm", level2_addr_temp, level2_addr_temp, 1)))
             return slots
 
+        def level4_prepare_slots():
+            if not (enable_level4_where and enable_prefetch):
+                return []
+            slots = []
+            slots.append(
+                (
+                    "alu",
+                    (
+                        "+",
+                        level2_addr_temp,
+                        self.scratch["forest_values_p"],
+                        level4_base_addr_const,
+                    ),
+                )
+            )
+            for i in range(16):
+                slots.append(("load", ("load", level2_scalars_base, level2_addr_temp)))
+                slots.append(
+                    ("valu", ("vbroadcast", level4_vecs_base + i * VLEN, level2_scalars_base))
+                )
+                if i < 15:
+                    slots.append(("flow", ("add_imm", level2_addr_temp, level2_addr_temp, 1)))
+            return slots
+
         def emit_level_select_block_slots(block_vecs, buf_idx, node_arith):
             level = node_arith["level"]
             v_start = node_arith["v_start"]
@@ -2085,6 +2135,7 @@ class KernelBuilder:
             node_prefetch=None,
             level2_round=False,
             level3_round=False,
+            level4_round=False,
         ):
             """XOR, hash, and update indices using node values from specified buffer."""
             slots = []
@@ -2121,18 +2172,34 @@ class KernelBuilder:
                         slots.append(("valu", ("multiply_add", v_offset, v_bit0, v_tmp, v_offset)))
                         slots.append(("valu", ("^", v_val, v_val, v_offset)))
                     else:
-                        v_offset = v_tmp1_block + bi * VLEN
-                        v_go_left1 = v_tmp2_block + bi * VLEN
-                        v_left = v_tmp3_block + bi * VLEN
-                        slots.append(("valu", ("-", v_offset, v_idx, v_level_start)))
-                        slots.append(("valu", ("<", v_go_left1, v_offset, v_two)))
-                        slots.append(("valu", ("<", v_left, v_offset, v_one)))
-                        slots.append(("flow", ("vselect", v_left, v_left, node0, node1)))
-                        slots.append(("valu", ("-", v_offset, v_offset, v_two)))
-                        slots.append(("valu", ("<", v_offset, v_offset, v_one)))
-                        slots.append(("flow", ("vselect", v_offset, v_offset, node2, node3)))
-                        slots.append(("flow", ("vselect", v_offset, v_go_left1, v_left, v_offset)))
-                        slots.append(("valu", ("^", v_val, v_val, v_offset)))
+                        if alias_tmp3_block:
+                            # Flow select path using only v_tmp1/2; write temps into node buffer.
+                            v_offset = v_tmp1_block + bi * VLEN
+                            v_go_left1 = v_tmp2_block + bi * VLEN
+                            v_left = v_node_block[1] + bi * VLEN  # use other buffer as temp
+                            slots.append(("valu", ("-", v_offset, v_idx, v_level_start)))
+                            slots.append(("valu", ("<", v_go_left1, v_offset, v_two)))
+                            slots.append(("valu", ("<", v_offset, v_offset, v_one)))
+                            slots.append(("flow", ("vselect", v_left, v_offset, node0, node1)))
+                            slots.append(("valu", ("-", v_offset, v_idx, v_level_start)))
+                            slots.append(("valu", ("-", v_offset, v_offset, v_two)))
+                            slots.append(("valu", ("<", v_offset, v_offset, v_one)))
+                            slots.append(("flow", ("vselect", v_offset, v_offset, node2, node3)))
+                            slots.append(("flow", ("vselect", v_left, v_go_left1, v_left, v_offset)))
+                            slots.append(("valu", ("^", v_val, v_val, v_left)))
+                        else:
+                            v_offset = v_tmp1_block + bi * VLEN
+                            v_go_left1 = v_tmp2_block + bi * VLEN
+                            v_left = v_tmp3_block + bi * VLEN
+                            slots.append(("valu", ("-", v_offset, v_idx, v_level_start)))
+                            slots.append(("valu", ("<", v_go_left1, v_offset, v_two)))
+                            slots.append(("valu", ("<", v_left, v_offset, v_one)))
+                            slots.append(("flow", ("vselect", v_left, v_left, node0, node1)))
+                            slots.append(("valu", ("-", v_offset, v_offset, v_two)))
+                            slots.append(("valu", ("<", v_offset, v_offset, v_one)))
+                            slots.append(("flow", ("vselect", v_offset, v_offset, node2, node3)))
+                            slots.append(("flow", ("vselect", v_offset, v_go_left1, v_left, v_offset)))
+                            slots.append(("valu", ("^", v_val, v_val, v_offset)))
             elif level3_round:
                 node0 = level3_vecs_base
                 node1 = level3_vecs_base + VLEN
@@ -2189,6 +2256,108 @@ class KernelBuilder:
                     slots.append(("valu", ("&", v_bit2, v_bit2, v_one)))
                     slots.append(("flow", ("vselect", v_sel, v_bit2, v_bit0, v_sel)))
                     slots.append(("valu", ("^", v_val, v_val, v_sel)))
+            elif level4_round:
+                node0 = level4_vecs_base
+                node1 = level4_vecs_base + VLEN
+                node2 = level4_vecs_base + 2 * VLEN
+                node3 = level4_vecs_base + 3 * VLEN
+                node4 = level4_vecs_base + 4 * VLEN
+                node5 = level4_vecs_base + 5 * VLEN
+                node6 = level4_vecs_base + 6 * VLEN
+                node7 = level4_vecs_base + 7 * VLEN
+                node8 = level4_vecs_base + 8 * VLEN
+                node9 = level4_vecs_base + 9 * VLEN
+                node10 = level4_vecs_base + 10 * VLEN
+                node11 = level4_vecs_base + 11 * VLEN
+                node12 = level4_vecs_base + 12 * VLEN
+                node13 = level4_vecs_base + 13 * VLEN
+                node14 = level4_vecs_base + 14 * VLEN
+                node15 = level4_vecs_base + 15 * VLEN
+                v_level_start = self.scratch_vconst(15)
+                v_three = self.scratch_vconst(3)
+                for bi, vec_i in enumerate(block_vecs):
+                    v_idx = idx_cache + vec_i
+                    v_val = val_cache + vec_i
+                    bit = v_tmp1_block + bi * VLEN
+                    t0 = v_tmp2_block + bi * VLEN
+                    t1 = v_tmp3_block + bi * VLEN
+                    out = v_node_block[1] + bi * VLEN
+
+                    # Select 0-3 into t0.
+                    slots.append(("valu", ("-", bit, v_idx, v_level_start)))
+                    slots.append(("valu", ("&", bit, bit, v_one)))
+                    slots.append(("valu", ("-", t0, node1, node0)))
+                    slots.append(("valu", ("multiply_add", t0, bit, t0, node0)))
+                    slots.append(("valu", ("-", t1, node3, node2)))
+                    slots.append(("valu", ("multiply_add", t1, bit, t1, node2)))
+                    slots.append(("valu", ("-", bit, v_idx, v_level_start)))
+                    slots.append(("valu", (">>", bit, bit, v_one)))
+                    slots.append(("valu", ("&", bit, bit, v_one)))
+                    slots.append(("valu", ("-", t1, t1, t0)))
+                    slots.append(("valu", ("multiply_add", t0, bit, t1, t0)))
+
+                    # Select 4-7 into t1.
+                    slots.append(("valu", ("-", bit, v_idx, v_level_start)))
+                    slots.append(("valu", ("&", bit, bit, v_one)))
+                    slots.append(("valu", ("-", t1, node5, node4)))
+                    slots.append(("valu", ("multiply_add", t1, bit, t1, node4)))
+                    slots.append(("valu", ("-", out, node7, node6)))
+                    slots.append(("valu", ("multiply_add", out, bit, out, node6)))
+                    slots.append(("valu", ("-", bit, v_idx, v_level_start)))
+                    slots.append(("valu", (">>", bit, bit, v_one)))
+                    slots.append(("valu", ("&", bit, bit, v_one)))
+                    slots.append(("valu", ("-", out, out, t1)))
+                    slots.append(("valu", ("multiply_add", t1, bit, out, t1)))
+
+                    # Select 0-7 into t0.
+                    slots.append(("valu", ("-", bit, v_idx, v_level_start)))
+                    slots.append(("valu", (">>", bit, bit, v_two)))
+                    slots.append(("valu", ("&", bit, bit, v_one)))
+                    slots.append(("valu", ("-", t1, t1, t0)))
+                    slots.append(("valu", ("multiply_add", t0, bit, t1, t0)))
+
+                    # Select 8-11 into t1.
+                    slots.append(("valu", ("-", bit, v_idx, v_level_start)))
+                    slots.append(("valu", ("&", bit, bit, v_one)))
+                    slots.append(("valu", ("-", t1, node9, node8)))
+                    slots.append(("valu", ("multiply_add", t1, bit, t1, node8)))
+                    slots.append(("valu", ("-", out, node11, node10)))
+                    slots.append(("valu", ("multiply_add", out, bit, out, node10)))
+                    slots.append(("valu", ("-", bit, v_idx, v_level_start)))
+                    slots.append(("valu", (">>", bit, bit, v_one)))
+                    slots.append(("valu", ("&", bit, bit, v_one)))
+                    slots.append(("valu", ("-", out, out, t1)))
+                    slots.append(("valu", ("multiply_add", t1, bit, out, t1)))
+                    # Preserve sel(8-11) in out.
+                    slots.append(("valu", ("+", out, t1, v_zero)))
+
+                    # Select 12-15 into t1 using v_tmp3 as temp (preserves out).
+                    slots.append(("valu", ("-", bit, v_idx, v_level_start)))
+                    slots.append(("valu", ("&", bit, bit, v_one)))
+                    slots.append(("valu", ("-", t1, node13, node12)))
+                    slots.append(("valu", ("multiply_add", t1, bit, t1, node12)))
+                    slots.append(("valu", ("-", v_tmp3, node15, node14)))
+                    slots.append(("valu", ("multiply_add", v_tmp3, bit, v_tmp3, node14)))
+                    slots.append(("valu", ("-", bit, v_idx, v_level_start)))
+                    slots.append(("valu", (">>", bit, bit, v_one)))
+                    slots.append(("valu", ("&", bit, bit, v_one)))
+                    slots.append(("valu", ("-", v_tmp3, v_tmp3, t1)))
+                    slots.append(("valu", ("multiply_add", t1, bit, v_tmp3, t1)))
+
+                    # Select 8-15 into out.
+                    slots.append(("valu", ("-", bit, v_idx, v_level_start)))
+                    slots.append(("valu", (">>", bit, bit, v_two)))
+                    slots.append(("valu", ("&", bit, bit, v_one)))
+                    slots.append(("valu", ("-", t1, t1, out)))
+                    slots.append(("valu", ("multiply_add", out, bit, t1, out)))
+
+                    # Final select between 0-7 (t0) and 8-15 (t1).
+                    slots.append(("valu", ("-", bit, v_idx, v_level_start)))
+                    slots.append(("valu", (">>", bit, bit, v_three)))
+                    slots.append(("valu", ("&", bit, bit, v_one)))
+                    slots.append(("valu", ("-", t1, out, t0)))
+                    slots.append(("valu", ("multiply_add", out, bit, t1, t0)))
+                    slots.append(("valu", ("^", v_val, v_val, out)))
             elif node_const is not None:
                 for _bi, vec_i in enumerate(block_vecs):
                     v_val = val_cache + vec_i
@@ -2371,6 +2540,9 @@ class KernelBuilder:
                     node_pair,
                     node_arith,
                     node_prefetch,
+                    False,
+                    False,
+                    False,
                 )
             )
             return slots
@@ -2480,7 +2652,12 @@ class KernelBuilder:
             self.enable_prefetch
             and rounds > 1
             and use_cross_round
-            and (enable_arith or enable_level2_where or enable_level3_where)
+            and (
+                enable_arith
+                or enable_level2_where
+                or enable_level3_where
+                or enable_level4_where
+            )
         )
         if enable_prefetch:
             # Prefetch buffer only needs block 0 (block_size vectors).
@@ -2512,6 +2689,9 @@ class KernelBuilder:
                 level3_round = (
                     fast_wrap and enable_level3_where and enable_prefetch and level == 3
                 )
+                level4_round = (
+                    fast_wrap and enable_level4_where and enable_prefetch and level == 4
+                )
                 round_info.append(
                     {
                         "round": round,
@@ -2526,10 +2706,12 @@ class KernelBuilder:
                             and node_arith is None
                             and not level2_round  # Level 2 uses where-tree, not loads
                             and not level3_round  # Level 3 uses where-tree, not loads
+                            and not level4_round  # Level 4 uses where-tree, not loads
                         ),
                         "arith_round": arith_round,
                         "level2_round": level2_round,
                         "level3_round": level3_round,
+                        "level4_round": level4_round,
                     }
                 )
             if v_node_prefetch is not None:
@@ -2575,11 +2757,14 @@ class KernelBuilder:
                     info["arith_round"]
                     or info["level2_round"]
                     or info["level3_round"]
+                    or info["level4_round"]
                 )
                 level2_prep = level2_prepare_slots() if info["level2_round"] else []
                 level3_prep = level3_prepare_slots() if info["level3_round"] else []
+                level4_prep = level4_prepare_slots() if info["level4_round"] else []
                 level2_prepared = False
                 level3_prepared = False
+                level4_prepared = False
 
                 if pending_prev:
                     last_buf = last_block_idx % 2
@@ -2594,6 +2779,7 @@ class KernelBuilder:
                         prev_node_prefetch,
                         prev_info["level2_round"],
                         prev_info["level3_round"],
+                        prev_info["level4_round"],
                     )
                     if info["level2_round"]:
                         body.extend(interleave_slots(hash_prev, level2_prep))
@@ -2601,6 +2787,9 @@ class KernelBuilder:
                     elif info["level3_round"]:
                         body.extend(interleave_slots(hash_prev, level3_prep))
                         level3_prepared = True
+                    elif info["level4_round"]:
+                        body.extend(interleave_slots(hash_prev, level4_prep))
+                        level4_prepared = True
                     elif special_round:
                         body.extend(hash_prev)
                     else:
@@ -2622,6 +2811,9 @@ class KernelBuilder:
                 if info["level3_round"] and not level3_prepared:
                     body.extend(level3_prep)
                     level3_prepared = True
+                if info["level4_round"] and not level4_prepared:
+                    body.extend(level4_prep)
+                    level4_prepared = True
 
                 if special_round:
                     body.extend(
@@ -2635,6 +2827,7 @@ class KernelBuilder:
                             node_prefetch,
                             info["level2_round"],
                             info["level3_round"],
+                            info["level4_round"],
                         )
                     )
                     for block_idx in range(1, num_blocks):
@@ -2655,6 +2848,7 @@ class KernelBuilder:
                             node_prefetch,
                             info["level2_round"],
                             info["level3_round"],
+                            info["level4_round"],
                         )
                         # Prefetch only block 0, issued one block behind so idx updates are committed.
                         load_slots = []
@@ -2678,6 +2872,7 @@ class KernelBuilder:
                             node_prefetch,
                             info["level2_round"],
                             info["level3_round"],
+                            info["level4_round"],
                         )
                         load_slots = vec_block_load_slots(
                             all_block_vecs[1],
@@ -2717,6 +2912,7 @@ class KernelBuilder:
                             None,
                             info["level2_round"],
                             info["level3_round"],
+                            info["level4_round"],
                         )
                         load_slots = vec_block_load_slots(
                             all_block_vecs[block_idx],
@@ -2750,6 +2946,7 @@ class KernelBuilder:
                         node_prefetch,
                         prev_info["level2_round"],
                         prev_info["level3_round"],
+                        prev_info["level4_round"],
                     )
                 )
 
@@ -2805,6 +3002,10 @@ class KernelBuilder:
                                     node_const,
                                     node_pair,
                                     node_arith,
+                                    None,
+                                    False,
+                                    False,
+                                    False,
                                 )
                                 load_slots = vec_block_load_slots(
                                     all_block_vecs[block_idx],
@@ -2825,6 +3026,10 @@ class KernelBuilder:
                                     node_const,
                                     node_pair,
                                     node_arith,
+                                    None,
+                                    False,
+                                    False,
+                                    False,
                                 )
                             )
                         else:
@@ -3020,10 +3225,12 @@ def do_kernel_test(
     max_special_level: int | None = None,
     max_arith_level: int | None = None,
         enable_prefetch: bool | None = None,
-        enable_level2_where: bool | None = None,
-        enable_level2_valu: bool | None = None,
-        enable_two_round_fusion: bool | None = None,
-        enable_level3_where: bool | None = None,
+    enable_level2_where: bool | None = None,
+    enable_level2_valu: bool | None = None,
+    enable_two_round_fusion: bool | None = None,
+    enable_level3_where: bool | None = None,
+    enable_level4_where: bool | None = None,
+    alias_tmp3_block: bool | None = None,
     lookahead: int | None = None,
     block_size: int | None = None,
     enable_second_pass: bool | None = None,
@@ -3055,6 +3262,10 @@ def do_kernel_test(
         enable_two_round_fusion = False
     if enable_level3_where is None:
         enable_level3_where = False
+    if enable_level4_where is None:
+        enable_level4_where = False
+    if alias_tmp3_block is None:
+        alias_tmp3_block = False
     if lookahead is None:
         lookahead = 1024
     if block_size is None:
@@ -3077,6 +3288,8 @@ def do_kernel_test(
         enable_level2_valu=enable_level2_valu,
         enable_two_round_fusion=enable_two_round_fusion,
         enable_level3_where=enable_level3_where,
+        enable_level4_where=enable_level4_where,
+        alias_tmp3_block=alias_tmp3_block,
         lookahead=lookahead,
         block_size=block_size,
         enable_second_pass=enable_second_pass,
