@@ -430,7 +430,11 @@ class KernelBuilder:
             self.scratch[name] = addr
             self.scratch_debug[addr] = (name, length)
         self.scratch_ptr += length
-        assert self.scratch_ptr <= SCRATCH_SIZE, "Out of scratch space"
+        if self.scratch_ptr > SCRATCH_SIZE:
+            usage_info = f"Scratch usage: {self.scratch_ptr}/{SCRATCH_SIZE} words"
+            if name:
+                usage_info += f" (failed allocating {length} words for '{name}')"
+            raise AssertionError(f"Out of scratch space: {usage_info}")
         return addr
 
     def scratch_const(self, val, name=None):
@@ -560,7 +564,248 @@ class KernelBuilder:
             right2 = out1 + mid2 * VLEN
             out2 = temp_base + VLEN
             slots.append(("flow", ("vselect", out2, go_left2, left2, right2)))
-            final_out = out2
+
+            if level_size > 4:
+                subtract_mid2 = self.alloc_scratch(f"subtract_mid2_{vec}", VLEN)
+                slots.append(("flow", ("vselect", subtract_mid2, go_left2, v_zero, v_mid2)))
+                next_rel_idx2 = self.alloc_scratch(f"next_rel_idx2_{vec}", VLEN)
+                slots.append(("valu", ("-", next_rel_idx2, next_rel_idx1, subtract_mid2)))
+
+                mid3 = mid2 // 2
+                v_mid3 = self.scratch_vconst(mid3)
+                go_left3 = self.alloc_scratch(f"go_left3_{vec}", VLEN)
+                slots.append(("valu", ("<", go_left3, next_rel_idx2, v_mid3)))
+
+                left3 = out2
+                right3 = out2 + mid3 * VLEN
+                out3 = temp_base + 2 * VLEN
+                slots.append(("flow", ("vselect", out3, go_left3, left3, right3)))
+
+                if level_size > 8:
+                    subtract_mid3 = self.alloc_scratch(f"subtract_mid3_{vec}", VLEN)
+                    slots.append(("flow", ("vselect", subtract_mid3, go_left3, v_zero, v_mid3)))
+                    next_rel_idx3 = self.alloc_scratch(f"next_rel_idx3_{vec}", VLEN)
+                    slots.append(("valu", ("-", next_rel_idx3, next_rel_idx2, subtract_mid3)))
+
+                    mid4 = mid3 // 2
+                    v_mid4 = self.scratch_vconst(mid4)
+                    go_left4 = self.alloc_scratch(f"go_left4_{vec}", VLEN)
+                    slots.append(("valu", ("<", go_left4, next_rel_idx3, v_mid4)))
+
+                    left4 = out3
+                    right4 = out3 + mid4 * VLEN
+                    out4 = temp_base + 3 * VLEN
+                    slots.append(("flow", ("vselect", out4, go_left4, left4, right4)))
+                    final_out = out4
+                else:
+                    final_out = out3
+            else:
+                final_out = out2
+        else:
+            final_out = out1
+
+        if self.enable_debug:
+            slots.append(
+                (
+                    "debug",
+                    (
+                        "vcompare",
+                        final_out,
+                        [(round, vec * VLEN + l, "node_val") for l in range(VLEN)],
+                    ),
+                )
+            )
+
+        return final_out, slots
+
+    def build_vselect_tree_reuse(
+        self,
+        all_level_vecs: int,
+        relative_idx_vec: int,
+        level_size: int,
+        temp_base: int,
+        final_temp: int,
+        round: int,
+        vec: int,
+    ):
+        slots = []
+
+        if level_size <= 1:
+            out = all_level_vecs
+            if self.enable_debug:
+                slots.append(
+                    (
+                        "debug",
+                        (
+                            "vcompare",
+                            out,
+                            [(round, vec * VLEN + l, "node_val") for l in range(VLEN)],
+                        ),
+                    )
+                )
+            return out, slots
+
+        current_out = all_level_vecs
+        rel_idx = relative_idx_vec
+        v_zero = self.scratch_vconst(0)
+        temp_offset = 0
+        
+        mid1 = level_size // 2
+        v_mid1 = self.scratch_vconst(mid1)
+        go_left1 = temp_base + temp_offset
+        temp_offset += VLEN
+        slots.append(("valu", ("<", go_left1, rel_idx, v_mid1)))
+
+        left1 = current_out
+        right1 = current_out + mid1 * VLEN
+        out1 = temp_base + temp_offset
+        temp_offset += VLEN
+        slots.append(("flow", ("vselect", out1, go_left1, left1, right1)))
+
+        subtract_mid1 = temp_base + temp_offset
+        temp_offset += VLEN
+        slots.append(("flow", ("vselect", subtract_mid1, go_left1, v_zero, v_mid1)))
+        next_rel_idx1 = temp_base + temp_offset
+        temp_offset += VLEN
+        slots.append(("valu", ("-", next_rel_idx1, rel_idx, subtract_mid1)))
+
+        if level_size > 2:
+            # For layer 2, we need to select from the chosen half
+            # Since vselect produces a single vector (not an address), we can't use out1 as a base
+            # Instead, we use nested vselects to select the correct vectors based on both go_left1 and go_left2
+            
+            mid2 = mid1 // 2
+            v_mid2 = self.scratch_vconst(mid2)
+            go_left2 = temp_base + temp_offset
+            temp_offset += VLEN
+            slots.append(("valu", ("<", go_left2, next_rel_idx1, v_mid2)))
+
+            # Compute left2 and right2 candidates based on go_left1
+            # left2: if go_left1 then current_out else current_out + mid1*VLEN
+            # right2: if go_left1 then current_out + mid2*VLEN else current_out + mid1*VLEN + mid2*VLEN
+            left2_left_half = current_out
+            left2_right_half = current_out + mid1 * VLEN
+            right2_left_half = current_out + mid2 * VLEN
+            right2_right_half = current_out + mid1 * VLEN + mid2 * VLEN
+            
+            # Select left2 and right2 candidates based on go_left1
+            left2_candidate = temp_base + temp_offset
+            temp_offset += VLEN
+            slots.append(("flow", ("vselect", left2_candidate, go_left1, left2_left_half, left2_right_half)))
+            right2_candidate = temp_base + temp_offset
+            temp_offset += VLEN
+            slots.append(("flow", ("vselect", right2_candidate, go_left1, right2_left_half, right2_right_half)))
+            
+            # Now select final result based on go_left2
+            out2 = temp_base + temp_offset
+            temp_offset += VLEN
+            slots.append(("flow", ("vselect", out2, go_left2, left2_candidate, right2_candidate)))
+
+
+            if level_size > 4:
+
+                subtract_mid2 = temp_base + temp_offset
+                temp_offset += VLEN
+                slots.append(("flow", ("vselect", subtract_mid2, go_left2, v_zero, v_mid2)))
+                next_rel_idx2 = temp_base + temp_offset
+                temp_offset += VLEN
+                slots.append(("valu", ("-", next_rel_idx2, next_rel_idx1, subtract_mid2)))
+
+                mid3 = mid2 // 2
+                v_mid3 = self.scratch_vconst(mid3)
+                go_left3 = temp_base + temp_offset
+                temp_offset += VLEN
+                slots.append(("valu", ("<", go_left3, next_rel_idx2, v_mid3)))
+
+                # For layer 3, compute addresses based on previous decisions (go_left1 and go_left2)
+                # We need to determine which quarter we're in, then select left or right eighth
+                quarter0_base = current_out
+                quarter1_base = current_out + mid2 * VLEN
+                quarter2_base = current_out + mid1 * VLEN
+                quarter3_base = current_out + mid1 * VLEN + mid2 * VLEN
+                
+                # Select quarter base using nested vselects
+                quarter_left = temp_base + temp_offset
+                temp_offset += VLEN
+                slots.append(("flow", ("vselect", quarter_left, go_left2, quarter0_base, quarter1_base)))
+                quarter_right = temp_base + temp_offset
+                temp_offset += VLEN
+                slots.append(("flow", ("vselect", quarter_right, go_left2, quarter2_base, quarter3_base)))
+                quarter_base = temp_base + temp_offset
+                temp_offset += VLEN
+                slots.append(("flow", ("vselect", quarter_base, go_left1, quarter_left, quarter_right)))
+                
+                left3 = quarter_base
+                right3 = quarter_base + mid3 * VLEN
+                out3 = temp_base + temp_offset
+                temp_offset += VLEN
+                slots.append(("flow", ("vselect", out3, go_left3, left3, right3)))
+
+                if level_size > 8:
+                    subtract_mid3 = temp_base + temp_offset
+                    temp_offset += VLEN
+                    slots.append(("flow", ("vselect", subtract_mid3, go_left3, v_zero, v_mid3)))
+                    next_rel_idx3 = temp_base + temp_offset
+                    temp_offset += VLEN
+                    slots.append(("valu", ("-", next_rel_idx3, next_rel_idx2, subtract_mid3)))
+
+                    # For layer 4, compute addresses based on all previous decisions (go_left1, go_left2, go_left3)
+                    # We need to determine which eighth we're in, then select left or right sixteenth
+                    # Compute all 8 eighth bases
+                    eighth_bases = [
+                        current_out,
+                        current_out + mid3 * VLEN,
+                        current_out + mid2 * VLEN,
+                        current_out + mid2 * VLEN + mid3 * VLEN,
+                        current_out + mid1 * VLEN,
+                        current_out + mid1 * VLEN + mid3 * VLEN,
+                        current_out + mid1 * VLEN + mid2 * VLEN,
+                        current_out + mid1 * VLEN + mid2 * VLEN + mid3 * VLEN,
+                    ]
+                    
+                    # Select eighth base using nested vselects based on go_left1, go_left2, go_left3
+                    # First, select based on go_left3 within each quarter
+                    eighth_left_quarter0 = temp_base + temp_offset
+                    temp_offset += VLEN
+                    slots.append(("flow", ("vselect", eighth_left_quarter0, go_left3, eighth_bases[0], eighth_bases[1])))
+                    eighth_right_quarter0 = temp_base + temp_offset
+                    temp_offset += VLEN
+                    slots.append(("flow", ("vselect", eighth_right_quarter0, go_left3, eighth_bases[2], eighth_bases[3])))
+                    eighth_left_quarter1 = temp_base + temp_offset
+                    temp_offset += VLEN
+                    slots.append(("flow", ("vselect", eighth_left_quarter1, go_left3, eighth_bases[4], eighth_bases[5])))
+                    eighth_right_quarter1 = temp_base + temp_offset
+                    temp_offset += VLEN
+                    slots.append(("flow", ("vselect", eighth_right_quarter1, go_left3, eighth_bases[6], eighth_bases[7])))
+                    
+                    # Then select quarter based on go_left2
+                    eighth_left_half = temp_base + temp_offset
+                    temp_offset += VLEN
+                    slots.append(("flow", ("vselect", eighth_left_half, go_left2, eighth_left_quarter0, eighth_right_quarter0)))
+                    eighth_right_half = temp_base + temp_offset
+                    temp_offset += VLEN
+                    slots.append(("flow", ("vselect", eighth_right_half, go_left2, eighth_left_quarter1, eighth_right_quarter1)))
+                    
+                    # Finally select half based on go_left1
+                    eighth_base = temp_base + temp_offset
+                    temp_offset += VLEN
+                    slots.append(("flow", ("vselect", eighth_base, go_left1, eighth_left_half, eighth_right_half)))
+                    
+                    mid4 = mid3 // 2
+                    v_mid4 = self.scratch_vconst(mid4)
+                    go_left4 = temp_base + temp_offset
+                    temp_offset += VLEN
+                    slots.append(("valu", ("<", go_left4, next_rel_idx3, v_mid4)))
+
+                    left4 = eighth_base
+                    right4 = eighth_base + mid4 * VLEN
+                    out4 = final_temp
+                    slots.append(("flow", ("vselect", out4, go_left4, left4, right4)))
+                    final_out = out4
+                else:
+                    final_out = out3
+            else:
+                final_out = out2
         else:
             final_out = out1
 
@@ -834,7 +1079,7 @@ class KernelBuilder:
         block_limit = vec_count - (vec_count % block_size)
         num_blocks = block_limit // block_size
         max_special = min(self.max_special_level, forest_height)
-        use_special = self.assume_zero_indices and max_special >= 0
+        use_special = self.assume_zero_indices and max_special >= 0 and max_special < 4
         use_cross_round = (
             not self.enable_debug
             and vec_count >= block_size
@@ -892,14 +1137,24 @@ class KernelBuilder:
             self.alloc_scratch("v_node_block_A", block_size * VLEN),
             self.alloc_scratch("v_node_block_B", block_size * VLEN),
         ]
+
+
+
         v_tmp1_block = self.alloc_scratch("v_tmp1_block", block_size * VLEN)
         v_tmp2_block = self.alloc_scratch("v_tmp2_block", block_size * VLEN)
-        v_tmp3_block = self.alloc_scratch("v_tmp3_block", block_size * VLEN)
+        
         v_tmp4_block = None
         if enable_arith:
             v_tmp4_block = self.alloc_scratch("v_tmp4_block", block_size * VLEN)
 
         enable_level2_where = self.enable_level2_where
+        enable_level3_where = self.enable_level3_where
+        
+        can_alias_tmp23 = not enable_level2_where and not enable_level3_where
+        if can_alias_tmp23:
+            v_tmp3_block = v_tmp2_block
+        else:
+            v_tmp3_block = self.alloc_scratch("v_tmp3_block", block_size * VLEN)
         level2_base_addr_const = self.scratch_const(3)
         level2_vecs_base = v_node_block[0]
         level2_tree_tmp_base = None
@@ -952,6 +1207,40 @@ class KernelBuilder:
                             level_values + (offset - level_size + p),
                         ),
                     )
+
+        upper_levels = {}
+        precompute_max_level = 4
+        enable_level4_precompute = False
+        if enable_level4_precompute:
+            level4_size = 16
+            level4_start = 15
+            level4_values = self.alloc_scratch("level4_values", level4_size)
+            level4_vecs = self.alloc_scratch("level4_vecs", level4_size * VLEN)
+            level4_addr = self.alloc_scratch("level4_addr")
+            level_base = level4_vecs
+            upper_levels[4] = level_base
+            self.add(
+                "alu",
+                (
+                    "+",
+                    level4_addr,
+                    self.scratch["forest_values_p"],
+                    self.scratch_const(level4_start),
+                ),
+            )
+            for v in range(2):
+                self.add("load", ("vload", level4_values + v * VLEN, level4_addr))
+                if v < 1:
+                    self.add("flow", ("add_imm", level4_addr, level4_addr, VLEN))
+            for p in range(level4_size):
+                self.add(
+                    "valu",
+                    (
+                        "vbroadcast",
+                        level4_vecs + p * VLEN,
+                        level4_values + p,
+                    ),
+                )
 
         def interleave_slots(hash_slots, load_slots):
             if not load_slots:
@@ -1547,11 +1836,45 @@ class KernelBuilder:
             node_arith=None,
             node_prefetch=None,
             level2_round=False,
+            level4_precompute_round=False,
+            level=None,
         ):
             slots = []
             node_buf = v_node_block[buf_idx]
 
-            if level2_round:
+            if level4_precompute_round and level is not None and level in upper_levels and len(upper_levels) > 0 and len(block_vecs) <= VLEN:
+                level_base = upper_levels[level]
+                level_size = 1 << level
+                level_start = (1 << level) - 1 if level > 0 else 0
+                v_level_start = self.scratch_vconst(level_start)
+                # Calculate maximum temp space needed for vselect tree (level_size=16 needs ~25*VLEN)
+                # Use 30*VLEN to be safe
+                VSELECT_TREE_TEMP_SIZE = 30 * VLEN
+                for bi, vec_i in enumerate(block_vecs):
+                    v_idx = idx_cache + vec_i
+                    v_val = val_cache + vec_i
+                    relative_idx_vec = v_tmp1_block + bi * VLEN
+                    slots.append(("valu", ("-", relative_idx_vec, v_idx, v_level_start)))
+                    # Use per-item temp space to avoid data corruption when VLIW bundler reorders instructions
+                    tree_temp_base = v_tmp2_block + bi * VSELECT_TREE_TEMP_SIZE
+                    final_temp = v_node_block[0] + bi * VLEN
+                    final_out, tree_slots = self.build_vselect_tree_reuse(
+                        level_base, relative_idx_vec, level_size, 
+                        tree_temp_base, final_temp,
+                        0,
+                        vec_i // VLEN
+                    )
+                    slots.extend(tree_slots)
+                    slots.append(("valu", ("^", v_val, v_val, final_out)))
+            elif level4_precompute_round and (level is None or level not in upper_levels or len(upper_levels) == 0):
+                for bi, vec_i in enumerate(block_vecs):
+                    v_idx = idx_cache + vec_i
+                    v_val = val_cache + vec_i
+                    slots.append(("valu", ("+", v_addr[0], v_idx, v_forest_p)))
+                    for lane in range(VLEN):
+                        slots.append(("load", ("load_offset", node_buf + bi * VLEN, v_addr[0], lane)))
+                    slots.append(("valu", ("^", v_val, v_val, node_buf + bi * VLEN)))
+            elif level2_round:
                 node0 = level2_vecs_base
                 node1 = level2_vecs_base + VLEN
                 node2 = level2_vecs_base + 2 * VLEN
@@ -1753,6 +2076,9 @@ class KernelBuilder:
                     node_pair,
                     node_arith,
                     node_prefetch,
+                    False,
+                    False,
+                    None,
                 )
             )
             return slots
@@ -1881,6 +2207,14 @@ class KernelBuilder:
                 level2_round = (
                     fast_wrap and enable_level2_where and enable_prefetch and level == 2
                 )
+                level4_precompute_round = (
+                    enable_level4_precompute
+                    and level == 4
+                    and not uniform_round
+                    and not binary_round
+                    and not arith_round
+                    and not level2_round
+                )
                 round_info.append(
                     {
                         "round": round,
@@ -1894,9 +2228,11 @@ class KernelBuilder:
                             and node_pair is None
                             and node_arith is None
                             and not level2_round
+                            and not level4_precompute_round
                         ),
                         "arith_round": arith_round,
                         "level2_round": level2_round,
+                        "level4_precompute_round": level4_precompute_round,
                     }
                 )
             if v_node_prefetch is not None:
@@ -1929,7 +2265,7 @@ class KernelBuilder:
                     sr=enable_prefetch and(info["arith_round"]or info["level2_round"]);l2p=level2_prepare_slots()if info["level2_round"]else[];l2pd=False
                     if pending_prev:
                         lb=last_block_idx%2;pnp=v_node_prefetch if prev_use_prefetch else None
-                        hp=vec_block_hash_only_slots(last_block_vecs,lb,prev_info["wrap_round"],prev_info["node_const"],prev_info["node_pair"],prev_info["node_arith"],pnp,prev_info["level2_round"])
+                        hp=vec_block_hash_only_slots(last_block_vecs,lb,prev_info["wrap_round"],prev_info["node_const"],prev_info["node_pair"],prev_info["node_arith"],pnp,prev_info["level2_round"],prev_info.get("level4_precompute_round",False),prev_info.get("level"))
                         if info["level2_round"]:body.extend(interleave_slots(hp,l2p));l2pd=True
                         elif sr:body.extend(hp)
                         else:
@@ -1937,22 +2273,22 @@ class KernelBuilder:
                             body.extend(interleave_slots(hp,ls))
                     if info["level2_round"] and not l2pd:body.extend(l2p);l2pd=True
                     if sr:
-                        body.extend(vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"]))
+                        body.extend(vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level")))
                         for bi in range(1,num_blocks):
-                            b=bi%2;hs=vec_block_hash_only_slots(all_block_vecs[bi],b,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"])
+                            b=bi%2;hs=vec_block_hash_only_slots(all_block_vecs[bi],b,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
                             ls=vec_block_prefetch_slots(all_block_vecs[0],v_node_prefetch)if dpn and bi==1 else[]
                             body.extend(interleave_slots(hs,ls))
                         pending_prev=False
                     else:
                         sb=1
                         if up:
-                            hs=vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"])
+                            hs=vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
                             ls=vec_block_load_slots(all_block_vecs[1],1,info["node_const"],info["node_pair"],info["node_arith"])
                             body.extend(interleave_slots(hs,ls));sb=2
                         elif not pending_prev:body.extend(vec_block_load_slots(block_0_vecs,0,info["node_const"],info["node_pair"],info["node_arith"]))
                         for bi in range(sb,num_blocks):
                             pb=(bi-1)%2;cb=bi%2
-                            hs=vec_block_hash_only_slots(all_block_vecs[bi-1],pb,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],None,info["level2_round"])
+                            hs=vec_block_hash_only_slots(all_block_vecs[bi-1],pb,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],None,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
                             ls=vec_block_load_slots(all_block_vecs[bi],cb,info["node_const"],info["node_pair"],info["node_arith"])
                             body.extend(interleave_slots(hs,ls))
                         pending_prev=True
@@ -1963,7 +2299,7 @@ class KernelBuilder:
                     sr=enable_prefetch and(info["arith_round"]or info["level2_round"]);l2p=level2_prepare_slots()if info["level2_round"]else[];l2pd=False
                     if pending_prev:
                         lb=last_block_idx%2;pnp=v_node_prefetch if prev_use_prefetch else None
-                        hp=vec_block_hash_only_slots(last_block_vecs,lb,prev_info["wrap_round"],prev_info["node_const"],prev_info["node_pair"],prev_info["node_arith"],pnp,prev_info["level2_round"])
+                        hp=vec_block_hash_only_slots(last_block_vecs,lb,prev_info["wrap_round"],prev_info["node_const"],prev_info["node_pair"],prev_info["node_arith"],pnp,prev_info["level2_round"],prev_info.get("level4_precompute_round",False),prev_info.get("level"))
                         if info["level2_round"]:body.extend(interleave_slots(hp,l2p));l2pd=True
                         elif sr:body.extend(hp)
                         else:
@@ -1971,22 +2307,22 @@ class KernelBuilder:
                             body.extend(interleave_slots(hp,ls))
                     if info["level2_round"]and not l2pd:body.extend(l2p);l2pd=True
                     if sr:
-                        body.extend(vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"]))
+                        body.extend(vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level")))
                         for bi in range(1,num_blocks):
-                            b=bi%2;hs=vec_block_hash_only_slots(all_block_vecs[bi],b,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"])
+                            b=bi%2;hs=vec_block_hash_only_slots(all_block_vecs[bi],b,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
                             ls=vec_block_prefetch_slots(all_block_vecs[0],v_node_prefetch)if dpn and bi==1 else[]
                             body.extend(interleave_slots(hs,ls))
                         pending_prev=False
                     else:
                         sb=1
                         if up:
-                            hs=vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"])
+                            hs=vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
                             ls=vec_block_load_slots(all_block_vecs[1],1,info["node_const"],info["node_pair"],info["node_arith"])
                             body.extend(interleave_slots(hs,ls));sb=2
                         elif not pending_prev:body.extend(vec_block_load_slots(block_0_vecs,0,info["node_const"],info["node_pair"],info["node_arith"]))
                         for bi in range(sb,num_blocks):
                             pb=(bi-1)%2;cb=bi%2
-                            hs=vec_block_hash_only_slots(all_block_vecs[bi-1],pb,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],None,info["level2_round"])
+                            hs=vec_block_hash_only_slots(all_block_vecs[bi-1],pb,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],None,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
                             ls=vec_block_load_slots(all_block_vecs[bi],cb,info["node_const"],info["node_pair"],info["node_arith"])
                             body.extend(interleave_slots(hs,ls))
                         pending_prev=True
@@ -2005,6 +2341,8 @@ class KernelBuilder:
                         prev_info["node_arith"],
                         node_prefetch,
                         prev_info["level2_round"],
+                        prev_info.get("level4_precompute_round", False),
+                        prev_info.get("level"),
                     )
                 )
 
@@ -2029,6 +2367,14 @@ class KernelBuilder:
                     and not uniform_round
                     and not binary_round
                     and not arith_round
+                )
+                level4_precompute_round = (
+                    enable_level4_precompute
+                    and level == 4
+                    and not uniform_round
+                    and not binary_round
+                    and not arith_round
+                    and not special_round
                 )
                 if vec_count > 0:
                     if special_round:
@@ -2060,6 +2406,10 @@ class KernelBuilder:
                                     node_const,
                                     node_pair,
                                     node_arith,
+                                    None,
+                                    False,
+                                    level4_precompute_round,
+                                    level,
                                 )
                                 load_slots = vec_block_load_slots(
                                     all_block_vecs[block_idx],
@@ -2080,6 +2430,10 @@ class KernelBuilder:
                                     node_const,
                                     node_pair,
                                     node_arith,
+                                    None,
+                                    False,
+                                    level4_precompute_round,
+                                    level,
                                 )
                             )
                         else:
