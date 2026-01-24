@@ -3281,10 +3281,8 @@ class KernelBuilder:
                                 info["node_const"],
                                 info["node_pair"],
                                 info["node_arith"],
-                                info.get("level2_round", False),
-                                info["round"],
                             )
-                            body.extend(interleave_slots(hash_prev, load_slots))
+                        )
 
                     if info["level2_round"] and not level2_prepared:
                         body.extend(level2_prep)
