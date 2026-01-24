@@ -2723,6 +2723,7 @@ class KernelBuilder:
                         info["arith_round"]
                         or info["level2_round"]
                         or info["level3_round"]
+                        or info["level4_round"]
                     ) and next_info["load_needed"]:
                         prefetch_next[round] = True
                         prefetch_active[round + 1] = True
