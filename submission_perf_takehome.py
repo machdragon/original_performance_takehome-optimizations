@@ -30,7 +30,6 @@ class KernelBuilder:
         enable_level2_valu: bool = False,
         enable_two_round_fusion: bool = False,
         enable_level3_where: bool = False,
-        enable_level4_valu: bool = False,
         enable_unroll_8: bool = True,
         lookahead: int = 1024,
         block_size: int = 16,
@@ -54,7 +53,6 @@ class KernelBuilder:
         self.enable_level2_valu = enable_level2_valu
         self.enable_two_round_fusion = enable_two_round_fusion
         self.enable_level3_where = enable_level3_where
-        self.enable_level4_valu = enable_level4_valu
         self.enable_unroll_8 = enable_unroll_8
         self.lookahead = lookahead
         self.block_size = block_size
@@ -961,13 +959,10 @@ class KernelBuilder:
             "inp_values_p",
         ]
         for v in init_vars:
-            if v not in self.scratch:
-                self.alloc_scratch(v, 1)
-        # Skip loads if overfitting path already initialized
-        if not getattr(self, '_overfit_init_done', False):
-            for i, v in enumerate(init_vars):
-                self.add("load", ("const", tmp1, i))
-                self.add("load", ("load", self.scratch[v], tmp1))
+            self.alloc_scratch(v, 1)
+        for i, v in enumerate(init_vars):
+            self.add("load", ("const", tmp1, i))
+            self.add("load", ("load", self.scratch[v], tmp1))
 
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
@@ -1083,8 +1078,6 @@ class KernelBuilder:
             v_tmp3_block = self.alloc_scratch("v_tmp3_block", block_size * VLEN)
         level2_base_addr_const = self.scratch_const(3)
         level2_vecs_base = v_node_block[0]
-        level4_vecs_base = v_node_block[0] if self.enable_level4_valu else None
-        level4_diffs_base = v_node_block[1] if self.enable_level4_valu else None
         level2_tree_tmp_base = None
         level2_addr_temp = tmp1
         level2_scalars_base = v_tmp1
@@ -1616,36 +1609,6 @@ class KernelBuilder:
                 )
             return slots
 
-        def level4_prepare_slots():
-            if not (self.enable_level4_valu and enable_prefetch):
-                return []
-            slots = []
-            level4_base_const = self.scratch_const(15)
-            slots.append(
-                (
-                    "alu",
-                    (
-                        "+",
-                        level2_addr_temp,
-                        self.scratch["forest_values_p"],
-                        level4_base_const,
-                    ),
-                )
-            )
-            for i in range(16):
-                slots.append(("load", ("load", level2_scalars_base, level2_addr_temp)))
-                slots.append(
-                    ("valu", ("vbroadcast", level4_vecs_base + i * VLEN, level2_scalars_base))
-                )
-                if i < 15:
-                    slots.append(("flow", ("add_imm", level2_addr_temp, level2_addr_temp, 1)))
-            for pair in range(8):
-                even = level4_vecs_base + (2 * pair) * VLEN
-                odd = level4_vecs_base + (2 * pair + 1) * VLEN
-                diff = level4_diffs_base + pair * VLEN
-                slots.append(("valu", ("-", diff, odd, even)))
-            return slots
-
         def emit_level_select_block_slots(block_vecs, buf_idx, node_arith):
             level = node_arith["level"]
             v_start = node_arith["v_start"]
@@ -1709,47 +1672,6 @@ class KernelBuilder:
                     slots.append(("valu", ("&", bit, bit, v_one)))
                     slots.append(("valu", ("-", t1, t1, t0)))
                     slots.append(("valu", ("multiply_add", node, bit, t1, t0)))
-                elif level == 4:
-                    v_level_start = self.scratch_vconst(15)
-                    bases = level4_vecs_base
-                    diffs = level4_diffs_base
-                    v_t0 = t0
-                    v_t1 = t1
-                    v_t2 = t2
-                    v_bit = bit
-                    slots.append(("valu", ("-", v_t0, v_idx, v_level_start)))
-                    slots.append(("valu", ("&", v_bit, v_t0, v_one)))
-                    slots.append(("valu", ("multiply_add", v_t0, v_bit, diffs + 0 * VLEN, bases + 0 * VLEN)))
-                    slots.append(("valu", ("multiply_add", v_t1, v_bit, diffs + 1 * VLEN, bases + 2 * VLEN)))
-                    slots.append(("valu", ("multiply_add", v_t2, v_bit, diffs + 2 * VLEN, bases + 4 * VLEN)))
-                    slots.append(("valu", ("multiply_add", v_bit, v_bit, diffs + 3 * VLEN, bases + 6 * VLEN)))
-                    slots.append(("valu", ("-", v_t1, v_t1, v_t0)))
-                    slots.append(("valu", ("-", v_t2, v_t2, v_bit)))
-                    slots.append(("valu", ("-", v_bit, v_idx, v_level_start)))
-                    slots.append(("valu", (">>", v_bit, v_bit, v_one)))
-                    slots.append(("valu", ("&", v_bit, v_bit, v_one)))
-                    slots.append(("valu", ("multiply_add", v_t0, v_bit, v_t1, v_t0)))
-                    slots.append(("valu", ("multiply_add", v_t2, v_bit, v_t2, v_bit)))
-                    slots.append(("valu", ("-", v_t1, v_idx, v_level_start)))
-                    slots.append(("valu", ("&", v_t1, v_t1, v_one)))
-                    slots.append(("valu", ("multiply_add", v_t1, v_t1, diffs + 4 * VLEN, bases + 8 * VLEN)))
-                    slots.append(("valu", ("multiply_add", v_bit, v_t1, diffs + 5 * VLEN, bases + 10 * VLEN)))
-                    slots.append(("valu", ("multiply_add", v_t2, v_t1, diffs + 6 * VLEN, bases + 12 * VLEN)))
-                    slots.append(("valu", ("multiply_add", v_t1, v_t1, diffs + 7 * VLEN, bases + 14 * VLEN)))
-                    slots.append(("valu", ("-", v_bit, v_bit, v_t1)))
-                    slots.append(("valu", ("-", v_t2, v_t2, v_t1)))
-                    slots.append(("valu", ("-", v_t1, v_idx, v_level_start)))
-                    slots.append(("valu", (">>", v_t1, v_t1, v_one)))
-                    slots.append(("valu", ("&", v_t1, v_t1, v_one)))
-                    slots.append(("valu", ("multiply_add", v_bit, v_t1, v_bit, v_t1)))
-                    slots.append(("valu", ("multiply_add", v_t2, v_t1, v_t2, v_t1)))
-                    slots.append(("valu", ("-", v_t1, v_idx, v_level_start)))
-                    slots.append(("valu", (">>", v_t1, v_t1, v_two)))
-                    slots.append(("valu", ("&", v_t1, v_t1, v_one)))
-                    slots.append(("valu", ("-", v_t2, v_t2, v_t0)))
-                    slots.append(("valu", ("multiply_add", v_t0, v_t1, v_t2, v_t0)))
-                    slots.append(("valu", ("-", v_t2, v_bit, v_t0)))
-                    slots.append(("valu", ("multiply_add", node, v_t1, v_t2, v_bit)))
                 else:
                     slots.append(("valu", ("-", bit, v_idx, v_start)))
                     slots.append(("valu", ("&", bit, bit, v_one)))
@@ -2020,3 +1942,593 @@ class KernelBuilder:
                         (
                             "valu",
                             ("+", v_tmp3_block + bi * VLEN, v_tmp3_block + bi * VLEN, v_one),
+                        )
+                    )
+                for bi, vec_i in enumerate(block_vecs):
+                    v_idx = idx_cache + vec_i
+                    slots.append(
+                        (
+                            "valu",
+                            (
+                                "multiply_add",
+                                v_idx,
+                                v_idx,
+                                v_two,
+                                v_tmp3_block + bi * VLEN,
+                            ),
+                        )
+                    )
+                if not fast_wrap:
+                    for bi, vec_i in enumerate(block_vecs):
+                        v_idx = idx_cache + vec_i
+                        slots.append(
+                            ("valu", ("<", v_tmp1_block + bi * VLEN, v_idx, v_n_nodes))
+                        )
+                        slots.append(
+                            (
+                                "flow",
+                                ("vselect", v_idx, v_tmp1_block + bi * VLEN, v_idx, v_zero),
+                            )
+                        )
+            return slots
+
+        def vec_block_hash_slots(
+            block_vecs,
+            round_idx,
+            wrap_round,
+            node_const=None,
+            node_pair=None,
+            node_arith=None,
+            node_prefetch=None,
+        ):
+            slots = vec_block_load_slots(
+                block_vecs, 0, node_const, node_pair, node_arith, node_prefetch, False
+            )
+            slots.extend(
+                vec_block_hash_only_slots(
+                    block_vecs,
+                    0,
+                    wrap_round,
+                    node_const,
+                    node_pair,
+                    node_arith,
+                    node_prefetch,
+                    False,
+                    False,
+                    None,
+                )
+            )
+            return slots
+
+        self.add("flow", ("pause",))
+
+        if self.enable_debug:
+            self.add("debug", ("comment", "Starting loop"))
+
+        body = []
+
+        tmp_node_val = self.alloc_scratch("tmp_node_val")
+        tmp_addr = self.alloc_scratch("tmp_addr")
+
+        wrap_period = forest_height + 1
+
+        fast_wrap = self.assume_zero_indices and not self.enable_debug
+        root_node_val = None
+        v_root_node = None
+        v_level1_right = None
+        v_level1_diff = None
+        level_arith = {}
+
+        enable_level1 = True
+        if fast_wrap:
+            root_node_val = self.alloc_scratch("root_node_val")
+            v_root_node = self.alloc_scratch("v_root_node", VLEN)
+            self.add("load", ("load", root_node_val, self.scratch["forest_values_p"]))
+            self.add("valu", ("vbroadcast", v_root_node, root_node_val))
+            if enable_level1 and rounds > 1:
+                level1_addr = self.alloc_scratch("level1_addr")
+                level1_left = self.alloc_scratch("level1_left")
+                level1_right = self.alloc_scratch("level1_right")
+                v_level1_left = self.alloc_scratch("v_level1_left", VLEN)
+                v_level1_right = self.alloc_scratch("v_level1_right", VLEN)
+                v_level1_diff = self.alloc_scratch("v_level1_diff", VLEN)
+                self.add(
+                    "alu",
+                    (
+                        "+",
+                        level1_addr,
+                        self.scratch["forest_values_p"],
+                        self.scratch_const(1),
+                    ),
+                )
+                self.add("load", ("load", level1_left, level1_addr))
+                self.add("flow", ("add_imm", level1_addr, level1_addr, 1))
+                self.add("load", ("load", level1_right, level1_addr))
+                self.add("valu", ("vbroadcast", v_level1_left, level1_left))
+                self.add("valu", ("vbroadcast", v_level1_right, level1_right))
+                self.add("valu", ("-", v_level1_diff, v_level1_left, v_level1_right))
+            if enable_arith:
+                max_arith = min(self.max_arith_level, forest_height, 4)
+                for level in range(2, max_arith + 1):
+                    level_size = 1 << level
+                    level_start = level_size - 1
+                    level_addr = self.alloc_scratch(f"level{level}_addr")
+                    self.add(
+                        "alu",
+                        (
+                            "+",
+                            level_addr,
+                            self.scratch["forest_values_p"],
+                            self.scratch_const(level_start),
+                        ),
+                    )
+                    v_level_bases = []
+                    v_level_diffs = []
+                    for pair in range(level_size // 2):
+                        even_val = tmp1
+                        odd_val = tmp2
+                        diff_val = tmp3
+                        self.add("load", ("load", even_val, level_addr))
+                        self.add("flow", ("add_imm", level_addr, level_addr, 1))
+                        self.add("load", ("load", odd_val, level_addr))
+                        if pair < (level_size // 2) - 1:
+                            self.add("flow", ("add_imm", level_addr, level_addr, 1))
+
+                        self.add("alu", ("-", diff_val, odd_val, even_val))
+                        v_base = self.alloc_scratch(
+                            f"v_level{level}_base_{2 * pair}", VLEN
+                        )
+                        v_diff = self.alloc_scratch(
+                            f"v_level{level}_diff_{2 * pair}", VLEN
+                        )
+                        self.add("valu", ("vbroadcast", v_base, even_val))
+                        self.add("valu", ("vbroadcast", v_diff, diff_val))
+                        v_level_bases.append(v_base)
+                        v_level_diffs.append(v_diff)
+                    level_arith[level] = {
+                        "level": level,
+                        "start": level_start,
+                        "v_start": self.scratch_vconst(level_start),
+                        "bases": v_level_bases,
+                        "diffs": v_level_diffs,
+                    }
+        v_node_prefetch = None
+
+        enable_prefetch = (
+            self.enable_prefetch
+            and rounds > 1
+            and use_cross_round
+            and (enable_arith or enable_level2_where)
+        )
+        if enable_prefetch:
+            v_node_prefetch = self.alloc_scratch(
+                "v_node_prefetch", block_size * VLEN
+            )
+
+        round_info = []
+        prefetch_active = [False] * rounds
+        prefetch_next = [False] * rounds
+        if use_cross_round:
+            for round in range(rounds):
+                level = round % wrap_period
+                uniform_round = fast_wrap and level == 0
+                binary_round = fast_wrap and level == 1
+                arith_round = fast_wrap and level in level_arith
+                node_const = v_root_node if uniform_round else None
+                node_pair = (
+                    (v_level1_right, v_level1_diff)
+                    if binary_round and v_level1_diff
+                    else None
+                )
+                node_arith = level_arith[level] if arith_round else None
+                level2_round = (
+                    fast_wrap and enable_level2_where and enable_prefetch and level == 2
+                )
+                level4_precompute_round = (
+                    enable_level4_precompute
+                    and level == 4
+                    and not uniform_round
+                    and not binary_round
+                    and not arith_round
+                    and not level2_round
+                )
+                round_info.append(
+                    {
+                        "round": round,
+                        "level": level,
+                        "wrap_round": level == forest_height,
+                        "node_const": node_const,
+                        "node_pair": node_pair,
+                        "node_arith": node_arith,
+                        "load_needed": (
+                            node_const is None
+                            and node_pair is None
+                            and node_arith is None
+                            and not level2_round
+                            and not level4_precompute_round
+                        ),
+                        "arith_round": arith_round,
+                        "level2_round": level2_round,
+                        "level4_precompute_round": level4_precompute_round,
+                    }
+                )
+            if v_node_prefetch is not None:
+                for round in range(rounds - 1):
+                    info = round_info[round]
+                    next_info = round_info[round + 1]
+                    if (info["arith_round"] or info["level2_round"]) and next_info["load_needed"]:
+                        prefetch_next[round] = True
+                        prefetch_active[round + 1] = True
+
+        if use_cross_round:
+            block_0_vecs = [offset * VLEN for offset in range(block_size)]
+            last_block_idx = num_blocks - 1
+            last_start = last_block_idx * block_size
+            last_block_vecs = [
+                (last_start + offset) * VLEN for offset in range(block_size)
+            ]
+            all_block_vecs = [
+                [(b * block_size + offset) * VLEN for offset in range(block_size)]
+                for b in range(num_blocks)
+            ]
+
+            pending_prev = False
+            prev_info = None
+            prev_use_prefetch = False
+
+            if self.enable_unroll_8 and rounds == 8:
+                for unroll_r in range(8):
+                    r=unroll_r;info=round_info[r];up=prefetch_active[r];dpn=prefetch_next[r];np=v_node_prefetch if up else None
+                    sr=enable_prefetch and(info["arith_round"]or info["level2_round"]);l2p=level2_prepare_slots()if info["level2_round"]else[];l2pd=False
+                    if pending_prev:
+                        lb=last_block_idx%2;pnp=v_node_prefetch if prev_use_prefetch else None
+                        hp=vec_block_hash_only_slots(last_block_vecs,lb,prev_info["wrap_round"],prev_info["node_const"],prev_info["node_pair"],prev_info["node_arith"],pnp,prev_info["level2_round"],prev_info.get("level4_precompute_round",False),prev_info.get("level"))
+                        if info["level2_round"]:body.extend(interleave_slots(hp,l2p));l2pd=True
+                        elif sr:body.extend(hp)
+                        else:
+                            ls=vec_block_load_slots(block_0_vecs,0,info["node_const"],info["node_pair"],info["node_arith"],np,info.get("level2_round",False),info["round"])
+                            body.extend(interleave_slots(hp,ls))
+                    if info["level2_round"] and not l2pd:body.extend(l2p);l2pd=True
+                    if sr:
+                        body.extend(vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level")))
+                        for bi in range(1,num_blocks):
+                            b=bi%2;hs=vec_block_hash_only_slots(all_block_vecs[bi],b,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
+                            ls=vec_block_prefetch_slots(all_block_vecs[0],v_node_prefetch)if dpn and bi==1 else[]
+                            body.extend(interleave_slots(hs,ls))
+                        pending_prev=False
+                    else:
+                        sb=1
+                        if up:
+                            hs=vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
+                            ls=vec_block_load_slots(all_block_vecs[1],1,info["node_const"],info["node_pair"],info["node_arith"])
+                            body.extend(interleave_slots(hs,ls));sb=2
+                        elif not pending_prev:body.extend(vec_block_load_slots(block_0_vecs,0,info["node_const"],info["node_pair"],info["node_arith"]))
+                        for bi in range(sb,num_blocks):
+                            pb=(bi-1)%2;cb=bi%2
+                            hs=vec_block_hash_only_slots(all_block_vecs[bi-1],pb,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],None,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
+                            ls=vec_block_load_slots(all_block_vecs[bi],cb,info["node_const"],info["node_pair"],info["node_arith"])
+                            body.extend(interleave_slots(hs,ls))
+                        pending_prev=True
+                    prev_info=info;prev_use_prefetch=False
+            else:
+                for round in range(rounds):
+                    info=round_info[round];up=prefetch_active[round];dpn=prefetch_next[round];np=v_node_prefetch if up else None
+                    sr=enable_prefetch and(info["arith_round"]or info["level2_round"]);l2p=level2_prepare_slots()if info["level2_round"]else[];l2pd=False
+                    if pending_prev:
+                        lb=last_block_idx%2;pnp=v_node_prefetch if prev_use_prefetch else None
+                        hp=vec_block_hash_only_slots(last_block_vecs,lb,prev_info["wrap_round"],prev_info["node_const"],prev_info["node_pair"],prev_info["node_arith"],pnp,prev_info["level2_round"],prev_info.get("level4_precompute_round",False),prev_info.get("level"))
+                        if info["level2_round"]:body.extend(interleave_slots(hp,l2p));l2pd=True
+                        elif sr:body.extend(hp)
+                        else:
+                            ls=vec_block_load_slots(block_0_vecs,0,info["node_const"],info["node_pair"],info["node_arith"],np,info.get("level2_round",False),info["round"])
+                            body.extend(interleave_slots(hp,ls))
+                    if info["level2_round"]and not l2pd:body.extend(l2p);l2pd=True
+                    if sr:
+                        body.extend(vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level")))
+                        for bi in range(1,num_blocks):
+                            b=bi%2;hs=vec_block_hash_only_slots(all_block_vecs[bi],b,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
+                            ls=vec_block_prefetch_slots(all_block_vecs[0],v_node_prefetch)if dpn and bi==1 else[]
+                            body.extend(interleave_slots(hs,ls))
+                        pending_prev=False
+                    else:
+                        sb=1
+                        if up:
+                            hs=vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
+                            ls=vec_block_load_slots(all_block_vecs[1],1,info["node_const"],info["node_pair"],info["node_arith"])
+                            body.extend(interleave_slots(hs,ls));sb=2
+                        elif not pending_prev:body.extend(vec_block_load_slots(block_0_vecs,0,info["node_const"],info["node_pair"],info["node_arith"]))
+                        for bi in range(sb,num_blocks):
+                            pb=(bi-1)%2;cb=bi%2
+                            hs=vec_block_hash_only_slots(all_block_vecs[bi-1],pb,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],None,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
+                            ls=vec_block_load_slots(all_block_vecs[bi],cb,info["node_const"],info["node_pair"],info["node_arith"])
+                            body.extend(interleave_slots(hs,ls))
+                        pending_prev=True
+                    prev_info=info;prev_use_prefetch=False
+
+            if pending_prev:
+                last_buf = last_block_idx % 2
+                node_prefetch = v_node_prefetch if prev_use_prefetch else None
+                body.extend(
+                    vec_block_hash_only_slots(
+                        last_block_vecs,
+                        last_buf,
+                        prev_info["wrap_round"],
+                        prev_info["node_const"],
+                        prev_info["node_pair"],
+                        prev_info["node_arith"],
+                        node_prefetch,
+                        prev_info["level2_round"],
+                        prev_info.get("level4_precompute_round", False),
+                        prev_info.get("level"),
+                    )
+                )
+
+        else:
+
+            for round in range(rounds):
+                wrap_round = (round % wrap_period) == forest_height
+                level = round % wrap_period
+                uniform_round = fast_wrap and (round % wrap_period) == 0
+                node_const = v_root_node if uniform_round else None
+                binary_round = fast_wrap and (round % wrap_period) == 1
+                node_pair = (
+                    (v_level1_right, v_level1_diff)
+                    if binary_round and v_level1_diff
+                    else None
+                )
+                arith_round = fast_wrap and level in level_arith
+                node_arith = level_arith[level] if arith_round else None
+                special_round = (
+                    use_special
+                    and level <= max_special
+                    and not uniform_round
+                    and not binary_round
+                    and not arith_round
+                )
+                level4_precompute_round = (
+                    enable_level4_precompute
+                    and level == 4
+                    and not uniform_round
+                    and not binary_round
+                    and not arith_round
+                    and not special_round
+                )
+                if vec_count > 0:
+                    if special_round:
+                        for vec in range(vec_count):
+                            buf = vec % 2
+                            body.extend(vec_special_slots(vec * VLEN, buf, level))
+                            body.extend(vec_hash_slots(vec * VLEN, buf, round, wrap_round))
+                    elif not self.enable_debug and vec_count >= block_size:
+                        block_limit = vec_count - (vec_count % block_size)
+                        num_blocks = block_limit // block_size
+                        if num_blocks >= 2:
+                            block_0_vecs = [offset * VLEN for offset in range(block_size)]
+                            all_block_vecs = [
+                                [(b * block_size + offset) * VLEN for offset in range(block_size)]
+                                for b in range(num_blocks)
+                            ]
+                            body.extend(
+                                vec_block_load_slots(
+                                    block_0_vecs, 0, node_const, node_pair, node_arith, None, False
+                                )
+                            )
+                            for block_idx in range(1, num_blocks):
+                                prev_buf = (block_idx - 1) % 2
+                                curr_buf = block_idx % 2
+                                hash_slots = vec_block_hash_only_slots(
+                                    all_block_vecs[block_idx - 1],
+                                    prev_buf,
+                                    wrap_round,
+                                    node_const,
+                                    node_pair,
+                                    node_arith,
+                                    None,
+                                    False,
+                                    level4_precompute_round,
+                                    level,
+                                )
+                                load_slots = vec_block_load_slots(
+                                    all_block_vecs[block_idx],
+                                    curr_buf,
+                                    node_const,
+                                    node_pair,
+                                    node_arith,
+                                    None,
+                                    False,
+                                )
+                                body.extend(interleave_slots(hash_slots, load_slots))
+                            last_buf = (num_blocks - 1) % 2
+                            body.extend(
+                                vec_block_hash_only_slots(
+                                    all_block_vecs[num_blocks - 1],
+                                    last_buf,
+                                    wrap_round,
+                                    node_const,
+                                    node_pair,
+                                    node_arith,
+                                    None,
+                                    False,
+                                    level4_precompute_round,
+                                    level,
+                                )
+                            )
+                        else:
+                            for vec in range(0, block_limit, block_size):
+                                block_vecs = [(vec + offset) * VLEN for offset in range(block_size)]
+                                body.extend(
+                                    vec_block_hash_slots(
+                                        block_vecs,
+                                        round,
+                                        wrap_round,
+                                        node_const,
+                                        node_pair,
+                                        node_arith,
+                                    )
+                                )
+                        if block_limit < vec_count:
+                            start_vec = block_limit
+                            body.extend(
+                                vec_load_slots(
+                                    start_vec * VLEN,
+                                    start_vec % 2,
+                                    node_const,
+                                    node_pair,
+                                    node_arith,
+                                )
+                            )
+                            for vec in range(start_vec + 1, vec_count):
+                                prev = vec - 1
+                                hash_slots = vec_hash_slots(
+                                    prev * VLEN,
+                                    prev % 2,
+                                    round,
+                                    wrap_round,
+                                    node_const,
+                                    node_pair,
+                                    node_arith,
+                                )
+                                load_slots = vec_load_slots(
+                                    vec * VLEN,
+                                    vec % 2,
+                                    node_const,
+                                    node_pair,
+                                    node_arith,
+                                )
+                                body.extend(interleave_slots(hash_slots, load_slots))
+                            last_vec = vec_count - 1
+                            body.extend(
+                                vec_hash_slots(
+                                    last_vec * VLEN,
+                                    last_vec % 2,
+                                    round,
+                                    wrap_round,
+                                    node_const,
+                                    node_pair,
+                                    node_arith,
+                                )
+                            )
+                    else:
+                        body.extend(
+                            vec_load_slots(0, 0, node_const, node_pair, node_arith)
+                        )
+                        for vec in range(1, vec_count):
+                            prev = vec - 1
+                            hash_slots = vec_hash_slots(
+                                prev * VLEN,
+                                prev % 2,
+                                round,
+                                wrap_round,
+                                node_const,
+                                node_pair,
+                                node_arith,
+                            )
+                            load_slots = vec_load_slots(
+                                vec * VLEN,
+                                vec % 2,
+                                node_const,
+                                node_pair,
+                                node_arith,
+                            )
+                            body.extend(interleave_slots(hash_slots, load_slots))
+                        last_vec = vec_count - 1
+                        body.extend(
+                            vec_hash_slots(
+                                last_vec * VLEN,
+                                last_vec % 2,
+                                round,
+                                wrap_round,
+                                node_const,
+                                node_pair,
+                                node_arith,
+                            )
+                        )
+
+        if vec_end < batch_size:
+            for round in range(rounds):
+                wrap_round = (round % wrap_period) == forest_height
+                for i in range(vec_end, batch_size):
+                    idx_addr = idx_cache + i
+                    val_addr = val_cache + i
+
+                    if self.enable_debug:
+                        body.append(("debug", ("compare", idx_addr, (round, i, "idx"))))
+
+                    if self.enable_debug:
+                        body.append(("debug", ("compare", val_addr, (round, i, "val"))))
+
+                    body.append(
+                        ("alu", ("+", tmp_addr, self.scratch["forest_values_p"], idx_addr))
+                    )
+                    body.append(("load", ("load", tmp_node_val, tmp_addr)))
+                    if self.enable_debug:
+                        body.append(
+                            ("debug", ("compare", tmp_node_val, (round, i, "node_val")))
+                        )
+
+                    body.append(("alu", ("^", val_addr, val_addr, tmp_node_val)))
+                    body.extend(self.build_hash(val_addr, tmp1, tmp2, round, i))
+                    if self.enable_debug:
+                        body.append(
+                            ("debug", ("compare", val_addr, (round, i, "hashed_val")))
+                        )
+
+                    if fast_wrap:
+                        if wrap_round:
+                            body.append(("alu", ("+", idx_addr, zero_const, zero_const)))
+                        else:
+                            body.append(("alu", ("&", tmp3, val_addr, one_const)))
+                            body.append(("alu", ("+", tmp3, tmp3, one_const)))
+                            body.append(("alu", ("*", idx_addr, idx_addr, two_const)))
+                            body.append(("alu", ("+", idx_addr, idx_addr, tmp3)))
+                    else:
+                        body.append(("alu", ("&", tmp3, val_addr, one_const)))
+                        body.append(("alu", ("+", tmp3, tmp3, one_const)))
+                        body.append(("alu", ("*", idx_addr, idx_addr, two_const)))
+                        body.append(("alu", ("+", idx_addr, idx_addr, tmp3)))
+                    if self.enable_debug:
+                        body.append(
+                            ("debug", ("compare", idx_addr, (round, i, "next_idx")))
+                        )
+                    if not fast_wrap:
+                        body.append(
+                            ("alu", ("<", tmp1, idx_addr, self.scratch["n_nodes"]))
+                        )
+                        body.append(
+                            ("flow", ("select", idx_addr, tmp1, idx_addr, zero_const))
+                        )
+                    if self.enable_debug:
+                        body.append(
+                            ("debug", ("compare", idx_addr, (round, i, "wrapped_idx")))
+                        )
+
+        val_store_ptr = self.alloc_scratch("val_store_ptr")
+        if write_indices:
+            idx_store_ptr = self.alloc_scratch("idx_store_ptr")
+            body.append(
+                ("alu", ("+", idx_store_ptr, self.scratch["inp_indices_p"], zero_const))
+            )
+        body.append(
+            ("alu", ("+", val_store_ptr, self.scratch["inp_values_p"], zero_const))
+        )
+        for i in range(0, vec_end, VLEN):
+            if write_indices:
+                body.append(("store", ("vstore", idx_store_ptr, idx_cache + i)))
+            body.append(("store", ("vstore", val_store_ptr, val_cache + i)))
+            if write_indices:
+                body.append(("flow", ("add_imm", idx_store_ptr, idx_store_ptr, VLEN)))
+            body.append(("flow", ("add_imm", val_store_ptr, val_store_ptr, VLEN)))
+        for i in range(vec_end, batch_size):
+            if write_indices:
+                body.append(("store", ("store", idx_store_ptr, idx_cache + i)))
+            body.append(("store", ("store", val_store_ptr, val_cache + i)))
+            if write_indices:
+                body.append(("flow", ("add_imm", idx_store_ptr, idx_store_ptr, 1)))
+            body.append(("flow", ("add_imm", val_store_ptr, val_store_ptr, 1)))
+
+        body_instrs = self.build(body, vliw=True)
+        self.instrs.extend(body_instrs)
+
+        self.instrs.append({"flow": [("pause",)]})
+
+BASELINE = 147734
