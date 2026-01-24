@@ -3065,7 +3065,10 @@ class KernelBuilder:
                         pending_prev = True
 
                     prev_info = info
-                    prev_use_prefetch = use_prefetch
+                    # Note: prev_use_prefetch tracks whether the PREVIOUS round used prefetch
+                    # for the epilogue. Since prefetch only covers block 0 and epilogue uses
+                    # normal double-buffer path, we set it to False (matching non-unrolled path)
+                    prev_use_prefetch = False
                 
                 # Epilogue: hash last block of final round (round 7)
                 if pending_prev:
