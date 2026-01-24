@@ -2136,25 +2136,29 @@ class KernelBuilder:
                     slots.append(("valu", ("&", v_bit2, v_bit2, v_one)))
 
                     # First half: nodes 0-3
+                    # v_sel = select(node1, node0) using bit0
                     slots.append(("flow", ("vselect", v_sel, v_bit0, node1, node0)))
+                    # v_bit0 = select(node3, node2) using bit0 (temporarily overwrites bit0)
                     slots.append(("flow", ("vselect", v_bit0, v_bit0, node3, node2)))
+                    # v_sel = select(v_bit0, v_sel) using bit1 (first half result: nodes 0-3)
                     slots.append(("flow", ("vselect", v_sel, v_bit1, v_bit0, v_sel)))
 
-                    # Second half: nodes 4-7 (recompute bit0)
-                    slots.append(("valu", ("-", v_bit0, v_idx, v_level_start)))
-                    slots.append(("valu", ("&", v_bit0, v_bit0, v_one)))
-                    slots.append(("flow", ("vselect", v_bit0, v_bit0, node5, node4)))
-                    slots.append(("valu", ("-", v_bit1, v_idx, v_level_start)))
-                    slots.append(("valu", ("&", v_bit1, v_bit1, v_one)))
-                    slots.append(("flow", ("vselect", v_bit1, v_bit1, node7, node6)))
-
-                    # Select between the two halves using bit1 (recomputed into v_bit2)
+                    # Second half: nodes 4-7
+                    # Recompute bit0 for second half into v_bit2 (preserve pair45 result location)
+                    slots.append(("valu", ("-", v_bit2, v_idx, v_level_start)))
+                    slots.append(("valu", ("&", v_bit2, v_bit2, v_one)))
+                    # v_bit0 = select(node5, node4) using bit0 (pair45 result, stored in v_bit0)
+                    slots.append(("flow", ("vselect", v_bit0, v_bit2, node5, node4)))
+                    # v_bit1 = select(node7, node6) using bit0 (pair67 result, stored in v_bit1)
+                    slots.append(("flow", ("vselect", v_bit1, v_bit2, node7, node6)))
+                    # Recompute bit1 for combining pairs into v_bit2
                     slots.append(("valu", ("-", v_bit2, v_idx, v_level_start)))
                     slots.append(("valu", (">>", v_bit2, v_bit2, v_one)))
                     slots.append(("valu", ("&", v_bit2, v_bit2, v_one)))
+                    # v_bit0 = select(v_bit1, v_bit0) using bit1 (second half result: nodes 4-7)
                     slots.append(("flow", ("vselect", v_bit0, v_bit2, v_bit1, v_bit0)))
 
-                    # Final select using bit2
+                    # Final select: choose between first half (v_sel) and second half (v_bit0) using bit2
                     slots.append(("valu", ("-", v_bit2, v_idx, v_level_start)))
                     slots.append(("valu", (">>", v_bit2, v_bit2, v_two)))
                     slots.append(("valu", ("&", v_bit2, v_bit2, v_one)))
