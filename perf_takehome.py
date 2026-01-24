@@ -45,6 +45,7 @@ class KernelBuilder:
         max_arith_level: int = -1,
         enable_prefetch: bool = True,
         enable_level2_where: bool = True,
+        enable_level2_valu: bool = False,
         enable_two_round_fusion: bool = False,
         enable_level3_where: bool = False,
         lookahead: int = 1024,  # Optimized: 1024 with block_size=16 gives 1923 cycles
@@ -66,6 +67,7 @@ class KernelBuilder:
         self.max_arith_level = max_arith_level
         self.enable_prefetch = enable_prefetch
         self.enable_level2_where = enable_level2_where
+        self.enable_level2_valu = enable_level2_valu
         self.enable_two_round_fusion = enable_two_round_fusion
         self.enable_level3_where = enable_level3_where
         self.lookahead = lookahead
@@ -1379,6 +1381,7 @@ class KernelBuilder:
 
         # Level 2 where-tree selection (optional): load 4 nodes once per round, vselect per vector.
         enable_level2_where = self.enable_level2_where
+        enable_level2_valu = self.enable_level2_valu
         enable_level3_where = self.enable_level3_where
         level2_base_addr_const = self.scratch_const(3)
         level2_vecs_base = v_node_block[0]  # Reuse v_node_block[0] for the 4 level-2 vectors.
@@ -2096,18 +2099,40 @@ class KernelBuilder:
                 for bi, vec_i in enumerate(block_vecs):
                     v_idx = idx_cache + vec_i
                     v_val = val_cache + vec_i
-                    v_offset = v_tmp1_block + bi * VLEN
-                    v_go_left1 = v_tmp2_block + bi * VLEN
-                    v_left = v_tmp3_block + bi * VLEN
-                    slots.append(("valu", ("-", v_offset, v_idx, v_level_start)))
-                    slots.append(("valu", ("<", v_go_left1, v_offset, v_two)))
-                    slots.append(("valu", ("<", v_left, v_offset, v_one)))
-                    slots.append(("flow", ("vselect", v_left, v_left, node0, node1)))
-                    slots.append(("valu", ("-", v_offset, v_offset, v_two)))
-                    slots.append(("valu", ("<", v_offset, v_offset, v_one)))
-                    slots.append(("flow", ("vselect", v_offset, v_offset, node2, node3)))
-                    slots.append(("flow", ("vselect", v_offset, v_go_left1, v_left, v_offset)))
-                    slots.append(("valu", ("^", v_val, v_val, v_offset)))
+                    if enable_level2_valu:
+                        v_offset = v_tmp1_block + bi * VLEN
+                        v_bit0 = v_tmp2_block + bi * VLEN
+                        v_tmp = v_tmp3_block + bi * VLEN
+                        # bit0 from offset
+                        slots.append(("valu", ("-", v_offset, v_idx, v_level_start)))
+                        slots.append(("valu", ("&", v_bit0, v_offset, v_one)))
+                        # t0 = node0 + bit0 * (node1 - node0)
+                        slots.append(("valu", ("-", v_offset, node1, node0)))
+                        slots.append(("valu", ("multiply_add", v_offset, v_bit0, v_offset, node0)))
+                        # t1 = node2 + bit0 * (node3 - node2)
+                        slots.append(("valu", ("-", v_tmp, node3, node2)))
+                        slots.append(("valu", ("multiply_add", v_tmp, v_bit0, v_tmp, node2)))
+                        # bit1 from offset (recompute)
+                        slots.append(("valu", ("-", v_bit0, v_idx, v_level_start)))
+                        slots.append(("valu", (">>", v_bit0, v_bit0, v_one)))
+                        slots.append(("valu", ("&", v_bit0, v_bit0, v_one)))
+                        # result = t0 + bit1 * (t1 - t0)
+                        slots.append(("valu", ("-", v_tmp, v_tmp, v_offset)))
+                        slots.append(("valu", ("multiply_add", v_offset, v_bit0, v_tmp, v_offset)))
+                        slots.append(("valu", ("^", v_val, v_val, v_offset)))
+                    else:
+                        v_offset = v_tmp1_block + bi * VLEN
+                        v_go_left1 = v_tmp2_block + bi * VLEN
+                        v_left = v_tmp3_block + bi * VLEN
+                        slots.append(("valu", ("-", v_offset, v_idx, v_level_start)))
+                        slots.append(("valu", ("<", v_go_left1, v_offset, v_two)))
+                        slots.append(("valu", ("<", v_left, v_offset, v_one)))
+                        slots.append(("flow", ("vselect", v_left, v_left, node0, node1)))
+                        slots.append(("valu", ("-", v_offset, v_offset, v_two)))
+                        slots.append(("valu", ("<", v_offset, v_offset, v_one)))
+                        slots.append(("flow", ("vselect", v_offset, v_offset, node2, node3)))
+                        slots.append(("flow", ("vselect", v_offset, v_go_left1, v_left, v_offset)))
+                        slots.append(("valu", ("^", v_val, v_val, v_offset)))
             elif level3_round:
                 node0 = level3_vecs_base
                 node1 = level3_vecs_base + VLEN
@@ -2136,25 +2161,29 @@ class KernelBuilder:
                     slots.append(("valu", ("&", v_bit2, v_bit2, v_one)))
 
                     # First half: nodes 0-3
+                    # v_sel = select(node1, node0) using bit0
                     slots.append(("flow", ("vselect", v_sel, v_bit0, node1, node0)))
+                    # v_bit0 = select(node3, node2) using bit0 (temporarily overwrites bit0)
                     slots.append(("flow", ("vselect", v_bit0, v_bit0, node3, node2)))
+                    # v_sel = select(v_bit0, v_sel) using bit1 (first half result: nodes 0-3)
                     slots.append(("flow", ("vselect", v_sel, v_bit1, v_bit0, v_sel)))
 
-                    # Second half: nodes 4-7 (recompute bit0)
-                    slots.append(("valu", ("-", v_bit0, v_idx, v_level_start)))
-                    slots.append(("valu", ("&", v_bit0, v_bit0, v_one)))
-                    slots.append(("flow", ("vselect", v_bit0, v_bit0, node5, node4)))
-                    slots.append(("valu", ("-", v_bit1, v_idx, v_level_start)))
-                    slots.append(("valu", ("&", v_bit1, v_bit1, v_one)))
-                    slots.append(("flow", ("vselect", v_bit1, v_bit1, node7, node6)))
-
-                    # Select between the two halves using bit1 (recomputed into v_bit2)
+                    # Second half: nodes 4-7
+                    # Recompute bit0 for second half into v_bit2 (preserve pair45 result location)
+                    slots.append(("valu", ("-", v_bit2, v_idx, v_level_start)))
+                    slots.append(("valu", ("&", v_bit2, v_bit2, v_one)))
+                    # v_bit0 = select(node5, node4) using bit0 (pair45 result, stored in v_bit0)
+                    slots.append(("flow", ("vselect", v_bit0, v_bit2, node5, node4)))
+                    # v_bit1 = select(node7, node6) using bit0 (pair67 result, stored in v_bit1)
+                    slots.append(("flow", ("vselect", v_bit1, v_bit2, node7, node6)))
+                    # Recompute bit1 for combining pairs into v_bit2
                     slots.append(("valu", ("-", v_bit2, v_idx, v_level_start)))
                     slots.append(("valu", (">>", v_bit2, v_bit2, v_one)))
                     slots.append(("valu", ("&", v_bit2, v_bit2, v_one)))
+                    # v_bit0 = select(v_bit1, v_bit0) using bit1 (second half result: nodes 4-7)
                     slots.append(("flow", ("vselect", v_bit0, v_bit2, v_bit1, v_bit0)))
 
-                    # Final select using bit2
+                    # Final select: choose between first half (v_sel) and second half (v_bit0) using bit2
                     slots.append(("valu", ("-", v_bit2, v_idx, v_level_start)))
                     slots.append(("valu", (">>", v_bit2, v_bit2, v_two)))
                     slots.append(("valu", ("&", v_bit2, v_bit2, v_one)))
@@ -2990,10 +3019,11 @@ def do_kernel_test(
     assume_zero_indices: bool | None = None,
     max_special_level: int | None = None,
     max_arith_level: int | None = None,
-    enable_prefetch: bool | None = None,
-    enable_level2_where: bool | None = None,
-    enable_two_round_fusion: bool | None = None,
-    enable_level3_where: bool | None = None,
+        enable_prefetch: bool | None = None,
+        enable_level2_where: bool | None = None,
+        enable_level2_valu: bool | None = None,
+        enable_two_round_fusion: bool | None = None,
+        enable_level3_where: bool | None = None,
     lookahead: int | None = None,
     block_size: int | None = None,
     enable_second_pass: bool | None = None,
@@ -3019,6 +3049,8 @@ def do_kernel_test(
         enable_prefetch = True
     if enable_level2_where is None:
         enable_level2_where = True
+    if enable_level2_valu is None:
+        enable_level2_valu = False
     if enable_two_round_fusion is None:
         enable_two_round_fusion = False
     if enable_level3_where is None:
@@ -3042,6 +3074,7 @@ def do_kernel_test(
         max_arith_level=max_arith_level,
         enable_prefetch=enable_prefetch,
         enable_level2_where=enable_level2_where,
+        enable_level2_valu=enable_level2_valu,
         enable_two_round_fusion=enable_two_round_fusion,
         enable_level3_where=enable_level3_where,
         lookahead=lookahead,
