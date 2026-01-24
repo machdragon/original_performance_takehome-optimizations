@@ -1835,3 +1835,5 @@ class KernelBuilder:
             node_arith=None,
             node_prefetch=None,
             level2_round=False,
+            level4_precompute_round=False,
+            level=None,
