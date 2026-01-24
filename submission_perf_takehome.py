@@ -1959,142 +1959,38 @@ class KernelBuilder:
                     prev_info=info;prev_use_prefetch=False
             else:
                 for round in range(rounds):
-                    info = round_info[round]
-                    use_prefetch = prefetch_active[round]
-                    do_prefetch_next = prefetch_next[round]
-                    node_prefetch = v_node_prefetch if use_prefetch else None
-                    special_round = enable_prefetch and (info["arith_round"] or info["level2_round"])
-                    level2_prep = level2_prepare_slots() if info["level2_round"] else []
-                    level2_prepared = False
-
+                    info=round_info[round];up=prefetch_active[round];dpn=prefetch_next[round];np=v_node_prefetch if up else None
+                    sr=enable_prefetch and(info["arith_round"]or info["level2_round"]);l2p=level2_prepare_slots()if info["level2_round"]else[];l2pd=False
                     if pending_prev:
-                        last_buf = last_block_idx % 2
-                        prev_node_prefetch = v_node_prefetch if prev_use_prefetch else None
-                        hash_prev = vec_block_hash_only_slots(
-                            last_block_vecs,
-                            last_buf,
-                            prev_info["wrap_round"],
-                            prev_info["node_const"],
-                            prev_info["node_pair"],
-                            prev_info["node_arith"],
-                            prev_node_prefetch,
-                            prev_info["level2_round"],
-                        )
-                        if info["level2_round"]:
-                            body.extend(interleave_slots(hash_prev, level2_prep))
-                            level2_prepared = True
-                        elif special_round:
-                            body.extend(hash_prev)
+                        lb=last_block_idx%2;pnp=v_node_prefetch if prev_use_prefetch else None
+                        hp=vec_block_hash_only_slots(last_block_vecs,lb,prev_info["wrap_round"],prev_info["node_const"],prev_info["node_pair"],prev_info["node_arith"],pnp,prev_info["level2_round"])
+                        if info["level2_round"]:body.extend(interleave_slots(hp,l2p));l2pd=True
+                        elif sr:body.extend(hp)
                         else:
-                            load_slots = vec_block_load_slots(
-                                block_0_vecs,
-                                0,
-                                info["node_const"],
-                                info["node_pair"],
-                                info["node_arith"],
-                                node_prefetch,
-                                info.get("level2_round", False),
-                                info["round"],
-                            )
-                            body.extend(interleave_slots(hash_prev, load_slots))
-
-                    if info["level2_round"] and not level2_prepared:
-                        body.extend(level2_prep)
-                        level2_prepared = True
-
-                    if special_round:
-                        body.extend(
-                            vec_block_hash_only_slots(
-                                block_0_vecs,
-                                0,
-                                info["wrap_round"],
-                                info["node_const"],
-                                info["node_pair"],
-                                info["node_arith"],
-                                node_prefetch,
-                                info["level2_round"],
-                            )
-                        )
-                        for block_idx in range(1, num_blocks):
-                            buf_idx = block_idx % 2
-
-                            hash_slots = vec_block_hash_only_slots(
-                                all_block_vecs[block_idx],
-                                buf_idx,
-                                info["wrap_round"],
-                                info["node_const"],
-                                info["node_pair"],
-                                info["node_arith"],
-                                node_prefetch,
-                                info["level2_round"],
-                            )
-
-                            load_slots = []
-                            if do_prefetch_next and block_idx == 1:
-                                load_slots = vec_block_prefetch_slots(
-                                    all_block_vecs[0], v_node_prefetch
-                                )
-                            body.extend(interleave_slots(hash_slots, load_slots))
-                        pending_prev = False
+                            ls=vec_block_load_slots(block_0_vecs,0,info["node_const"],info["node_pair"],info["node_arith"],np,info.get("level2_round",False),info["round"])
+                            body.extend(interleave_slots(hp,ls))
+                    if info["level2_round"]and not l2pd:body.extend(l2p);l2pd=True
+                    if sr:
+                        body.extend(vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"]))
+                        for bi in range(1,num_blocks):
+                            b=bi%2;hs=vec_block_hash_only_slots(all_block_vecs[bi],b,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"])
+                            ls=vec_block_prefetch_slots(all_block_vecs[0],v_node_prefetch)if dpn and bi==1 else[]
+                            body.extend(interleave_slots(hs,ls))
+                        pending_prev=False
                     else:
-                        start_block = 1
-                        if use_prefetch:
-
-                            hash_slots = vec_block_hash_only_slots(
-                                block_0_vecs,
-                                0,
-                                info["wrap_round"],
-                                info["node_const"],
-                                info["node_pair"],
-                                info["node_arith"],
-                                node_prefetch,
-                                info["level2_round"],
-                            )
-                            load_slots = vec_block_load_slots(
-                                all_block_vecs[1],
-                                1,
-                                info["node_const"],
-                                info["node_pair"],
-                                info["node_arith"],
-                            )
-                            body.extend(interleave_slots(hash_slots, load_slots))
-                            start_block = 2
-                        elif not pending_prev:
-                            body.extend(
-                                vec_block_load_slots(
-                                    block_0_vecs,
-                                    0,
-                                    info["node_const"],
-                                    info["node_pair"],
-                                    info["node_arith"],
-                                )
-                            )
-
-                        for block_idx in range(start_block, num_blocks):
-                            prev_buf = (block_idx - 1) % 2
-                            curr_buf = block_idx % 2
-                            hash_slots = vec_block_hash_only_slots(
-                                all_block_vecs[block_idx - 1],
-                                prev_buf,
-                                info["wrap_round"],
-                                info["node_const"],
-                                info["node_pair"],
-                                info["node_arith"],
-                                None,
-                                info["level2_round"],
-                            )
-                            load_slots = vec_block_load_slots(
-                                all_block_vecs[block_idx],
-                                curr_buf,
-                                info["node_const"],
-                                info["node_pair"],
-                                info["node_arith"],
-                            )
-                            body.extend(interleave_slots(hash_slots, load_slots))
-                        pending_prev = True
-
-                    prev_info = info
-                    prev_use_prefetch = False
+                        sb=1
+                        if up:
+                            hs=vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"])
+                            ls=vec_block_load_slots(all_block_vecs[1],1,info["node_const"],info["node_pair"],info["node_arith"])
+                            body.extend(interleave_slots(hs,ls));sb=2
+                        elif not pending_prev:body.extend(vec_block_load_slots(block_0_vecs,0,info["node_const"],info["node_pair"],info["node_arith"]))
+                        for bi in range(sb,num_blocks):
+                            pb=(bi-1)%2;cb=bi%2
+                            hs=vec_block_hash_only_slots(all_block_vecs[bi-1],pb,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],None,info["level2_round"])
+                            ls=vec_block_load_slots(all_block_vecs[bi],cb,info["node_const"],info["node_pair"],info["node_arith"])
+                            body.extend(interleave_slots(hs,ls))
+                        pending_prev=True
+                    prev_info=info;prev_use_prefetch=False
 
             if pending_prev:
                 last_buf = last_block_idx % 2
