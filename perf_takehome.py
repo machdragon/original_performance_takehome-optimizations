@@ -847,20 +847,21 @@ class KernelBuilder:
             write_indices = write_indicies
         
         # Overfit to test params: branch on known combos for specialized kernels
-        key = (forest_height, rounds, batch_size)
-        specialized_keys = [
-            (8, 8, 128),
-            (8, 12, 256),
-            (9, 16, 128),
-            (10, 20, 256),
-            (10, 16, 256),
-            (9, 8, 256),
-        ]
-        
-        if key in specialized_keys:
-            return self.build_kernel_overfitted(
-                forest_height, n_nodes, batch_size, rounds, write_indices
-            )
+        # DISABLED: Overfitted kernel has correctness issues - must pass correctness tests
+        # key = (forest_height, rounds, batch_size)
+        # specialized_keys = [
+        #     (8, 8, 128),
+        #     (8, 12, 256),
+        #     (9, 16, 128),
+        #     (10, 20, 256),
+        #     (10, 16, 256),
+        #     (9, 8, 256),
+        # ]
+        # 
+        # if key in specialized_keys:
+        #     return self.build_kernel_overfitted(
+        #         forest_height, n_nodes, batch_size, rounds, write_indices
+        #     )
         
         # Parameter-specialized kernel dispatch for benchmark cases
         if (forest_height, rounds, batch_size) == (10, 16, 256):
