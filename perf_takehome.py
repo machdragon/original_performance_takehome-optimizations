@@ -3137,69 +3137,69 @@ class KernelBuilder:
                                 )
                             body.extend(interleave_slots(hash_slots, load_slots))
                         pending_prev = False
-                else:
-                    start_block = 1
-                    if use_prefetch:
-                        # Block 0 is prefetched; hash it while loading block 1.
-                        hash_slots = vec_block_hash_only_slots(
-                            block_0_vecs,
-                            0,
-                            info["wrap_round"],
-                            info["node_const"],
-                            info["node_pair"],
-                            info["node_arith"],
-                            node_prefetch,
-                            info["level2_round"],
-                            info["level3_round"],
-                        )
-                        load_slots = vec_block_load_slots(
-                            all_block_vecs[1],
-                            1,
-                            info["node_const"],
-                            info["node_pair"],
-                            info["node_arith"],
-                        )
-                        body.extend(interleave_slots(hash_slots, load_slots))
-                        start_block = 2
-                    elif not pending_prev:
-                        body.extend(
-                            vec_block_load_slots(
+                    else:
+                        start_block = 1
+                        if use_prefetch:
+                            # Block 0 is prefetched; hash it while loading block 1.
+                            hash_slots = vec_block_hash_only_slots(
                                 block_0_vecs,
                                 0,
+                                info["wrap_round"],
+                                info["node_const"],
+                                info["node_pair"],
+                                info["node_arith"],
+                                node_prefetch,
+                                info["level2_round"],
+                                info["level3_round"],
+                            )
+                            load_slots = vec_block_load_slots(
+                                all_block_vecs[1],
+                                1,
                                 info["node_const"],
                                 info["node_pair"],
                                 info["node_arith"],
                             )
-                        )
-                    # For num_blocks == 2 the following loop is
-                    # intentionally empty when start_block == 2:
-                    # block 1 is loaded here and then hashed as the
-                    # deferred epilogue in the next round, which
-                    # is how the cross-round pipeline keeps one
-                    # block "in flight" across iterations.
-                    for block_idx in range(start_block, num_blocks):
-                        prev_buf = (block_idx - 1) % 2
-                        curr_buf = block_idx % 2
-                        hash_slots = vec_block_hash_only_slots(
-                            all_block_vecs[block_idx - 1],
-                            prev_buf,
-                            info["wrap_round"],
-                            info["node_const"],
-                            info["node_pair"],
-                            info["node_arith"],
-                            None,
-                            info["level2_round"],
-                            info["level3_round"],
-                        )
-                        load_slots = vec_block_load_slots(
-                            all_block_vecs[block_idx],
-                            curr_buf,
-                            info["node_const"],
-                            info["node_pair"],
-                            info["node_arith"],
-                        )
-                        body.extend(interleave_slots(hash_slots, load_slots))
-                    pending_prev = True
+                            body.extend(interleave_slots(hash_slots, load_slots))
+                            start_block = 2
+                        elif not pending_prev:
+                            body.extend(
+                                vec_block_load_slots(
+                                    block_0_vecs,
+                                    0,
+                                    info["node_const"],
+                                    info["node_pair"],
+                                    info["node_arith"],
+                                )
+                            )
+                        # For num_blocks == 2 the following loop is
+                        # intentionally empty when start_block == 2:
+                        # block 1 is loaded here and then hashed as the
+                        # deferred epilogue in the next round, which
+                        # is how the cross-round pipeline keeps one
+                        # block "in flight" across iterations.
+                        for block_idx in range(start_block, num_blocks):
+                            prev_buf = (block_idx - 1) % 2
+                            curr_buf = block_idx % 2
+                            hash_slots = vec_block_hash_only_slots(
+                                all_block_vecs[block_idx - 1],
+                                prev_buf,
+                                info["wrap_round"],
+                                info["node_const"],
+                                info["node_pair"],
+                                info["node_arith"],
+                                None,
+                                info["level2_round"],
+                                info["level3_round"],
+                            )
+                            load_slots = vec_block_load_slots(
+                                all_block_vecs[block_idx],
+                                curr_buf,
+                                info["node_const"],
+                                info["node_pair"],
+                                info["node_arith"],
+                            )
+                            body.extend(interleave_slots(hash_slots, load_slots))
+                        pending_prev = True
 
                     prev_info = info
                     # Prefetch only covers block 0; epilogue always
