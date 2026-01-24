@@ -1373,20 +1373,29 @@ class KernelBuilder:
         v_tmp1_block = self.alloc_scratch("v_tmp1_block", block_size * VLEN)
         v_tmp2_block = self.alloc_scratch("v_tmp2_block", block_size * VLEN)
         v_tmp3_block = self.alloc_scratch("v_tmp3_block", block_size * VLEN)
-        v_tmp4_block = None
-        if enable_arith:
-            v_tmp4_block = self.alloc_scratch("v_tmp4_block", block_size * VLEN)
-
         # Level 2 where-tree selection (optional): load 4 nodes once per round, vselect per vector.
         enable_level2_where = self.enable_level2_where
         # Level 3 VALU selection (optional): load 8 nodes once per round, VALU blend per vector.
+        # Disabled when level-2 where-tree is active (known incorrect interaction).
         enable_level3_valu = self.enable_level3_valu
+        enable_level3_rounds = enable_level3_valu and not enable_level2_where
+
+        v_tmp4_block = None
+        if enable_arith:
+            v_tmp4_block = self.alloc_scratch("v_tmp4_block", block_size * VLEN)
         level2_base_addr_const = self.scratch_const(3)
         level2_vecs_base = v_node_block[0]  # Reuse v_node_block[0] for the 4 level-2 vectors.
         # Reuse scratch to avoid extra allocations when prefetch is enabled.
         level2_addr_temp = tmp1
         level2_scalars_base = v_tmp1  # Use first 4 lanes as scalar temps.
-        level3_vecs_base = v_node_block[0]  # Reuse v_node_block[0] for the 8 level-3 vectors.
+        # Level-3 vectors use the alternate block buffer when level-2 where-tree is enabled
+        # to avoid clobbering level-2 data during cross-round bundling.
+        if enable_level2_where:
+            level3_vecs_base = v_node_block[1]
+            level3_tmp_base = v_node_block[0]
+        else:
+            level3_vecs_base = v_node_block[0]
+            level3_tmp_base = v_node_block[1]
 
         level_vec_base = []
         level_sizes = []
@@ -1910,7 +1919,7 @@ class KernelBuilder:
             return slots
 
         def level3_prepare_slots():
-            if not (enable_level3_valu and enable_prefetch):
+            if not (enable_level3_rounds and enable_prefetch):
                 return []
             slots = []
             slots.append(
@@ -2117,7 +2126,6 @@ class KernelBuilder:
                 node5 = level3_vecs_base + 5 * VLEN
                 node6 = level3_vecs_base + 6 * VLEN
                 node7 = level3_vecs_base + 7 * VLEN
-                level3_tmp_base = v_node_block[1]
                 v_level_start = self.scratch_vconst(7)
                 for bi, vec_i in enumerate(block_vecs):
                     v_idx = idx_cache + vec_i
@@ -2127,11 +2135,13 @@ class KernelBuilder:
                     v_tmp2 = v_tmp3_block + bi * VLEN
                     v_bit = level3_tmp_base + bi * VLEN
 
+                    # bit0 in v_bit, bit1 in v_tmp2
                     slots.append(("valu", ("-", v_sel, v_idx, v_level_start)))
                     slots.append(("valu", ("&", v_bit, v_sel, v_one)))
                     slots.append(("valu", (">>", v_tmp2, v_sel, v_one)))
                     slots.append(("valu", ("&", v_tmp2, v_tmp2, v_one)))
 
+                    # Pair 0/1 -> v_sel, pair 2/3 -> v_tmp
                     slots.append(("valu", ("-", v_tmp, node1, node0)))
                     slots.append(("valu", ("multiply_add", v_sel, v_bit, v_tmp, node0)))
                     slots.append(("valu", ("-", v_tmp, node3, node2)))
@@ -2139,22 +2149,25 @@ class KernelBuilder:
                     slots.append(("valu", ("-", v_tmp, v_tmp, v_sel)))
                     slots.append(("valu", ("multiply_add", v_sel, v_tmp2, v_tmp, v_sel)))
 
+                    # Pair 4/5 -> v_tmp, pair 6/7 -> v_tmp2
                     slots.append(("valu", ("-", v_tmp, node5, node4)))
                     slots.append(("valu", ("multiply_add", v_tmp, v_bit, v_tmp, node4)))
                     slots.append(("valu", ("-", v_tmp2, node7, node6)))
                     slots.append(("valu", ("multiply_add", v_tmp2, v_bit, v_tmp2, node6)))
 
+                    # Recompute bit1 into v_bit and combine high half
                     slots.append(("valu", ("-", v_bit, v_idx, v_level_start)))
                     slots.append(("valu", (">>", v_bit, v_bit, v_one)))
                     slots.append(("valu", ("&", v_bit, v_bit, v_one)))
                     slots.append(("valu", ("-", v_tmp2, v_tmp2, v_tmp)))
                     slots.append(("valu", ("multiply_add", v_tmp, v_bit, v_tmp2, v_tmp)))
 
+                    # bit2 and final select between low (v_sel) and high (v_tmp)
                     slots.append(("valu", ("-", v_bit, v_idx, v_level_start)))
                     slots.append(("valu", (">>", v_bit, v_bit, v_two)))
                     slots.append(("valu", ("&", v_bit, v_bit, v_one)))
-                    slots.append(("valu", ("-", v_tmp, v_tmp, v_sel)))
-                    slots.append(("valu", ("multiply_add", v_sel, v_bit, v_tmp, v_sel)))
+                    slots.append(("valu", ("-", v_tmp2, v_tmp, v_sel)))
+                    slots.append(("valu", ("multiply_add", v_sel, v_bit, v_tmp2, v_sel)))
                     slots.append(("valu", ("^", v_val, v_val, v_sel)))
             elif node_const is not None:
                 for _bi, vec_i in enumerate(block_vecs):
@@ -2477,7 +2490,7 @@ class KernelBuilder:
                     fast_wrap and enable_level2_where and enable_prefetch and level == 2
                 )
                 level3_round = (
-                    fast_wrap and enable_level3_valu and enable_prefetch and level == 3
+                    fast_wrap and enable_level3_rounds and enable_prefetch and level == 3
                 )
                 round_info.append(
                     {
@@ -2493,7 +2506,6 @@ class KernelBuilder:
                             and node_arith is None
                             and not level2_round
                             and not level3_round
-                            and not level3_round  # Level 3 uses VALU select, not loads
                         ),
                         "arith_round": arith_round,
                         "level2_round": level2_round,
