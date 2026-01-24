@@ -2059,33 +2059,48 @@ class KernelBuilder:
                         ("valu", ("^", v_val, v_val, node_base + bi * VLEN))
                     )
             elif level == 2 and not level2_round and node_arith is None:
-                # Gather deduplication for Level 2: Use pre-prepared vectors to select the right value per lane
+                # Gather deduplication for Level 2: VALU-only arithmetic selection (avoids flow engine bottleneck)
                 # Vectors should be prepared once per round by level2_prepare_slots_dedup() at round start
-                # This maintains the load pipeline by doing loads early, then VALU/flow work
+                # This maintains the load pipeline by doing loads early, then VALU work
                 # Level 2 has indices 3-6, so we load those 4 values once per round
+                # Uses multiply_add for selection instead of vselect (flow engine has only 1 slot/cycle!)
                 
                 # Use pre-prepared vectors (level2_vecs_base = v_node_block[0])
                 level2_vecs = level2_vecs_base
-                node0 = level2_vecs
-                node1 = level2_vecs + VLEN
-                node2 = level2_vecs + 2 * VLEN
-                node3 = level2_vecs + 3 * VLEN
+                node_buf = v_node_block[buf_idx]
                 v_level_start = self.scratch_vconst(3)
                 for bi, vec_i in enumerate(block_vecs):
                     v_idx = idx_cache + vec_i
                     v_val = val_cache + vec_i
-                    v_offset = v_tmp1_block + bi * VLEN
-                    v_go_left1 = v_tmp2_block + bi * VLEN
-                    v_left = v_tmp3_block + bi * VLEN
+                    v_offset = v_tmp2_block + bi * VLEN
+                    v_bit0 = v_tmp1_block + bi * VLEN
+                    v_bit1 = v_tmp3_block + bi * VLEN
+                    
+                    # Compute relative offset (idx - 3) and extract bits
                     slots.append(("valu", ("-", v_offset, v_idx, v_level_start)))
-                    slots.append(("valu", ("<", v_go_left1, v_offset, v_two)))
-                    slots.append(("valu", ("<", v_left, v_offset, v_one)))
-                    slots.append(("flow", ("vselect", v_left, v_left, node0, node1)))
-                    slots.append(("valu", ("-", v_offset, v_offset, v_two)))
-                    slots.append(("valu", ("<", v_offset, v_offset, v_one)))
-                    slots.append(("flow", ("vselect", v_offset, v_offset, node2, node3)))
-                    slots.append(("flow", ("vselect", v_offset, v_go_left1, v_left, v_offset)))
-                    slots.append(("valu", ("^", v_val, v_val, v_offset)))
+                    slots.append(("valu", ("&", v_bit0, v_offset, v_one)))
+                    slots.append(("valu", (">>", v_bit1, v_offset, self.scratch_vconst(1))))
+                    slots.append(("valu", ("&", v_bit1, v_bit1, v_one)))
+                    
+                    # Compute differences between adjacent nodes
+                    v_diff_01 = v_tmp1_block + bi * VLEN
+                    v_diff_23 = v_tmp2_block + bi * VLEN
+                    slots.append(("valu", ("-", v_diff_01, level2_vecs + 1 * VLEN, level2_vecs + 0 * VLEN)))
+                    slots.append(("valu", ("-", v_diff_23, level2_vecs + 3 * VLEN, level2_vecs + 2 * VLEN)))
+                    
+                    # Select low pair (0 or 1) based on bit0
+                    v_sel_low = v_tmp1_block + bi * VLEN
+                    v_sel_high = v_tmp2_block + bi * VLEN
+                    slots.append(("valu", ("multiply_add", v_sel_low, v_bit0, v_diff_01, level2_vecs + 0 * VLEN)))
+                    slots.append(("valu", ("multiply_add", v_sel_high, v_bit0, v_diff_23, level2_vecs + 2 * VLEN)))
+                    
+                    # Select final result (low or high) based on bit1
+                    v_result = v_tmp3_block + bi * VLEN
+                    slots.append(("valu", ("-", v_result, v_sel_high, v_sel_low)))
+                    slots.append(("valu", ("multiply_add", node_buf + bi * VLEN, v_bit1, v_result, v_sel_low)))
+                    
+                    # Hash with selected node value
+                    slots.append(("valu", ("^", v_val, v_val, node_buf + bi * VLEN)))
             else:
                 for bi, vec_i in enumerate(block_vecs):
                     v_val = val_cache + vec_i
@@ -2298,11 +2313,20 @@ class KernelBuilder:
                     }
         v_node_prefetch = None
 
+        # Enable prefetch for arith rounds, level2_where, or level2 deduplication
+        # Level 2 deduplication is used when: level==2, not level2_round, not arith_round
+        # This happens when enable_level2_where=False but we still want gather deduplication
+        enable_level2_dedup = (
+            not enable_level2_where
+            and fast_wrap
+            and use_cross_round
+            and rounds > 1
+        )  # Will be used for level 2 rounds if not arith_round
         enable_prefetch = (
             self.enable_prefetch
             and rounds > 1
             and use_cross_round
-            and (enable_arith or enable_level2_where)
+            and (enable_arith or enable_level2_where or enable_level2_dedup)
         )
         if enable_prefetch:
             v_node_prefetch = self.alloc_scratch(
@@ -2328,6 +2352,15 @@ class KernelBuilder:
                 level2_round = (
                     fast_wrap and enable_level2_where and enable_prefetch and level == 2
                 )
+                level2_dedup_round = (
+                    fast_wrap
+                    and not enable_level2_where
+                    and enable_prefetch
+                    and level == 2
+                    and not uniform_round
+                    and not binary_round
+                    and not arith_round
+                )
                 level4_precompute_round = (
                     enable_level4_precompute
                     and level == 4
@@ -2349,10 +2382,12 @@ class KernelBuilder:
                             and node_pair is None
                             and node_arith is None
                             and not level2_round
+                            and not level2_dedup_round
                             and not level4_precompute_round
                         ),
                         "arith_round": arith_round,
                         "level2_round": level2_round,
+                        "level2_dedup_round": level2_dedup_round,
                         "level4_precompute_round": level4_precompute_round,
                     }
                 )
@@ -2360,7 +2395,7 @@ class KernelBuilder:
                 for round in range(rounds - 1):
                     info = round_info[round]
                     next_info = round_info[round + 1]
-                    if (info["arith_round"] or info["level2_round"]) and next_info["load_needed"]:
+                    if (info["arith_round"] or info["level2_round"] or info.get("level2_dedup_round", False)) and next_info["load_needed"]:
                         prefetch_next[round] = True
                         prefetch_active[round + 1] = True
 
