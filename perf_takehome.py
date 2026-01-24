@@ -1602,21 +1602,20 @@ class KernelBuilder:
             and block_size >= 16
         )
         enable_level4_valu = self.enable_level4_valu
-        need_tmp3_block = (
+        # Optionally alias v_tmp3_block to v_tmp2_block to free 128 words.
+        alias_tmp3_block = self.alias_tmp3_block and not (
             enable_arith
             or enable_level2_valu
             or enable_level3_where
             or enable_level4_where
         )
-        if need_tmp3_block:
-            v_tmp3_block = self.alloc_scratch("v_tmp3_block", block_size * VLEN)
-        else:
+        if alias_tmp3_block:
             v_tmp3_block = v_tmp2_block
+        else:
+            v_tmp3_block = self.alloc_scratch("v_tmp3_block", block_size * VLEN)
         v_tmp4_block = None
         if enable_arith:
             v_tmp4_block = self.alloc_scratch("v_tmp4_block", block_size * VLEN)
-        enable_level4_valu = self.enable_level4_valu
-=======
         # Optionally alias v_tmp3_block to v_tmp2_block to free 128 words.
         alias_tmp3_block = self.alias_tmp3_block and not (
             enable_arith
@@ -1641,11 +1640,9 @@ class KernelBuilder:
         level2_scalars_base = v_tmp1  # Use first 4 lanes as scalar temps.
         level3_base_addr_const = None
         level3_vecs_base = v_node_block[0]  # Reuse v_node_block[0] for the 8 level-3 vectors.
-<<<<<<< HEAD
-        level4_vecs_base = v_node_block[0]
-        level4_diffs_base = v_node_block[1]
-=======
         level4_base_addr_const = self.scratch_const(15)
+        level4_vecs_base = v_node_block[0]  # Reuse v_node_block[0] for the 16 level-4 vectors.
+        level4_diffs_base = v_node_block[1]
         level4_vecs_base = v_node_block[0]  # Reuse v_node_block[0] for the 16 level-4 vectors.
 >>>>>>> phase-27
 
@@ -2195,11 +2192,7 @@ class KernelBuilder:
             return slots
 
         def level4_prepare_slots():
-<<<<<<< HEAD
-            if not (enable_level4_valu and enable_prefetch):
-=======
-            if not (enable_level4_where and enable_prefetch):
->>>>>>> phase-27
+            if not ((enable_level4_valu or enable_level4_where) and enable_prefetch):
                 return []
             slots = []
             slots.append(
