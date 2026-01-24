@@ -3048,7 +3048,7 @@ class KernelBuilder:
                     level3_prepared = False
                     level4_prepared = False
 
-                if pending_prev:
+                    if pending_prev:
                     last_buf = last_block_idx % 2
                     prev_node_prefetch = v_node_prefetch if prev_use_prefetch else None
                     hash_prev = vec_block_hash_only_slots(
@@ -3086,7 +3086,7 @@ class KernelBuilder:
                         )
                         body.extend(interleave_slots(hash_prev, load_slots))
 
-                if info["level2_round"] and not level2_prepared:
+                    if info["level2_round"] and not level2_prepared:
                     body.extend(level2_prep)
                     level2_prepared = True
                 if info["level3_round"] and not level3_prepared:
