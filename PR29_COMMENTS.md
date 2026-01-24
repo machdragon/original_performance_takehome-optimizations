@@ -39,19 +39,20 @@ The parameter is now properly passed through. While `write_indices=False` may be
 
 ---
 
-## 3. Intentional scratch memory aliasing between level2 and level3 vectors ✅ FIXED
+## 3. Intentional scratch memory aliasing between level2 and level3 vectors ✅ RESOLVED
 
-**Location:** `perf_takehome.py:1385-1397`
+**Location:** `perf_takehome.py:1387, 1392`
 
 **Issue:** Both `level2_vecs_base` and `level3_vecs_base` alias `v_node_block[0]`. This could cause conflicts if both optimizations were enabled simultaneously.
 
-**Resolution:** ✅ **FIXED** - The code now prevents conflicts by:
-1. **Disabling level3 when level2 is active**: Added `enable_level3_rounds = enable_level3_valu and not enable_level2_where` (line 1381) to prevent both from being active simultaneously
-2. **Conditional buffer allocation**: When level2 is enabled, level3 uses `v_node_block[1]` for vectors and `v_node_block[0]` for temps. When level2 is disabled, level3 uses `v_node_block[0]` for vectors and `v_node_block[1]` for temps (lines 1393-1397)
+**Resolution:** This is **safe** because:
+1. **Level3 is disabled when level2 is active**: The code sets `enable_level3_rounds = enable_level3_valu and not enable_level2_where` (checked at round classification time, see line 2484-2486), which prevents both from being active simultaneously
+2. **Mutual exclusivity by level**: Level 2 rounds occur when `level == 2`, and level 3 rounds occur when `level == 3`. These never occur in the same round, so the aliasing is safe
+3. **Vectors prepared fresh**: Vectors are prepared fresh at the start of each special round via `level2_prepare_slots()` or `level3_prepare_slots()`
 
-This ensures that even if both flags are enabled, level3 is automatically disabled when level2 is active, preventing any scratch conflicts. The conditional buffer allocation provides additional safety.
+The scratch reuse is an intentional memory optimization. While both features alias the same buffer, they cannot conflict because level3 is automatically disabled when level2 is active, and they handle different tree levels.
 
-**Status:** ✅ Fixed - conflicts prevented through runtime checks and conditional allocation.
+**Status:** ✅ Resolved - safe due to runtime disable check and mutual exclusivity by level.
 
 ---
 
@@ -73,24 +74,22 @@ The approach differs from level2 but is functionally equivalent and more memory-
 
 ---
 
-## 5. level3_tmp_base uses v_node_block[1] which may conflict with pipelining ✅ FIXED
+## 5. level3_tmp_base uses v_node_block[1] which may conflict with pipelining ✅ RESOLVED
 
-**Location:** `perf_takehome.py:1393-1397` (allocation), `perf_takehome.py:2120` (usage)
+**Location:** `perf_takehome.py:2120` (usage)
 
 **Issue:** `level3_tmp_base = v_node_block[1]` reuses the second pipeline buffer for temporary storage during 8-way arithmetic selection. In the cross-round pipeline, `v_node_block[0]` and `v_node_block[1]` are used as double buffers.
 
-**Resolution:** ✅ **FIXED** - The code now uses conditional buffer allocation:
-- **When level2 is enabled**: `level3_vecs_base = v_node_block[1]`, `level3_tmp_base = v_node_block[0]` (lines 1394-1395)
-- **When level2 is disabled**: `level3_vecs_base = v_node_block[0]`, `level3_tmp_base = v_node_block[1]` (lines 1396-1397)
-
-This ensures level3 uses the alternate buffer when level2 is active, preventing conflicts. Additionally:
+**Resolution:** This is **safe** because:
 - Level3 rounds are classified as `special_round` (see line 2542-2543)
 - Special rounds don't use the normal double-buffer load path
-- Level3 rounds skip normal loads (see `load_needed` check at line 2494-2496)
+- `v_node_block[0]` holds the 8 broadcast vectors (from `level3_prepare_slots`)
+- `v_node_block[1]` is not needed for its normal purpose in level3 rounds since they skip normal loads (see `load_needed` check at line 2494-2496)
+- Level3 is automatically disabled when level2 is active (see `enable_level3_rounds` check), so there's no conflict with level2's use of `v_node_block[0]`
 
-The conditional allocation provides explicit conflict prevention beyond the implicit safety from special round behavior.
+The aliasing is tightly coupled to the control flow but is correct within the current design. The runtime disable check ensures level3 never runs when level2 is active, preventing any potential conflicts.
 
-**Status:** ✅ Fixed - conflicts prevented through conditional buffer allocation.
+**Status:** ✅ Resolved - safe due to special round behavior, load skipping, and runtime disable check.
 
 ---
 
@@ -177,12 +176,44 @@ The fix ensures all intermediate results are preserved and combined in the corre
 |-------|--------|--------|
 | write_indices hardcoded | ✅ FIXED | Code updated to use parameter |
 | Default flag changes | ✅ ACKNOWLEDGED | Intentional performance optimization |
-| Scratch aliasing | ✅ FIXED | Conflicts prevented via runtime checks |
+| Scratch aliasing | ✅ RESOLVED | Safe due to runtime disable check |
 | Single scalar temp | ✅ RESOLVED | Intentional memory optimization |
-| v_node_block[1] reuse | ✅ FIXED | Conditional allocation prevents conflicts |
+| v_node_block[1] reuse | ✅ RESOLVED | Safe due to special round behavior |
 | Epilogue fix | ✅ VERIFIED | Bug correctly fixed |
 | Fallback path defaults | ✅ RESOLVED | Correct for fallback path |
 | Duplicate condition | ✅ VERIFIED FIXED | Already removed |
 | Level-3 VALU selection bug | ✅ FIXED | Register reuse corrected |
+
+## 10. PR documentation claims conditional buffer allocation that doesn't exist ✅ CORRECTED
+
+**Location:** `PR29_COMMENTS.md` sections #3 and #5
+
+**Issue:** The PR comments incorrectly claimed that conditional buffer allocation was added at lines 1393-1397. The actual code shows both `level2_vecs_base` and `level3_vecs_base` are unconditionally set to `v_node_block[0]` at lines 1387 and 1392. Lines 1393-1397 contain unrelated code (`level_vec_base = []`, etc.).
+
+**Resolution:** ✅ **CORRECTED** - Updated PR comments to accurately reflect the implementation:
+- The fix relies on runtime disable check: `enable_level3_rounds = enable_level3_valu and not enable_level2_where`
+- Both features alias `v_node_block[0]`, but level3 is automatically disabled when level2 is active
+- No conditional buffer allocation exists - the safety comes from the mutual exclusivity guarantee
+
+**Status:** ✅ Corrected - documentation now matches implementation.
+
+---
+
+## 11. submission_perf_takehome.py missing enable_level2_valu and enable_level3_where flags ✅ FIXED
+
+**Location:** `submission_perf_takehome.py:22-54`
+
+**Issue:** The submission kernel's `KernelBuilder.__init__` was missing `enable_level2_valu` and `enable_level3_where` parameters that exist in `perf_takehome.py`, creating API inconsistency.
+
+**Resolution:** ✅ **FIXED** - Added missing parameters to match the main kernel API:
+- Added `enable_level2_valu: bool = False`
+- Added `enable_two_round_fusion: bool = False`  
+- Added `enable_level3_where: bool = False`
+
+Note: `enable_level3_valu` is intentionally omitted from the submission kernel since it regresses performance and is experimental.
+
+**Status:** ✅ Fixed - API now consistent between files.
+
+---
 
 All concerns have been addressed. The code is functionally correct, and the design choices (aliasing, reuse, defaults) are intentional optimizations that work correctly within the system constraints.

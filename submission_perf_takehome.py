@@ -27,6 +27,9 @@ class KernelBuilder:
         max_arith_level: int = -1,
         enable_prefetch: bool = True,
         enable_level2_where: bool = True,
+        enable_level2_valu: bool = False,
+        enable_two_round_fusion: bool = False,
+        enable_level3_where: bool = False,
         lookahead: int = 1024,
         block_size: int = 16,
         enable_second_pass: bool = False,
@@ -46,6 +49,9 @@ class KernelBuilder:
         self.max_arith_level = max_arith_level
         self.enable_prefetch = enable_prefetch
         self.enable_level2_where = enable_level2_where
+        self.enable_level2_valu = enable_level2_valu
+        self.enable_two_round_fusion = enable_two_round_fusion
+        self.enable_level3_where = enable_level3_where
         self.lookahead = lookahead
         self.block_size = block_size
         self.enable_second_pass = enable_second_pass
