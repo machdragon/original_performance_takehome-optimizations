@@ -4041,13 +4041,17 @@ class Tests(unittest.TestCase):
         kb = KernelBuilder(enable_debug=True, assume_zero_indices=True, max_special_level=4)
         kb.build_kernel(10, len(forest.values), 256, 16)
         
+        # Make a deep copy of mem before running machine (machine modifies mem in-place)
+        import copy
+        mem_copy = copy.deepcopy(mem)
+        
         machine = Machine(mem, kb.instrs, kb.debug_info(), n_cores=N_CORES)
         machine.enable_pause = False
         machine.enable_debug = True
         machine.run()
         
-        # Compare against reference
-        for ref_mem in reference_kernel2(mem):
+        # Compare against reference (using original mem, not modified mem)
+        for ref_mem in reference_kernel2(mem_copy):
             pass
         
         inp_values_p = ref_mem[6]
@@ -4069,13 +4073,17 @@ class Tests(unittest.TestCase):
                 kb = KernelBuilder(enable_debug=False, assume_zero_indices=True, max_special_level=4)
                 kb.build_kernel(forest_height, len(forest.values), batch_size, 16)
                 
+                # Make a deep copy of mem before running machine (machine modifies mem in-place)
+                import copy
+                mem_copy = copy.deepcopy(mem)
+                
                 machine = Machine(mem, kb.instrs, kb.debug_info(), n_cores=N_CORES)
                 machine.enable_pause = False
                 machine.enable_debug = False
                 machine.run()
                 
-                # Compare against reference
-                for ref_mem in reference_kernel2(mem):
+                # Compare against reference (using original mem, not modified mem)
+                for ref_mem in reference_kernel2(mem_copy):
                     pass
                 
                 inp_values_p = ref_mem[6]
