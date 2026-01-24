@@ -30,6 +30,7 @@ class KernelBuilder:
         enable_level2_valu: bool = False,
         enable_two_round_fusion: bool = False,
         enable_level3_where: bool = False,
+        enable_unroll_8: bool = False,
         lookahead: int = 1024,
         block_size: int = 16,
         enable_second_pass: bool = False,
@@ -52,6 +53,7 @@ class KernelBuilder:
         self.enable_level2_valu = enable_level2_valu
         self.enable_two_round_fusion = enable_two_round_fusion
         self.enable_level3_where = enable_level3_where
+        self.enable_unroll_8 = enable_unroll_8
         self.lookahead = lookahead
         self.block_size = block_size
         self.enable_second_pass = enable_second_pass
@@ -1921,17 +1923,49 @@ class KernelBuilder:
             prev_info = None
             prev_use_prefetch = False
 
-            for round in range(rounds):
-                info = round_info[round]
-                use_prefetch = prefetch_active[round]
-                do_prefetch_next = prefetch_next[round]
-                node_prefetch = v_node_prefetch if use_prefetch else None
-
-                special_round = enable_prefetch and (
-                    info["arith_round"] or info["level2_round"]
-                )
-                level2_prep = level2_prepare_slots() if info["level2_round"] else []
-                level2_prepared = False
+            if self.enable_unroll_8 and rounds == 8:
+                for unroll_r in range(8):
+                    r=unroll_r;info=round_info[r];up=prefetch_active[r];dpn=prefetch_next[r];np=v_node_prefetch if up else None
+                    sr=enable_prefetch and(info["arith_round"]or info["level2_round"]);l2p=level2_prepare_slots()if info["level2_round"]else[];l2pd=False
+                    if pending_prev:
+                        lb=last_block_idx%2;pnp=v_node_prefetch if prev_use_prefetch else None
+                        hp=vec_block_hash_only_slots(last_block_vecs,lb,prev_info["wrap_round"],prev_info["node_const"],prev_info["node_pair"],prev_info["node_arith"],pnp,prev_info["level2_round"])
+                        if info["level2_round"]:body.extend(interleave_slots(hp,l2p));l2pd=True
+                        elif sr:body.extend(hp)
+                        else:
+                            ls=vec_block_load_slots(block_0_vecs,0,info["node_const"],info["node_pair"],info["node_arith"],np,info.get("level2_round",False),info["round"])
+                            body.extend(interleave_slots(hp,ls))
+                    if info["level2_round"] and not l2pd:body.extend(l2p);l2pd=True
+                    if sr:
+                        body.extend(vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"]))
+                        for bi in range(1,num_blocks):
+                            b=bi%2;hs=vec_block_hash_only_slots(all_block_vecs[bi],b,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"])
+                            ls=vec_block_prefetch_slots(all_block_vecs[0],v_node_prefetch)if dpn and bi==1 else[]
+                            body.extend(interleave_slots(hs,ls))
+                        pending_prev=False
+                    else:
+                        sb=1
+                        if up:
+                            hs=vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"])
+                            ls=vec_block_load_slots(all_block_vecs[1],1,info["node_const"],info["node_pair"],info["node_arith"])
+                            body.extend(interleave_slots(hs,ls));sb=2
+                        elif not pending_prev:body.extend(vec_block_load_slots(block_0_vecs,0,info["node_const"],info["node_pair"],info["node_arith"]))
+                        for bi in range(sb,num_blocks):
+                            pb=(bi-1)%2;cb=bi%2
+                            hs=vec_block_hash_only_slots(all_block_vecs[bi-1],pb,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],None,info["level2_round"])
+                            ls=vec_block_load_slots(all_block_vecs[bi],cb,info["node_const"],info["node_pair"],info["node_arith"])
+                            body.extend(interleave_slots(hs,ls))
+                        pending_prev=True
+                    prev_info=info;prev_use_prefetch=False
+            else:
+                for round in range(rounds):
+                    info = round_info[round]
+                    use_prefetch = prefetch_active[round]
+                    do_prefetch_next = prefetch_next[round]
+                    node_prefetch = v_node_prefetch if use_prefetch else None
+                    special_round = enable_prefetch and (info["arith_round"] or info["level2_round"])
+                    level2_prep = level2_prepare_slots() if info["level2_round"] else []
+                    level2_prepared = False
 
                 if pending_prev:
                     last_buf = last_block_idx % 2
@@ -2059,9 +2093,8 @@ class KernelBuilder:
                         body.extend(interleave_slots(hash_slots, load_slots))
                     pending_prev = True
 
-                prev_info = info
-
-                prev_use_prefetch = False
+                    prev_info = info
+                    prev_use_prefetch = False
 
             if pending_prev:
                 last_buf = last_block_idx % 2
