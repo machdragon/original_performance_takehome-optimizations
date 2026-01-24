@@ -1567,16 +1567,34 @@ class KernelBuilder:
         ]
         v_tmp1_block = self.alloc_scratch("v_tmp1_block", block_size * VLEN)
         v_tmp2_block = self.alloc_scratch("v_tmp2_block", block_size * VLEN)
-        v_tmp3_block = self.alloc_scratch("v_tmp3_block", block_size * VLEN)
-        v_tmp4_block = None
-        if enable_arith:
-            v_tmp4_block = self.alloc_scratch("v_tmp4_block", block_size * VLEN)
-
+        
         # Level 2 where-tree selection (optional): load 4 nodes once per round, vselect per vector.
         enable_level2_where = self.enable_level2_where
         enable_level2_valu = self.enable_level2_valu
         enable_level3_valu = self.enable_level3_valu
         enable_level3_where = self.enable_level3_where
+        
+        # Alias v_tmp3_block unless features that truly need it are enabled.
+        # This frees 128 words in the common path (block_size=16).
+        enable_level4_where = (
+            forest_height == 10
+            and rounds == 16
+            and batch_size == 256
+            and block_size >= 16
+        )
+        need_tmp3_block = (
+            enable_arith
+            or enable_level2_valu
+            or enable_level3_where
+            or enable_level4_where
+        )
+        if need_tmp3_block:
+            v_tmp3_block = self.alloc_scratch("v_tmp3_block", block_size * VLEN)
+        else:
+            v_tmp3_block = v_tmp2_block
+        v_tmp4_block = None
+        if enable_arith:
+            v_tmp4_block = self.alloc_scratch("v_tmp4_block", block_size * VLEN)
         enable_level4_valu = self.enable_level4_valu
         level2_base_addr_const = self.scratch_const(3)
         level2_vecs_base = v_node_block[0]  # Reuse v_node_block[0] for the 4 level-2 vectors.
