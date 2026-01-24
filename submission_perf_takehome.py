@@ -246,6 +246,9 @@ class KernelBuilder:
                 skipped_writes.update(writes)
             return None
 
+        recent_load_history = []  # Track loads from previous bundles for latency-aware scheduling
+        LOAD_LATENCY = 1  # Loads are available 1 cycle after issue
+        
         i = 0
         while i < len(slots_info):
             info = slots_info[i]
@@ -259,14 +262,25 @@ class KernelBuilder:
             barrier = info["barrier"]
 
             if barrier:
+                # Track loads before flush
+                if self.enable_latency_aware:
+                    if "load" in bundle:
+                        recent_load_history.append(set(bundle_writes))
+                        if len(recent_load_history) > LOAD_LATENCY:
+                            recent_load_history.pop(0)
                 flush()
                 instrs.append({engine: [slot]})
                 i += 1
                 continue
 
             recent_loads = set()
-            if self.enable_latency_aware and "load" in bundle:
-                recent_loads = bundle_writes
+            if self.enable_latency_aware:
+                # Track loads from current bundle
+                if "load" in bundle:
+                    recent_loads.update(bundle_writes)
+                # Track loads from previous bundles (latency)
+                for prev_loads in recent_load_history:
+                    recent_loads.update(prev_loads)
 
             if engine != "load" and bundle_loads() < SLOT_LIMITS["load"]:
                 while bundle_loads() < SLOT_LIMITS["load"]:
@@ -322,6 +336,12 @@ class KernelBuilder:
             add_to_bundle(info)
             i += 1
 
+        # Track loads before final flush
+        if self.enable_latency_aware:
+            if "load" in bundle:
+                recent_load_history.append(set(bundle_writes))
+                if len(recent_load_history) > LOAD_LATENCY:
+                    recent_load_history.pop(0)
         flush()
 
         if False and self.enable_combining:
@@ -391,32 +411,92 @@ class KernelBuilder:
         if self.enable_second_pass:
             for i in range(len(instrs)):
                 bundle = instrs[i].copy()
-
+                
+                # Extract slots by engine
                 load_slots = bundle.pop("load", [])
                 valu_slots = bundle.pop("valu", [])
                 alu_slots = bundle.pop("alu", [])
                 store_slots = bundle.pop("store", [])
                 flow_slots = bundle.pop("flow", [])
                 debug_slots = bundle.pop("debug", [])
-
+                
+                # Build dependency graph for reordering
+                all_slots = []
+                slot_deps = {}  # slot -> set of dependencies (reads)
+                slot_writes = {}  # slot -> set of writes
+                
+                for slot in load_slots:
+                    reads, writes, _ = self._slot_reads_writes("load", slot)
+                    all_slots.append(("load", slot))
+                    slot_deps[("load", slot)] = reads
+                    slot_writes[("load", slot)] = writes
+                for slot in valu_slots:
+                    reads, writes, _ = self._slot_reads_writes("valu", slot)
+                    all_slots.append(("valu", slot))
+                    slot_deps[("valu", slot)] = reads
+                    slot_writes[("valu", slot)] = writes
+                for slot in alu_slots:
+                    reads, writes, _ = self._slot_reads_writes("alu", slot)
+                    all_slots.append(("alu", slot))
+                    slot_deps[("alu", slot)] = reads
+                    slot_writes[("alu", slot)] = writes
+                for slot in store_slots:
+                    reads, writes, _ = self._slot_reads_writes("store", slot)
+                    all_slots.append(("store", slot))
+                    slot_deps[("store", slot)] = reads
+                    slot_writes[("store", slot)] = writes
+                for slot in flow_slots:
+                    reads, writes, _ = self._slot_reads_writes("flow", slot)
+                    all_slots.append(("flow", slot))
+                    slot_deps[("flow", slot)] = reads
+                    slot_writes[("flow", slot)] = writes
+                
+                # Topological sort: prioritize loads, then VALU, then ALU, respecting dependencies
+                reordered_slots = []
+                remaining = set(all_slots)
+                scheduled_writes = set()
+                
+                def can_schedule(slot_info):
+                    engine, slot = slot_info
+                    deps = slot_deps[slot_info]
+                    # Can schedule if all dependencies are satisfied (all deps are in scheduled_writes)
+                    return deps.issubset(scheduled_writes)
+                
+                # Priority order: load > valu > alu > store > flow
+                engine_priority = {"load": 0, "valu": 1, "alu": 2, "store": 3, "flow": 4}
+                
+                while remaining:
+                    # Find schedulable slots, prioritizing by engine
+                    candidates = [s for s in remaining if can_schedule(s)]
+                    if not candidates:
+                        # No dependencies satisfied, schedule any (shouldn't happen if bundler is correct)
+                        candidates = list(remaining)
+                    
+                    # Sort by engine priority
+                    candidates.sort(key=lambda s: engine_priority.get(s[0], 99))
+                    next_slot = candidates[0]
+                    
+                    engine, slot = next_slot
+                    reordered_slots.append((engine, slot))
+                    remaining.remove(next_slot)
+                    scheduled_writes.update(slot_writes[next_slot])
+                
+                # Rebuild bundle in dependency order, respecting slot limits
                 reordered = {}
-                if load_slots:
-                    reordered["load"] = load_slots[:SLOT_LIMITS["load"]]
-                if valu_slots:
-                    reordered["valu"] = valu_slots[:SLOT_LIMITS["valu"]]
-                if alu_slots:
-                    reordered["alu"] = alu_slots[:SLOT_LIMITS["alu"]]
-                if store_slots:
-                    reordered["store"] = store_slots[:SLOT_LIMITS["store"]]
-                if flow_slots:
-                    reordered["flow"] = flow_slots[:SLOT_LIMITS["flow"]]
+                for engine, slot in reordered_slots:
+                    engine_list = reordered.setdefault(engine, [])
+                    if len(engine_list) < SLOT_LIMITS.get(engine, 999):
+                        engine_list.append(slot)
+                
+                # Add debug slots (no limits)
                 if debug_slots:
                     reordered["debug"] = debug_slots
-
+                
+                # Add any remaining slots that didn't fit (shouldn't happen)
                 for engine, slots in bundle.items():
                     if slots:
                         reordered.setdefault(engine, []).extend(slots)
-
+                
                 instrs[i] = reordered
 
         return instrs

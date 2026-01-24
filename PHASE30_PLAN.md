@@ -1,93 +1,69 @@
-# Phase-30 and Phase-31 Optimization Plans
+# Phase-30 Optimization Plan
 
-This document outlines planned optimization work for phases 30 and 31, building on the level 4 precompute + vselect integration completed in phase-29.
+## Current State
+- **Current cycles**: 1865 (from submission test)
+- **Target**: <1487 cycles (need to save 378 cycles)
+- **Level 4 precompute**: Disabled (performance analysis showed it makes things worse)
 
-## Phase-30: Further Optimizations Based on Phase-29 Insights
+## Phase-30 Objectives
 
-### Objectives
-- Analyze performance impact of level 4 precompute + vselect integration
-- Identify bottlenecks and optimization opportunities
-- Extend optimizations to additional levels if beneficial
-
-### Planned Work
-
-1. **Performance Analysis**
-   - Measure cycle count improvement from level 4 precompute
-   - Analyze vselect tree overhead vs. gather load savings
-   - Profile instruction mix and slot utilization
-   - Identify remaining hot paths
-
-2. **Potential Extensions**
-   - Evaluate level 5 precompute feasibility (32 nodes, scratch space constraints)
-   - Consider partial precompute strategies for deeper levels
-   - Analyze trade-offs between precompute cost and runtime savings
-
-3. **Optimization Opportunities**
-   - Further reduce gather loads for levels 2-3 using similar techniques
-   - Optimize vselect tree scheduling and instruction packing
-   - Improve scratch space utilization
-   - Explore hybrid approaches (precompute + gather for different levels)
-
-4. **Code Refinement**
-   - Refactor common patterns between level optimizations
-   - Improve code maintainability
-   - Add more comprehensive tests
-
-## Phase-31: Advanced Optimizations
-
-### Objectives
-- Optimize vselect tree implementation
-- Improve loop unrolling and instruction-level parallelism
-- Complete integration across all precomputed levels
-- Extend optimizations to lower tree levels
+### Primary Focus: Gather Pressure Reduction
+The highest-potential optimization is reducing gather loads through deduplication for early rounds where index uniqueness is low.
 
 ### Planned Work
 
-1. **Optimize vselect tree depth**
-   - Reduce vselect tree layers where possible
-   - Optimize selection logic for better instruction packing
-   - Minimize temporary scratch space usage
-   - Improve VLIW slot utilization in vselect operations
+1. **Gather Load Analysis**
+   - Analyze index uniqueness per round (especially rounds 1-3, 12-14)
+   - Measure current gather load counts
+   - Identify rounds with highest deduplication potential
+   - Estimate cycle savings from eliminating duplicate loads
 
-2. **Unroll vec_count loops**
-   - Unroll vector count loops for better instruction-level parallelism
-   - Reduce loop overhead and improve branch prediction
-   - Enable better VLIW bundling opportunities
-   - Balance code size vs. performance gains
+2. **Gather Deduplication Implementation**
+   - For rounds with low uniqueness (e.g., level 2-4):
+     - Load unique values once into scratch cache
+     - Reuse cached values for duplicate indices
+     - Avoid redundant `load_offset` instructions
+   - Key insight: Early rounds (1-3) and wrap rounds (12-14) have low uniqueness
+   - Potential savings: 300-500 cycles (from PHASE19_PLAN analysis)
 
-3. **Integrate vselect for precomputed levels**
-   - Complete integration of vselect tree usage across all precomputed levels (not just level 4)
-   - Ensure consistent handling for levels 0-4
-   - Optimize per-level vselect tree parameters
-   - Share common vselect infrastructure
+3. **Bundler Refinements** (if time permits)
+   - Add latency-aware scheduling rules
+   - Second-pass reorder within bundles to keep load limits saturated
+   - Small unroll factors to increase ILP
 
-4. **Optimize lower tree levels**
-   - Apply similar precompute/vselect optimizations to lower tree levels (levels 5+)
-   - Evaluate scratch space constraints for deeper levels
-   - Consider partial precompute strategies (e.g., precompute only frequently accessed nodes)
-   - Implement adaptive strategies based on tree height and batch size
+4. **Structure-Aware Optimizations** (future)
+   - 2-round jump composition (combine two traversal steps)
+   - Memoization at upper levels where lanes converge
 
-### Implementation Notes
+## Implementation Strategy
 
-- **Scratch space management**: Monitor scratch usage carefully as optimizations are added
-- **Performance vs. complexity**: Balance optimization gains against code complexity
-- **Testing**: Ensure all optimizations pass correctness tests
-- **Benchmarking**: Measure impact on target benchmark (10, 16, 256)
+### Step 1: Analyze Gather Patterns
+- Add instrumentation to count unique indices per round
+- Measure gather load frequency
+- Identify hot rounds for optimization
 
-### Success Criteria
+### Step 2: Implement Deduplication Cache
+- Allocate scratch space for unique value cache (per round)
+- For each round, collect unique indices
+- Load unique values once, broadcast to matching indices
+- Reuse cached values instead of redundant loads
 
-- [ ] Phase-30: Performance analysis completed, insights documented
-- [ ] Phase-30: At least one additional optimization identified and implemented
-- [ ] Phase-31: Vselect tree depth optimized
-- [ ] Phase-31: Vec_count loops unrolled where beneficial
-- [ ] Phase-31: Vselect integration complete for all precomputed levels
-- [ ] Phase-31: Lower tree level optimizations evaluated and implemented if beneficial
-- [ ] All optimizations pass correctness tests
-- [ ] Performance improvements measured and documented
+### Step 3: Test and Measure
+- Verify correctness with submission test harness
+- Measure cycle count improvement
+- Profile to ensure no regressions
+
+## Success Criteria
+
+- [ ] Gather load analysis completed
+- [ ] Gather deduplication implemented for at least rounds 1-3
+- [ ] Correctness tests pass
+- [ ] Performance improvement measured (target: save 100+ cycles)
+- [ ] Code documented and maintainable
 
 ## Notes
 
-- These phases build directly on phase-29's level 4 precompute + vselect work
-- Focus should be on measurable performance improvements while maintaining correctness
-- Consider trade-offs between optimization complexity and performance gains
-- Keep code maintainable and well-tested
+- Previous attempt at gather deduplication (arith selection) regressed due to pipeline breaking
+- Need to ensure deduplication doesn't break load/VALU overlap
+- Focus on rounds with highest deduplication potential first
+- Keep implementation simple and testable
