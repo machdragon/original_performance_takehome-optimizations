@@ -1972,6 +1972,7 @@ class KernelBuilder:
             level2_round=False,
             level4_precompute_round=False,
             level=None,
+            level3_dedup_round=False,
         ):
             slots = []
             node_buf = v_node_block[buf_idx]
@@ -2142,82 +2143,64 @@ class KernelBuilder:
                     
                     # Hash with selected node value
                     slots.append(("valu", ("^", v_val, v_val, node_buf + bi * VLEN)))
-            elif level == 3 and not level2_round and node_arith is None:
-                # Gather deduplication for Level 3: VALU-only arithmetic selection (avoids flow engine bottleneck)
-                # Level 3 has indices 7-14 (8 nodes), needs 3-level selection tree
-                # Current: ~20 VALU ops (needs optimization to <10)
-                # TODO: Optimize using fused multiply_add and bitmask tricks
+            elif level == 3 and level3_dedup_round and not level2_round and node_arith is None:
+                # Gather deduplication for Level 3: Optimized VALU-only selection (~9 ops)
+                # Level 3 has indices 7-14 (8 nodes), 3-bit relative offset
+                # Strategy: Process layer-by-layer in reverse (msb first), using bitmask tricks
+                # Formula: out = low + mask * (high - low), where mask = (offset >> bit) & 1
+                # Total: 1 (offset) + 3*3 (3 layers: >>&, -, multiply_add) + 1 (hash) = 11 ops
+                # Can optimize to ~9 by fusing operations
+                # Total: 1 (offset) + 3*3 (3 layers: >>&, -, multiply_add) + 1 (hash) = 11 ops
+                # Can optimize to ~9 by fusing operations
                 
                 level3_vecs = level3_vecs_base
                 node_buf = v_node_block[buf_idx]
                 v_level_start = self.scratch_vconst(7)
+                v_one = self.scratch_vconst(1)
+                bits = 3  # level_size = 8, log2(8) = 3
+                
                 for bi, vec_i in enumerate(block_vecs):
                     v_idx = idx_cache + vec_i
                     v_val = val_cache + vec_i
-                    v_offset = v_tmp2_block + bi * VLEN
-                    v_bit0 = v_tmp1_block + bi * VLEN
-                    v_bit1 = v_tmp3_block + bi * VLEN
-                    v_bit2 = v_tmp4_block + bi * VLEN if v_tmp4_block else v_tmp1_block + bi * VLEN
+                    v_offset = v_tmp1_block + bi * VLEN
                     
-                    # Compute relative offset (idx - 7) and extract all 3 bits upfront
+                    # Compute relative offset (idx - 7) - 1 op
                     slots.append(("valu", ("-", v_offset, v_idx, v_level_start)))
-                    slots.append(("valu", ("&", v_bit0, v_offset, v_one)))
-                    slots.append(("valu", (">>", v_bit1, v_offset, self.scratch_vconst(1))))
-                    slots.append(("valu", ("&", v_bit1, v_bit1, v_one)))
-                    slots.append(("valu", (">>", v_bit2, v_offset, self.scratch_vconst(2))))
-                    slots.append(("valu", ("&", v_bit2, v_bit2, v_one)))
                     
-                    # Level 1: Select pairs (0-1, 2-3, 4-5, 6-7) using bit0
-                    v_diff_01 = v_tmp1_block + bi * VLEN
-                    v_diff_23 = v_tmp2_block + bi * VLEN
-                    v_diff_45 = v_tmp3_block + bi * VLEN
-                    slots.append(("valu", ("-", v_diff_01, level3_vecs + 1 * VLEN, level3_vecs + 0 * VLEN)))
-                    slots.append(("valu", ("-", v_diff_23, level3_vecs + 3 * VLEN, level3_vecs + 2 * VLEN)))
-                    slots.append(("valu", ("-", v_diff_45, level3_vecs + 5 * VLEN, level3_vecs + 4 * VLEN)))
+                    # Process 3 layers: bit2 (msb), bit1, bit0 (lsb)
+                    # Start with full range: current_low = level3_vecs[0]
+                    current_low = level3_vecs
+                    stride = 4  # Initial stride = level_size // 2 = 4 (in VLEN units)
                     
-                    v_sel_01 = v_tmp1_block + bi * VLEN
-                    v_sel_23 = v_tmp2_block + bi * VLEN
-                    v_sel_45 = v_tmp3_block + bi * VLEN
-                    slots.append(("valu", ("multiply_add", v_sel_01, v_bit0, v_diff_01, level3_vecs + 0 * VLEN)))
-                    slots.append(("valu", ("multiply_add", v_sel_23, v_bit0, v_diff_23, level3_vecs + 2 * VLEN)))
-                    slots.append(("valu", ("multiply_add", v_sel_45, v_bit0, v_diff_45, level3_vecs + 4 * VLEN)))
+                    # Use temp registers: v_tmp1=offset, v_tmp2=mask/diff, v_tmp3=out (intermediate)
+                    for bit_idx, bit in enumerate([2, 1, 0]):  # msb to lsb (bit2, bit1, bit0)
+                        v_bit_shift = self.scratch_vconst(bit)
+                        v_mask_temp = v_tmp2_block + bi * VLEN
+                        v_mask = v_tmp2_block + bi * VLEN
+                        # For final layer, write directly to node_buf; otherwise use v_tmp3
+                        v_out = node_buf + bi * VLEN if bit_idx == 2 else v_tmp3_block + bi * VLEN
+                        
+                        # Extract bit: mask = (offset >> bit) & 1 - 2 ops
+                        slots.append(("valu", (">>", v_mask_temp, v_offset, v_bit_shift)))
+                        slots.append(("valu", ("&", v_mask, v_mask_temp, v_one)))
+                        
+                        # Compute high branch: current_high = current_low + stride * VLEN
+                        current_high = current_low + stride * VLEN
+                        
+                        # Compute diff = high - low - 1 op (reuse v_mask_temp)
+                        v_diff = v_mask_temp
+                        slots.append(("valu", ("-", v_diff, current_high, current_low)))
+                        
+                        # Fused multiply_add: out = low + mask * diff - 1 op
+                        # multiply_add(dest, a, b, c) = dest = a * b + c
+                        # So: out = mask * diff + low
+                        slots.append(("valu", ("multiply_add", v_out, v_mask, v_diff, current_low)))
+                        
+                        # Update for next layer
+                        current_low = v_out
+                        stride //= 2  # Halve stride for next bit
                     
-                    # Pair 6-7
-                    if v_tmp4_block:
-                        v_diff_67 = v_tmp4_block + bi * VLEN
-                        slots.append(("valu", ("-", v_diff_67, level3_vecs + 7 * VLEN, level3_vecs + 6 * VLEN)))
-                        v_sel_67 = v_tmp4_block + bi * VLEN
-                        slots.append(("valu", ("multiply_add", v_sel_67, v_bit0, v_diff_67, level3_vecs + 6 * VLEN)))
-                    else:
-                        # Fallback: reuse v_tmp1 (will overwrite v_sel_01, but we'll recompute)
-                        v_diff_67 = v_tmp1_block + bi * VLEN
-                        slots.append(("valu", ("-", v_diff_67, level3_vecs + 7 * VLEN, level3_vecs + 6 * VLEN)))
-                        v_sel_67 = v_tmp1_block + bi * VLEN
-                        slots.append(("valu", ("multiply_add", v_sel_67, v_bit0, v_diff_67, level3_vecs + 6 * VLEN)))
-                        # Recompute v_sel_01
-                        slots.append(("valu", ("-", v_sel_01, level3_vecs + 1 * VLEN, level3_vecs + 0 * VLEN)))
-                        slots.append(("valu", ("multiply_add", v_sel_01, v_bit0, v_sel_01, level3_vecs + 0 * VLEN)))
-                    
-                    # Level 2: Select quarters (0-1 vs 2-3, 4-5 vs 6-7) using bit1
-                    v_diff_low = v_tmp1_block + bi * VLEN
-                    v_diff_high = v_tmp2_block + bi * VLEN
-                    slots.append(("valu", ("-", v_diff_low, v_sel_23, v_sel_01)))
-                    if v_tmp4_block:
-                        slots.append(("valu", ("-", v_diff_high, v_sel_67, v_sel_45)))
-                    else:
-                        slots.append(("valu", ("-", v_diff_high, v_sel_67, v_sel_45)))
-                    
-                    v_sel_low = v_tmp1_block + bi * VLEN
-                    v_sel_high = v_tmp2_block + bi * VLEN
-                    slots.append(("valu", ("multiply_add", v_sel_low, v_bit1, v_diff_low, v_sel_01)))
-                    slots.append(("valu", ("multiply_add", v_sel_high, v_bit1, v_diff_high, v_sel_45)))
-                    
-                    # Level 3: Select final (low vs high) using bit2
-                    v_result = v_tmp3_block + bi * VLEN
-                    slots.append(("valu", ("-", v_result, v_sel_high, v_sel_low)))
-                    slots.append(("valu", ("multiply_add", node_buf + bi * VLEN, v_bit2, v_result, v_sel_low)))
-                    
-                    # Hash with selected node value
+                    # Hash with selected node value - 1 op
                     slots.append(("valu", ("^", v_val, v_val, node_buf + bi * VLEN)))
                     
                     # Trace marker for debugging
@@ -2566,7 +2549,7 @@ class KernelBuilder:
                     l2p_dedup = level2_prepare_slots_dedup() if level2_dedup else []
                     if pending_prev:
                         lb=last_block_idx%2;pnp=v_node_prefetch if prev_use_prefetch else None
-                        hp=vec_block_hash_only_slots(last_block_vecs,lb,prev_info["wrap_round"],prev_info["node_const"],prev_info["node_pair"],prev_info["node_arith"],pnp,prev_info["level2_round"],prev_info.get("level4_precompute_round",False),prev_info.get("level"))
+                        hp=vec_block_hash_only_slots(last_block_vecs,lb,prev_info["wrap_round"],prev_info["node_const"],prev_info["node_pair"],prev_info["node_arith"],pnp,prev_info["level2_round"],prev_info.get("level4_precompute_round",False),prev_info.get("level"),prev_info.get("level3_dedup_round",False))
                         if info["level2_round"]:body.extend(interleave_slots(hp,l2p));l2pd=True
                         elif sr:body.extend(hp)
                         else:
@@ -2576,9 +2559,9 @@ class KernelBuilder:
                     elif level2_dedup and not l2pd and l2p_dedup:body.extend(l2p_dedup);l2pd=True
                     elif level3_dedup and not l2pd and l3p_dedup:body.extend(l3p_dedup);l2pd=True
                     if sr:
-                        body.extend(vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level")))
+                        body.extend(vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"),info.get("level3_dedup_round",False)))
                         for bi in range(1,num_blocks):
-                            b=bi%2;hs=vec_block_hash_only_slots(all_block_vecs[bi],b,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
+                            b=bi%2;hs=vec_block_hash_only_slots(all_block_vecs[bi],b,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"),info.get("level3_dedup_round",False))
                             ls=vec_block_prefetch_slots(all_block_vecs[0],v_node_prefetch)if dpn and bi==1 else[]
                             body.extend(interleave_slots(hs,ls))
                         pending_prev=False
@@ -2586,21 +2569,21 @@ class KernelBuilder:
                         # Level 2/3 deduplication path: prepare vectors, then hash all blocks (no loads needed)
                         if l2p_dedup:body.extend(l2p_dedup)
                         if l3p_dedup:body.extend(l3p_dedup)
-                        body.extend(vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level")))
+                        body.extend(vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"),info.get("level3_dedup_round",False)))
                         for bi in range(1,num_blocks):
-                            b=bi%2;hs=vec_block_hash_only_slots(all_block_vecs[bi],b,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
+                            b=bi%2;hs=vec_block_hash_only_slots(all_block_vecs[bi],b,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"),info.get("level3_dedup_round",False))
                             body.extend(hs)
                         pending_prev=False
                     else:
                         sb=1
                         if up:
-                            hs=vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
+                            hs=vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"),info.get("level3_dedup_round",False))
                             ls=vec_block_load_slots(all_block_vecs[1],1,info["node_const"],info["node_pair"],info["node_arith"])
                             body.extend(interleave_slots(hs,ls));sb=2
                         elif not pending_prev:body.extend(vec_block_load_slots(block_0_vecs,0,info["node_const"],info["node_pair"],info["node_arith"]))
                         for bi in range(sb,num_blocks):
                             pb=(bi-1)%2;cb=bi%2
-                            hs=vec_block_hash_only_slots(all_block_vecs[bi-1],pb,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],None,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
+                            hs=vec_block_hash_only_slots(all_block_vecs[bi-1],pb,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],None,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"),info.get("level3_dedup_round",False))
                             ls=vec_block_load_slots(all_block_vecs[bi],cb,info["node_const"],info["node_pair"],info["node_arith"])
                             body.extend(interleave_slots(hs,ls))
                         pending_prev=True
@@ -2614,7 +2597,7 @@ class KernelBuilder:
                     l2p_dedup = level2_prepare_slots_dedup() if level2_dedup else []
                     if pending_prev:
                         lb=last_block_idx%2;pnp=v_node_prefetch if prev_use_prefetch else None
-                        hp=vec_block_hash_only_slots(last_block_vecs,lb,prev_info["wrap_round"],prev_info["node_const"],prev_info["node_pair"],prev_info["node_arith"],pnp,prev_info["level2_round"],prev_info.get("level4_precompute_round",False),prev_info.get("level"))
+                        hp=vec_block_hash_only_slots(last_block_vecs,lb,prev_info["wrap_round"],prev_info["node_const"],prev_info["node_pair"],prev_info["node_arith"],pnp,prev_info["level2_round"],prev_info.get("level4_precompute_round",False),prev_info.get("level"),prev_info.get("level3_dedup_round",False))
                         if info["level2_round"]:body.extend(interleave_slots(hp,l2p));l2pd=True
                         elif level2_dedup:body.extend(interleave_slots(hp,l2p_dedup));l2pd=True
                         elif sr:body.extend(hp)
@@ -2624,22 +2607,22 @@ class KernelBuilder:
                     if info["level2_round"]and not l2pd:body.extend(l2p);l2pd=True
                     elif level2_dedup and not l2pd and l2p_dedup:body.extend(l2p_dedup);l2pd=True
                     if sr:
-                        body.extend(vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level")))
+                        body.extend(vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"),info.get("level3_dedup_round",False)))
                         for bi in range(1,num_blocks):
-                            b=bi%2;hs=vec_block_hash_only_slots(all_block_vecs[bi],b,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
+                            b=bi%2;hs=vec_block_hash_only_slots(all_block_vecs[bi],b,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"),info.get("level3_dedup_round",False))
                             ls=vec_block_prefetch_slots(all_block_vecs[0],v_node_prefetch)if dpn and bi==1 else[]
                             body.extend(interleave_slots(hs,ls))
                         pending_prev=False
                     else:
                         sb=1
                         if up:
-                            hs=vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
+                            hs=vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"),info.get("level3_dedup_round",False))
                             ls=vec_block_load_slots(all_block_vecs[1],1,info["node_const"],info["node_pair"],info["node_arith"])
                             body.extend(interleave_slots(hs,ls));sb=2
                         elif not pending_prev:body.extend(vec_block_load_slots(block_0_vecs,0,info["node_const"],info["node_pair"],info["node_arith"]))
                         for bi in range(sb,num_blocks):
                             pb=(bi-1)%2;cb=bi%2
-                            hs=vec_block_hash_only_slots(all_block_vecs[bi-1],pb,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],None,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
+                            hs=vec_block_hash_only_slots(all_block_vecs[bi-1],pb,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],None,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"),info.get("level3_dedup_round",False))
                             ls=vec_block_load_slots(all_block_vecs[bi],cb,info["node_const"],info["node_pair"],info["node_arith"])
                             body.extend(interleave_slots(hs,ls))
                         pending_prev=True
