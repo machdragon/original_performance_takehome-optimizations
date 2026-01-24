@@ -1838,4 +1838,185 @@ class KernelBuilder:
             level4_precompute_round=False,
             level=None,
         ):
+            slots = []
+            node_buf = v_node_block[buf_idx]
 
+            if level4_precompute_round and level is not None and level in upper_levels and len(upper_levels) > 0 and len(block_vecs) <= VLEN:
+                level_base = upper_levels[level]
+                level_size = 1 << level
+                level_start = (1 << level) - 1 if level > 0 else 0
+                v_level_start = self.scratch_vconst(level_start)
+                for bi, vec_i in enumerate(block_vecs):
+                    v_idx = idx_cache + vec_i
+                    v_val = val_cache + vec_i
+                    relative_idx_vec = v_tmp1_block + bi * VLEN
+                    slots.append(("valu", ("-", relative_idx_vec, v_idx, v_level_start)))
+                    tree_temp_base = v_tmp2_block
+                    final_temp = v_node_block[0] + bi * VLEN
+                    final_out, tree_slots = self.build_vselect_tree_reuse(
+                        level_base, relative_idx_vec, level_size, 
+                        tree_temp_base, final_temp,
+                        0,
+                        vec_i // VLEN
+                    )
+                    slots.extend(tree_slots)
+                    slots.append(("valu", ("^", v_val, v_val, final_out)))
+            elif level4_precompute_round and (level is None or level not in upper_levels or len(upper_levels) == 0):
+                for bi, vec_i in enumerate(block_vecs):
+                    v_idx = idx_cache + vec_i
+                    v_val = val_cache + vec_i
+                    slots.append(("valu", ("+", v_addr[0], v_idx, v_forest_p)))
+                    for lane in range(VLEN):
+                        slots.append(("load", ("load_offset", node_buf + bi * VLEN, v_addr[0], lane)))
+                    slots.append(("valu", ("^", v_val, v_val, node_buf + bi * VLEN)))
+            elif level2_round:
+                node0 = level2_vecs_base
+                node1 = level2_vecs_base + VLEN
+                node2 = level2_vecs_base + 2 * VLEN
+                node3 = level2_vecs_base + 3 * VLEN
+                v_level_start = self.scratch_vconst(3)
+                for bi, vec_i in enumerate(block_vecs):
+                    v_idx = idx_cache + vec_i
+                    v_val = val_cache + vec_i
+                    v_offset = v_tmp1_block + bi * VLEN
+                    v_go_left1 = v_tmp2_block + bi * VLEN
+                    v_left = v_tmp3_block + bi * VLEN
+                    slots.append(("valu", ("-", v_offset, v_idx, v_level_start)))
+                    slots.append(("valu", ("<", v_go_left1, v_offset, v_two)))
+                    slots.append(("valu", ("<", v_left, v_offset, v_one)))
+                    slots.append(("flow", ("vselect", v_left, v_left, node0, node1)))
+                    slots.append(("valu", ("-", v_offset, v_offset, v_two)))
+                    slots.append(("valu", ("<", v_offset, v_offset, v_one)))
+                    slots.append(("flow", ("vselect", v_offset, v_offset, node2, node3)))
+                    slots.append(("flow", ("vselect", v_offset, v_go_left1, v_left, v_offset)))
+                    slots.append(("valu", ("^", v_val, v_val, v_offset)))
+            elif node_const is not None:
+                for _bi, vec_i in enumerate(block_vecs):
+                    v_val = val_cache + vec_i
+                    slots.append(("valu", ("^", v_val, v_val, node_const)))
+            elif node_pair is not None:
+                if self.enable_level2_where and v_level1_left is not None:
+                    node_right, _node_diff = node_pair
+                    for bi, vec_i in enumerate(block_vecs):
+                        v_idx = idx_cache + vec_i
+                        slots.append(
+                            ("valu", ("&", v_tmp1_block + bi * VLEN, v_idx, v_one))
+                        )
+                    for bi, _vec_i in enumerate(block_vecs):
+                        slots.append(
+                            (
+                                "flow",
+                                (
+                                    "vselect",
+                                    v_tmp3_block + bi * VLEN,
+                                    v_tmp1_block + bi * VLEN,
+                                    v_level1_left,
+                                    node_right,
+                                ),
+                            )
+                        )
+                    for bi, vec_i in enumerate(block_vecs):
+                        v_val = val_cache + vec_i
+                        slots.append(
+                            ("valu", ("^", v_val, v_val, v_tmp3_block + bi * VLEN))
+                        )
+                else:
+                    node_right, node_diff = node_pair
+                    for bi, vec_i in enumerate(block_vecs):
+                        v_idx = idx_cache + vec_i
+                        slots.append(
+                            ("valu", ("&", v_tmp1_block + bi * VLEN, v_idx, v_one))
+                        )
+                        slots.append(
+                            (
+                                "valu",
+                                (
+                                    "multiply_add",
+                                    v_tmp3_block + bi * VLEN,
+                                    v_tmp1_block + bi * VLEN,
+                                    node_diff,
+                                    node_right,
+                                ),
+                            )
+                        )
+                    for bi, vec_i in enumerate(block_vecs):
+                        v_val = val_cache + vec_i
+                        slots.append(
+                            ("valu", ("^", v_val, v_val, v_tmp3_block + bi * VLEN))
+                        )
+            elif node_prefetch is not None:
+                for _bi, vec_i in enumerate(block_vecs):
+                    v_val = val_cache + vec_i
+                    slots.append(
+                        ("valu", ("^", v_val, v_val, node_prefetch + vec_i))
+                    )
+            elif node_arith is not None:
+                select_slots, node_base = emit_level_select_block_slots(
+                    block_vecs, buf_idx, node_arith
+                )
+                slots.extend(select_slots)
+                for bi, vec_i in enumerate(block_vecs):
+                    v_val = val_cache + vec_i
+                    slots.append(
+                        ("valu", ("^", v_val, v_val, node_base + bi * VLEN))
+                    )
+            else:
+                for bi, vec_i in enumerate(block_vecs):
+                    v_val = val_cache + vec_i
+                    slots.append(
+                        ("valu", ("^", v_val, v_val, node_buf + bi * VLEN))
+                    )
+
+            for op1, val1, op2, op3, val3 in HASH_STAGES:
+                if op1 == "+" and op2 == "+" and op3 == "<<":
+                    factor = 1 + (1 << val3)
+                    v_factor = self.scratch_vconst(factor)
+                    v_val1 = self.scratch_vconst(val1)
+                    for bi, vec_i in enumerate(block_vecs):
+                        v_val = val_cache + vec_i
+                        slots.append(
+                            ("valu", ("multiply_add", v_val, v_val, v_factor, v_val1))
+                        )
+                else:
+                    v_val1 = self.scratch_vconst(val1)
+                    v_val3 = self.scratch_vconst(val3)
+                    for bi, vec_i in enumerate(block_vecs):
+                        v_val = val_cache + vec_i
+                        slots.append(
+                            (
+                                "valu",
+                                (op1, v_tmp1_block + bi * VLEN, v_val, v_val1),
+                            )
+                        )
+                    for bi, vec_i in enumerate(block_vecs):
+                        v_val = val_cache + vec_i
+                        slots.append(
+                            (
+                                "valu",
+                                (op3, v_tmp2_block + bi * VLEN, v_val, v_val3),
+                            )
+                        )
+                    for bi, vec_i in enumerate(block_vecs):
+                        v_val = val_cache + vec_i
+                        slots.append(
+                            (
+                                "valu",
+                                (op2, v_val, v_tmp1_block + bi * VLEN, v_tmp2_block + bi * VLEN),
+                            )
+                        )
+
+            if fast_wrap and wrap_round:
+                for _bi, vec_i in enumerate(block_vecs):
+                    v_idx = idx_cache + vec_i
+                    slots.append(("valu", ("+", v_idx, v_zero, v_zero)))
+            else:
+                for bi, vec_i in enumerate(block_vecs):
+                    v_val = val_cache + vec_i
+                    slots.append(
+                        ("valu", ("&", v_tmp3_block + bi * VLEN, v_val, v_one))
+                    )
+                for bi, _vec_i in enumerate(block_vecs):
+                    slots.append(
+                        (
+                            "valu",
+                            ("+", v_tmp3_block + bi * VLEN, v_tmp3_block + bi * VLEN, v_one),
