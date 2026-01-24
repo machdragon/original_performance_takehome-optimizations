@@ -3049,54 +3049,54 @@ class KernelBuilder:
                     level4_prepared = False
 
                     if pending_prev:
-                    last_buf = last_block_idx % 2
-                    prev_node_prefetch = v_node_prefetch if prev_use_prefetch else None
-                    hash_prev = vec_block_hash_only_slots(
-                        last_block_vecs,
-                        last_buf,
-                        prev_info["wrap_round"],
-                        prev_info["node_const"],
-                        prev_info["node_pair"],
-                        prev_info["node_arith"],
-                        prev_node_prefetch,
-                        prev_info["level2_round"],
-                        prev_info["level3_round"],
-                    )
-                    if info["level2_round"]:
-                        body.extend(interleave_slots(hash_prev, level2_prep))
-                        level2_prepared = True
-                    elif info["level3_round"]:
-                        body.extend(interleave_slots(hash_prev, level3_prep))
-                        level3_prepared = True
-                    elif info["level4_round"]:
-                        body.extend(interleave_slots(hash_prev, level4_prep))
-                        level4_prepared = True
-                    elif special_round:
-                        body.extend(hash_prev)
-                    else:
-                        load_slots = vec_block_load_slots(
-                            block_0_vecs,
-                            0,
-                            info["node_const"],
-                            info["node_pair"],
-                            info["node_arith"],
-                            node_prefetch,
-                            info.get("level2_round", False),
-                            info["round"],
+                        last_buf = last_block_idx % 2
+                        prev_node_prefetch = v_node_prefetch if prev_use_prefetch else None
+                        hash_prev = vec_block_hash_only_slots(
+                            last_block_vecs,
+                            last_buf,
+                            prev_info["wrap_round"],
+                            prev_info["node_const"],
+                            prev_info["node_pair"],
+                            prev_info["node_arith"],
+                            prev_node_prefetch,
+                            prev_info["level2_round"],
+                            prev_info["level3_round"],
                         )
-                        body.extend(interleave_slots(hash_prev, load_slots))
+                        if info["level2_round"]:
+                            body.extend(interleave_slots(hash_prev, level2_prep))
+                            level2_prepared = True
+                        elif info["level3_round"]:
+                            body.extend(interleave_slots(hash_prev, level3_prep))
+                            level3_prepared = True
+                        elif info["level4_round"]:
+                            body.extend(interleave_slots(hash_prev, level4_prep))
+                            level4_prepared = True
+                        elif special_round:
+                            body.extend(hash_prev)
+                        else:
+                            load_slots = vec_block_load_slots(
+                                block_0_vecs,
+                                0,
+                                info["node_const"],
+                                info["node_pair"],
+                                info["node_arith"],
+                                node_prefetch,
+                                info.get("level2_round", False),
+                                info["round"],
+                            )
+                            body.extend(interleave_slots(hash_prev, load_slots))
 
                     if info["level2_round"] and not level2_prepared:
-                    body.extend(level2_prep)
-                    level2_prepared = True
-                if info["level3_round"] and not level3_prepared:
-                    body.extend(level3_prep)
-                    level3_prepared = True
-                if info["level4_round"] and not level4_prepared:
-                    body.extend(level4_prep)
-                    level4_prepared = True
+                        body.extend(level2_prep)
+                        level2_prepared = True
+                    if info["level3_round"] and not level3_prepared:
+                        body.extend(level3_prep)
+                        level3_prepared = True
+                    if info["level4_round"] and not level4_prepared:
+                        body.extend(level4_prep)
+                        level4_prepared = True
 
-                if special_round:
+                    if special_round:
                     body.extend(
                         vec_block_hash_only_slots(
                             block_0_vecs,
