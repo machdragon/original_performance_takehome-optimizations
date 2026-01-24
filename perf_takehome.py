@@ -3134,7 +3134,7 @@ class KernelBuilder:
             else:
                 # Original looped path
                 for round in range(rounds):
-                info = round_info[round]
+                    info = round_info[round]
                 use_prefetch = prefetch_active[round]
                 do_prefetch_next = prefetch_next[round]
                 node_prefetch = v_node_prefetch if use_prefetch else None
