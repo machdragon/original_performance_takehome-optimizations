@@ -50,6 +50,7 @@ class KernelBuilder:
         enable_two_round_fusion: bool = False,
         enable_level3_where: bool = False,
         enable_level4_valu: bool = False,
+        enable_level4_where: bool = False,
         enable_unroll_8: bool = False,  # Unroll rounds loop for exactly 8 rounds
         lookahead: int = 1024,  # Optimized: 1024 with block_size=16 gives 1923 cycles
         block_size: int = 16,  # Optimized: 16 gives best performance (1928->1923 with lookahead=1024)
@@ -75,6 +76,7 @@ class KernelBuilder:
         self.enable_two_round_fusion = enable_two_round_fusion
         self.enable_level3_where = enable_level3_where
         self.enable_level4_valu = enable_level4_valu
+        self.enable_level4_where = enable_level4_where
         self.enable_unroll_8 = enable_unroll_8
         self.lookahead = lookahead
         self.block_size = block_size
@@ -1602,7 +1604,8 @@ class KernelBuilder:
         # Alias v_tmp3_block unless features that truly need it are enabled.
         # This frees 128 words in the common path (block_size=16).
         enable_level4_where = (
-            forest_height == 10
+            self.enable_level4_where
+            and forest_height == 10
             and rounds == 16
             and batch_size == 256
             and block_size >= 16
@@ -2177,7 +2180,7 @@ class KernelBuilder:
             return slots
 
         def level4_prepare_slots():
-            if not (enable_level4_valu and enable_prefetch):
+            if not ((enable_level4_valu or enable_level4_where) and enable_prefetch):
                 return []
             slots = []
             slots.append(
@@ -2808,7 +2811,7 @@ class KernelBuilder:
             self.enable_prefetch
             and rounds > 1
             and use_cross_round
-            and (enable_arith or enable_level2_where or enable_level3_where or enable_level3_valu or enable_level4_valu)
+            and (enable_arith or enable_level2_where or enable_level3_where or enable_level3_valu or enable_level4_valu or enable_level4_where)
         )
         if enable_prefetch:
             # Prefetch buffer only needs block 0 (block_size vectors).
@@ -2844,7 +2847,7 @@ class KernelBuilder:
                     and level == 3
                 )
                 level4_round = (
-                    fast_wrap and enable_level4_valu and enable_prefetch and level == 4
+                    fast_wrap and (enable_level4_valu or enable_level4_where) and enable_prefetch and level == 4
                 )
                 round_info.append(
                     {
@@ -3561,6 +3564,8 @@ def do_kernel_test(
         enable_level2_valu: bool | None = None,
         enable_two_round_fusion: bool | None = None,
         enable_level3_where: bool | None = None,
+        enable_level4_valu: bool | None = None,
+        enable_level4_where: bool | None = None,
         enable_unroll_8: bool | None = None,
     lookahead: int | None = None,
     block_size: int | None = None,
@@ -3593,6 +3598,10 @@ def do_kernel_test(
         enable_two_round_fusion = False
     if enable_level3_where is None:
         enable_level3_where = False
+    if enable_level4_valu is None:
+        enable_level4_valu = False
+    if enable_level4_where is None:
+        enable_level4_where = False
     if lookahead is None:
         lookahead = 1024
     if block_size is None:
@@ -3615,6 +3624,8 @@ def do_kernel_test(
         enable_level2_valu=enable_level2_valu,
         enable_two_round_fusion=enable_two_round_fusion,
         enable_level3_where=enable_level3_where,
+        enable_level4_valu=enable_level4_valu,
+        enable_level4_where=enable_level4_where,
         enable_unroll_8=enable_unroll_8,
         lookahead=lookahead,
         block_size=block_size,
