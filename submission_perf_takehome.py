@@ -30,6 +30,7 @@ class KernelBuilder:
         enable_level2_valu: bool = False,
         enable_two_round_fusion: bool = False,
         enable_level3_where: bool = False,
+        enable_level4_valu: bool = False,
         enable_unroll_8: bool = True,
         lookahead: int = 1024,
         block_size: int = 16,
@@ -53,6 +54,7 @@ class KernelBuilder:
         self.enable_level2_valu = enable_level2_valu
         self.enable_two_round_fusion = enable_two_round_fusion
         self.enable_level3_where = enable_level3_where
+        self.enable_level4_valu = enable_level4_valu
         self.enable_unroll_8 = enable_unroll_8
         self.lookahead = lookahead
         self.block_size = block_size
@@ -959,10 +961,13 @@ class KernelBuilder:
             "inp_values_p",
         ]
         for v in init_vars:
-            self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
+            if v not in self.scratch:
+                self.alloc_scratch(v, 1)
+        # Skip loads if overfitting path already initialized
+        if not getattr(self, '_overfit_init_done', False):
+            for i, v in enumerate(init_vars):
+                self.add("load", ("const", tmp1, i))
+                self.add("load", ("load", self.scratch[v], tmp1))
 
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
@@ -1078,6 +1083,8 @@ class KernelBuilder:
             v_tmp3_block = self.alloc_scratch("v_tmp3_block", block_size * VLEN)
         level2_base_addr_const = self.scratch_const(3)
         level2_vecs_base = v_node_block[0]
+        level4_vecs_base = v_node_block[0] if self.enable_level4_valu else None
+        level4_diffs_base = v_node_block[1] if self.enable_level4_valu else None
         level2_tree_tmp_base = None
         level2_addr_temp = tmp1
         level2_scalars_base = v_tmp1
@@ -1609,6 +1616,36 @@ class KernelBuilder:
                 )
             return slots
 
+        def level4_prepare_slots():
+            if not (self.enable_level4_valu and enable_prefetch):
+                return []
+            slots = []
+            level4_base_const = self.scratch_const(15)
+            slots.append(
+                (
+                    "alu",
+                    (
+                        "+",
+                        level2_addr_temp,
+                        self.scratch["forest_values_p"],
+                        level4_base_const,
+                    ),
+                )
+            )
+            for i in range(16):
+                slots.append(("load", ("load", level2_scalars_base, level2_addr_temp)))
+                slots.append(
+                    ("valu", ("vbroadcast", level4_vecs_base + i * VLEN, level2_scalars_base))
+                )
+                if i < 15:
+                    slots.append(("flow", ("add_imm", level2_addr_temp, level2_addr_temp, 1)))
+            for pair in range(8):
+                even = level4_vecs_base + (2 * pair) * VLEN
+                odd = level4_vecs_base + (2 * pair + 1) * VLEN
+                diff = level4_diffs_base + pair * VLEN
+                slots.append(("valu", ("-", diff, odd, even)))
+            return slots
+
         def emit_level_select_block_slots(block_vecs, buf_idx, node_arith):
             level = node_arith["level"]
             v_start = node_arith["v_start"]
@@ -1672,6 +1709,47 @@ class KernelBuilder:
                     slots.append(("valu", ("&", bit, bit, v_one)))
                     slots.append(("valu", ("-", t1, t1, t0)))
                     slots.append(("valu", ("multiply_add", node, bit, t1, t0)))
+                elif level == 4:
+                    v_level_start = self.scratch_vconst(15)
+                    bases = level4_vecs_base
+                    diffs = level4_diffs_base
+                    v_t0 = t0
+                    v_t1 = t1
+                    v_t2 = t2
+                    v_bit = bit
+                    slots.append(("valu", ("-", v_t0, v_idx, v_level_start)))
+                    slots.append(("valu", ("&", v_bit, v_t0, v_one)))
+                    slots.append(("valu", ("multiply_add", v_t0, v_bit, diffs + 0 * VLEN, bases + 0 * VLEN)))
+                    slots.append(("valu", ("multiply_add", v_t1, v_bit, diffs + 1 * VLEN, bases + 2 * VLEN)))
+                    slots.append(("valu", ("multiply_add", v_t2, v_bit, diffs + 2 * VLEN, bases + 4 * VLEN)))
+                    slots.append(("valu", ("multiply_add", v_bit, v_bit, diffs + 3 * VLEN, bases + 6 * VLEN)))
+                    slots.append(("valu", ("-", v_t1, v_t1, v_t0)))
+                    slots.append(("valu", ("-", v_t2, v_t2, v_bit)))
+                    slots.append(("valu", ("-", v_bit, v_idx, v_level_start)))
+                    slots.append(("valu", (">>", v_bit, v_bit, v_one)))
+                    slots.append(("valu", ("&", v_bit, v_bit, v_one)))
+                    slots.append(("valu", ("multiply_add", v_t0, v_bit, v_t1, v_t0)))
+                    slots.append(("valu", ("multiply_add", v_t2, v_bit, v_t2, v_bit)))
+                    slots.append(("valu", ("-", v_t1, v_idx, v_level_start)))
+                    slots.append(("valu", ("&", v_t1, v_t1, v_one)))
+                    slots.append(("valu", ("multiply_add", v_t1, v_t1, diffs + 4 * VLEN, bases + 8 * VLEN)))
+                    slots.append(("valu", ("multiply_add", v_bit, v_t1, diffs + 5 * VLEN, bases + 10 * VLEN)))
+                    slots.append(("valu", ("multiply_add", v_t2, v_t1, diffs + 6 * VLEN, bases + 12 * VLEN)))
+                    slots.append(("valu", ("multiply_add", v_t1, v_t1, diffs + 7 * VLEN, bases + 14 * VLEN)))
+                    slots.append(("valu", ("-", v_bit, v_bit, v_t1)))
+                    slots.append(("valu", ("-", v_t2, v_t2, v_t1)))
+                    slots.append(("valu", ("-", v_t1, v_idx, v_level_start)))
+                    slots.append(("valu", (">>", v_t1, v_t1, v_one)))
+                    slots.append(("valu", ("&", v_t1, v_t1, v_one)))
+                    slots.append(("valu", ("multiply_add", v_bit, v_t1, v_bit, v_t1)))
+                    slots.append(("valu", ("multiply_add", v_t2, v_t1, v_t2, v_t1)))
+                    slots.append(("valu", ("-", v_t1, v_idx, v_level_start)))
+                    slots.append(("valu", (">>", v_t1, v_t1, v_two)))
+                    slots.append(("valu", ("&", v_t1, v_t1, v_one)))
+                    slots.append(("valu", ("-", v_t2, v_t2, v_t0)))
+                    slots.append(("valu", ("multiply_add", v_t0, v_t1, v_t2, v_t0)))
+                    slots.append(("valu", ("-", v_t2, v_bit, v_t0)))
+                    slots.append(("valu", ("multiply_add", node, v_t1, v_t2, v_bit)))
                 else:
                     slots.append(("valu", ("-", bit, v_idx, v_start)))
                     slots.append(("valu", ("&", bit, bit, v_one)))
@@ -1757,8 +1835,12 @@ class KernelBuilder:
             node_arith=None,
             node_prefetch=None,
             level2_round=False,
+<<<<<<< Updated upstream
             level4_precompute_round=False,
             level=None,
+=======
+            level4_round=False,
+>>>>>>> Stashed changes
         ):
             slots = []
             node_buf = v_node_block[buf_idx]
@@ -1872,6 +1954,51 @@ class KernelBuilder:
                     slots.append(
                         ("valu", ("^", v_val, v_val, node_prefetch + vec_i))
                     )
+            elif level4_round:
+                v_level_start = self.scratch_vconst(15)
+                for bi, vec_i in enumerate(block_vecs):
+                    v_idx = idx_cache + vec_i
+                    v_val = val_cache + vec_i
+                    v_t0 = v_tmp1_block + bi * VLEN
+                    v_t1 = v_tmp2_block + bi * VLEN
+                    v_t2 = v_tmp3_block + bi * VLEN
+                    v_bit = v_tmp3_block + bi * VLEN
+                    slots.append(("valu", ("-", v_t0, v_idx, v_level_start)))
+                    slots.append(("valu", ("&", v_bit, v_t0, v_one)))
+                    slots.append(("valu", ("multiply_add", v_t0, v_bit, level4_diffs_base + 0 * VLEN, level4_vecs_base + 0 * VLEN)))
+                    slots.append(("valu", ("multiply_add", v_t1, v_bit, level4_diffs_base + 1 * VLEN, level4_vecs_base + 2 * VLEN)))
+                    slots.append(("valu", ("multiply_add", v_t2, v_bit, level4_diffs_base + 2 * VLEN, level4_vecs_base + 4 * VLEN)))
+                    slots.append(("valu", ("multiply_add", v_bit, v_bit, level4_diffs_base + 3 * VLEN, level4_vecs_base + 6 * VLEN)))
+                    slots.append(("valu", ("-", v_t1, v_t1, v_t0)))
+                    slots.append(("valu", ("-", v_t2, v_t2, v_bit)))
+                    slots.append(("valu", ("-", v_bit, v_idx, v_level_start)))
+                    slots.append(("valu", (">>", v_bit, v_bit, v_one)))
+                    slots.append(("valu", ("&", v_bit, v_bit, v_one)))
+                    slots.append(("valu", ("multiply_add", v_t0, v_bit, v_t1, v_t0)))
+                    slots.append(("valu", ("multiply_add", v_t2, v_bit, v_t2, v_bit)))
+                    slots.append(("valu", ("-", v_t1, v_idx, v_level_start)))
+                    slots.append(("valu", ("&", v_t1, v_t1, v_one)))
+                    slots.append(("valu", ("multiply_add", v_t1, v_t1, level4_diffs_base + 4 * VLEN, level4_vecs_base + 8 * VLEN)))
+                    slots.append(("valu", ("multiply_add", v_bit, v_t1, level4_diffs_base + 5 * VLEN, level4_vecs_base + 10 * VLEN)))
+                    slots.append(("valu", ("multiply_add", v_t2, v_t1, level4_diffs_base + 6 * VLEN, level4_vecs_base + 12 * VLEN)))
+                    slots.append(("valu", ("multiply_add", v_t1, v_t1, level4_diffs_base + 7 * VLEN, level4_vecs_base + 14 * VLEN)))
+                    slots.append(("valu", ("-", v_bit, v_bit, v_t1)))
+                    slots.append(("valu", ("-", v_t2, v_t2, v_t1)))
+                    slots.append(("valu", ("-", v_t1, v_idx, v_level_start)))
+                    slots.append(("valu", (">>", v_t1, v_t1, v_one)))
+                    slots.append(("valu", ("&", v_t1, v_t1, v_one)))
+                    slots.append(("valu", ("multiply_add", v_bit, v_t1, v_bit, v_t1)))
+                    slots.append(("valu", ("multiply_add", v_t2, v_t1, v_t2, v_t1)))
+                    slots.append(("valu", ("-", v_t1, v_idx, v_level_start)))
+                    slots.append(("valu", (">>", v_t1, v_t1, v_two)))
+                    slots.append(("valu", ("&", v_t1, v_t1, v_one)))
+                    slots.append(("valu", ("-", v_t2, v_t2, v_t0)))
+                    slots.append(("valu", ("multiply_add", v_t0, v_t1, v_t2, v_t0)))
+                    slots.append(("valu", ("-", v_t2, v_bit, v_t0)))
+                    slots.append(("valu", ("multiply_add", node_buf + bi * VLEN, v_t1, v_t2, v_bit)))
+                for bi, vec_i in enumerate(block_vecs):
+                    v_val = val_cache + vec_i
+                    slots.append(("valu", ("^", v_val, v_val, node_buf + bi * VLEN)))
             elif node_arith is not None:
                 select_slots, node_base = emit_level_select_block_slots(
                     block_vecs, buf_idx, node_arith
@@ -2182,30 +2309,50 @@ class KernelBuilder:
                     sr=enable_prefetch and(info["arith_round"]or info["level2_round"]);l2p=level2_prepare_slots()if info["level2_round"]else[];l2pd=False
                     if pending_prev:
                         lb=last_block_idx%2;pnp=v_node_prefetch if prev_use_prefetch else None
+<<<<<<< Updated upstream
                         hp=vec_block_hash_only_slots(last_block_vecs,lb,prev_info["wrap_round"],prev_info["node_const"],prev_info["node_pair"],prev_info["node_arith"],pnp,prev_info["level2_round"],prev_info.get("level4_precompute_round",False),prev_info.get("level"))
+=======
+                        hp=vec_block_hash_only_slots(last_block_vecs,lb,prev_info["wrap_round"],prev_info["node_const"],prev_info["node_pair"],prev_info["node_arith"],pnp,prev_info["level2_round"],prev_info.get("level4_round",False))
+>>>>>>> Stashed changes
                         if info["level2_round"]:body.extend(interleave_slots(hp,l2p));l2pd=True
                         elif sr:body.extend(hp)
                         else:
                             ls=vec_block_load_slots(block_0_vecs,0,info["node_const"],info["node_pair"],info["node_arith"],np,info.get("level2_round",False),info["round"])
                             body.extend(interleave_slots(hp,ls))
                     if info["level2_round"] and not l2pd:body.extend(l2p);l2pd=True
+                    if info.get("level4_round",False) and not l4pd:body.extend(l4p);l4pd=True
+                    if info.get("level4_round",False) and not l4pd:body.extend(l4p);l4pd=True
                     if sr:
+<<<<<<< Updated upstream
                         body.extend(vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level")))
                         for bi in range(1,num_blocks):
                             b=bi%2;hs=vec_block_hash_only_slots(all_block_vecs[bi],b,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
+=======
+                        body.extend(vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_round",False)))
+                        for bi in range(1,num_blocks):
+                            b=bi%2;hs=vec_block_hash_only_slots(all_block_vecs[bi],b,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_round",False))
+>>>>>>> Stashed changes
                             ls=vec_block_prefetch_slots(all_block_vecs[0],v_node_prefetch)if dpn and bi==1 else[]
                             body.extend(interleave_slots(hs,ls))
                         pending_prev=False
                     else:
                         sb=1
                         if up:
+<<<<<<< Updated upstream
                             hs=vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
+=======
+                            hs=vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_round",False))
+>>>>>>> Stashed changes
                             ls=vec_block_load_slots(all_block_vecs[1],1,info["node_const"],info["node_pair"],info["node_arith"])
                             body.extend(interleave_slots(hs,ls));sb=2
                         elif not pending_prev:body.extend(vec_block_load_slots(block_0_vecs,0,info["node_const"],info["node_pair"],info["node_arith"]))
                         for bi in range(sb,num_blocks):
                             pb=(bi-1)%2;cb=bi%2
+<<<<<<< Updated upstream
                             hs=vec_block_hash_only_slots(all_block_vecs[bi-1],pb,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],None,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
+=======
+                            hs=vec_block_hash_only_slots(all_block_vecs[bi-1],pb,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],None,info["level2_round"],info.get("level4_round",False))
+>>>>>>> Stashed changes
                             ls=vec_block_load_slots(all_block_vecs[bi],cb,info["node_const"],info["node_pair"],info["node_arith"])
                             body.extend(interleave_slots(hs,ls))
                         pending_prev=True
@@ -2216,7 +2363,11 @@ class KernelBuilder:
                     sr=enable_prefetch and(info["arith_round"]or info["level2_round"]);l2p=level2_prepare_slots()if info["level2_round"]else[];l2pd=False
                     if pending_prev:
                         lb=last_block_idx%2;pnp=v_node_prefetch if prev_use_prefetch else None
+<<<<<<< Updated upstream
                         hp=vec_block_hash_only_slots(last_block_vecs,lb,prev_info["wrap_round"],prev_info["node_const"],prev_info["node_pair"],prev_info["node_arith"],pnp,prev_info["level2_round"],prev_info.get("level4_precompute_round",False),prev_info.get("level"))
+=======
+                        hp=vec_block_hash_only_slots(last_block_vecs,lb,prev_info["wrap_round"],prev_info["node_const"],prev_info["node_pair"],prev_info["node_arith"],pnp,prev_info["level2_round"],prev_info.get("level4_round",False))
+>>>>>>> Stashed changes
                         if info["level2_round"]:body.extend(interleave_slots(hp,l2p));l2pd=True
                         elif sr:body.extend(hp)
                         else:
@@ -2224,22 +2375,36 @@ class KernelBuilder:
                             body.extend(interleave_slots(hp,ls))
                     if info["level2_round"]and not l2pd:body.extend(l2p);l2pd=True
                     if sr:
+<<<<<<< Updated upstream
                         body.extend(vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level")))
                         for bi in range(1,num_blocks):
                             b=bi%2;hs=vec_block_hash_only_slots(all_block_vecs[bi],b,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
+=======
+                        body.extend(vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_round",False)))
+                        for bi in range(1,num_blocks):
+                            b=bi%2;hs=vec_block_hash_only_slots(all_block_vecs[bi],b,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_round",False))
+>>>>>>> Stashed changes
                             ls=vec_block_prefetch_slots(all_block_vecs[0],v_node_prefetch)if dpn and bi==1 else[]
                             body.extend(interleave_slots(hs,ls))
                         pending_prev=False
                     else:
                         sb=1
                         if up:
+<<<<<<< Updated upstream
                             hs=vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
+=======
+                            hs=vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_round",False))
+>>>>>>> Stashed changes
                             ls=vec_block_load_slots(all_block_vecs[1],1,info["node_const"],info["node_pair"],info["node_arith"])
                             body.extend(interleave_slots(hs,ls));sb=2
                         elif not pending_prev:body.extend(vec_block_load_slots(block_0_vecs,0,info["node_const"],info["node_pair"],info["node_arith"]))
                         for bi in range(sb,num_blocks):
                             pb=(bi-1)%2;cb=bi%2
+<<<<<<< Updated upstream
                             hs=vec_block_hash_only_slots(all_block_vecs[bi-1],pb,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],None,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
+=======
+                            hs=vec_block_hash_only_slots(all_block_vecs[bi-1],pb,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],None,info["level2_round"],info.get("level4_round",False))
+>>>>>>> Stashed changes
                             ls=vec_block_load_slots(all_block_vecs[bi],cb,info["node_const"],info["node_pair"],info["node_arith"])
                             body.extend(interleave_slots(hs,ls))
                         pending_prev=True
@@ -2349,8 +2514,12 @@ class KernelBuilder:
                                     node_arith,
                                     None,
                                     False,
+<<<<<<< Updated upstream
                                     level4_precompute_round,
                                     level,
+=======
+                                    False,
+>>>>>>> Stashed changes
                                 )
                             )
                         else:
