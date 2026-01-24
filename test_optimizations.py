@@ -166,8 +166,8 @@ def main():
             "enable_level2_where": True,
             "enable_prefetch": True,
         }),
-        ("Level3 VALU + prefetch", {
-            "enable_level3_valu": True,
+        ("Level3 where + prefetch", {
+            "enable_level3_where": True,
             "enable_prefetch": True,
         }),
     ])

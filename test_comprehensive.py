@@ -134,7 +134,7 @@ def main():
     print("="*80)
     fusion_tests = [
         ("Level2 where + Prefetch", {"enable_level2_where": True, "enable_prefetch": True}),
-        ("Level3 VALU + Prefetch", {"enable_level3_valu": True, "enable_prefetch": True}),
+        ("Level3 where + Prefetch", {"enable_level3_where": True, "enable_prefetch": True}),
         ("Level2 arith (max=2)", {"max_arith_level": 2}),
         ("Level2 arith + Prefetch", {"max_arith_level": 2, "enable_prefetch": True}),
         ("Two-round fusion", {"enable_two_round_fusion": True}),
