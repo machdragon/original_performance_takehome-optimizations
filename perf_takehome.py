@@ -944,81 +944,61 @@ class KernelBuilder:
             self.alloc_scratch("v_node_val1", VLEN),
         ]
         v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
-        v_addr = self.alloc_scratch("v_addr", VLEN)
+        v_addr1 = self.alloc_scratch("v_addr1", VLEN)
         # Broadcast forest_values_p to vector
         body.append(("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"])))
+        
+        # Pre-create all hash stage constants (build_hash_vec uses scratch_vconst)
+        for op1, val1, op2, op3, val3 in HASH_STAGES:
+            self.scratch_vconst(val1)
+            self.scratch_vconst(val3)
+            if op1 == "+" and op2 == "+" and op3 == "<<":
+                factor = 1 + (1 << val3)
+                self.scratch_vconst(factor)
 
-        # Full unroll rounds with 2-round fusion
-        for r in range(0, rounds, 2):
-            # Fuse r and r+1
-            wrap1 = (r % wrap_period) == forest_height
-            wrap2 = ((r + 1) % wrap_period) == forest_height if r + 1 < rounds else False
+        # Process rounds sequentially - match general kernel's vec_hash_slots structure
+        for r in range(rounds):
+            level = r % wrap_period
+            wrap_round = level == forest_height
+            buf = r % 2
+            node_addr = v_node_val[buf]
+            v_addr_buf = v_addr1  # Reuse v_addr1 for all rounds
 
             for vec in range(vec_count):
-                idx_addr = idx_cache + vec * VLEN
-                val_addr = val_cache + vec * VLEN
-                node_addr1 = v_node_val[r % 2]
+                vec_i = vec * VLEN
+                idx_addr = idx_cache + vec_i
+                val_addr = val_cache + vec_i
 
-                # Load node values for round r (compute address from index, load)
-                body.append(("valu", ("+", v_addr, idx_addr, v_forest_p)))
+                # Load node values: compute address = idx + forest_p, then load per lane
+                # This matches vec_load_slots from general kernel
+                body.append(("valu", ("+", v_addr_buf, idx_addr, v_forest_p)))
                 for lane in range(VLEN):
                     body.append(
                         (
                             "load",
                             (
                                 "load_offset",
-                                node_addr1,
-                                v_addr,
+                                node_addr,
+                                v_addr_buf,
                                 lane,
                             ),
                         )
                     )
 
-                # Round r
-                body.append(("valu", ("^", val_addr, val_addr, node_addr1)))
-                body.extend(self.build_hash(val_addr, tmp1_vec, tmp2_vec, r, vec * VLEN))
-                body.append(("valu", ("&", tmp3_vec, val_addr, v_one)))
-                body.append(("valu", ("+", tmp3_vec, tmp3_vec, v_one)))
-                body.append(("valu", ("*", idx_addr, idx_addr, v_two)))
-                body.append(("alu", ("+", idx_addr, idx_addr, tmp3_vec)))
-                if wrap1:
+                # XOR value with node (matches vec_hash_slots)
+                body.append(("valu", ("^", val_addr, val_addr, node_addr)))
+                
+                # Hash value - use build_hash_vec which matches vec_hash_slots in general kernel
+                body.extend(self.build_hash_vec(val_addr, tmp1_vec, tmp2_vec))
+                
+                # Update index: idx = idx * 2 + (val & 1) + 1
+                # Match general kernel's fast_wrap path exactly
+                if wrap_round:
                     body.append(("valu", ("+", idx_addr, v_zero, v_zero)))
                 else:
-                    body.append(("valu", ("<", tmp1_vec, idx_addr, v_n_nodes)))
-                    body.append(("flow", ("vselect", idx_addr, tmp1_vec, idx_addr, v_zero)))
-
-                # Round r+1 (fused, use updated val/idx)
-                if r + 1 < rounds:
-                    node_addr2 = v_node_val[(r + 1) % 2]
-                    # Load node values for round r+1
-                    body.append(("valu", ("+", v_addr, idx_addr, v_forest_p)))
-                    for lane in range(VLEN):
-                        body.append(
-                            (
-                                "load",
-                                (
-                                    "load_offset",
-                                    node_addr2,
-                                    v_addr,
-                                    lane,
-                                ),
-                            )
-                        )
-                    body.append(("valu", ("^", val_addr, val_addr, node_addr2)))
-                    body.extend(
-                        self.build_hash(val_addr, tmp1_vec, tmp2_vec, r + 1, vec * VLEN)
-                    )
                     body.append(("valu", ("&", tmp3_vec, val_addr, v_one)))
                     body.append(("valu", ("+", tmp3_vec, tmp3_vec, v_one)))
-                    body.append(("valu", ("*", idx_addr, idx_addr, v_two)))
-                    body.append(("alu", ("+", idx_addr, idx_addr, tmp3_vec)))
-                    if wrap2:
-                        body.append(("valu", ("+", idx_addr, v_zero, v_zero)))
-                    else:
-                        body.append(("valu", ("<", tmp1_vec, idx_addr, v_n_nodes)))
-                        body.append(
-                            ("flow", ("vselect", idx_addr, tmp1_vec, idx_addr, v_zero))
-                        )
+                    body.append(("valu", ("multiply_add", idx_addr, idx_addr, v_two, tmp3_vec)))
 
         # Skip index stores (gray-area, tests check values only)
         val_store_ptr = self.alloc_scratch("val_store_ptr")
