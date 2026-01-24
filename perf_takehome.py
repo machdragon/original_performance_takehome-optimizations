@@ -2631,18 +2631,18 @@ class KernelBuilder:
                     # Preserve sel(8-11) in out.
                     slots.append(("valu", ("+", out, t1, v_zero)))
 
-                    # Select 12-15 into t1 using v_tmp3 as temp (preserves out).
+                    # Select 12-15 into t1 using t0 as temp (preserves out, t0 no longer needed).
                     slots.append(("valu", ("-", bit, v_idx, v_level_start)))
                     slots.append(("valu", ("&", bit, bit, v_one)))
                     slots.append(("valu", ("-", t1, node13, node12)))
                     slots.append(("valu", ("multiply_add", t1, bit, t1, node12)))
-                    slots.append(("valu", ("-", v_tmp3, node15, node14)))
-                    slots.append(("valu", ("multiply_add", v_tmp3, bit, v_tmp3, node14)))
+                    slots.append(("valu", ("-", t0, node15, node14)))
+                    slots.append(("valu", ("multiply_add", t0, bit, t0, node14)))
                     slots.append(("valu", ("-", bit, v_idx, v_level_start)))
                     slots.append(("valu", (">>", bit, bit, v_one)))
                     slots.append(("valu", ("&", bit, bit, v_one)))
-                    slots.append(("valu", ("-", v_tmp3, v_tmp3, t1)))
-                    slots.append(("valu", ("multiply_add", t1, bit, v_tmp3, t1)))
+                    slots.append(("valu", ("-", t0, t0, t1)))
+                    slots.append(("valu", ("multiply_add", t1, bit, t0, t1)))
 
                     # Select 8-15 into out.
                     slots.append(("valu", ("-", bit, v_idx, v_level_start)))
