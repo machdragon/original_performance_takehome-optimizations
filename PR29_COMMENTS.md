@@ -148,6 +148,29 @@ The defaults of `False` are appropriate since the fallback path can never hit a 
 
 ---
 
+## 9. Level-3 VALU selection produces incorrect results ✅ FIXED
+
+**Location:** `perf_takehome.py:2142-2165`
+
+**Issue:** The level-3 VALU selection logic had a bug in register reuse. The algorithm:
+1. Computed pair45 result and stored it in v_bit0
+2. Computed pair67 result and stored it in v_bit1 (overwriting bit1)
+3. Tried to recompute bit1, but v_bit2 was already used for other purposes
+4. The intermediate results (pair45/pair67) were not properly preserved before combining
+
+**Resolution:** ✅ **FIXED** - Restructured the register usage:
+- Use `v_bit2` as temporary storage for recomputed bit0 in second half (lines 2147-2149)
+- Store pair45 result in `v_bit0` and pair67 result in `v_bit1` (lines 2150-2153)
+- Recompute bit1 into `v_bit2` before combining pairs (lines 2154-2157)
+- Combine pair45 and pair67 correctly using bit1 (line 2159)
+- Final select between first half and second half using bit2 (lines 2161-2165)
+
+The fix ensures all intermediate results are preserved and combined in the correct order.
+
+**Status:** ✅ Fixed - register reuse corrected, intermediate results properly preserved.
+
+---
+
 ## Summary
 
 | Issue | Status | Action |
@@ -160,5 +183,6 @@ The defaults of `False` are appropriate since the fallback path can never hit a 
 | Epilogue fix | ✅ VERIFIED | Bug correctly fixed |
 | Fallback path defaults | ✅ RESOLVED | Correct for fallback path |
 | Duplicate condition | ✅ VERIFIED FIXED | Already removed |
+| Level-3 VALU selection bug | ✅ FIXED | Register reuse corrected |
 
 All concerns have been addressed. The code is functionally correct, and the design choices (aliasing, reuse, defaults) are intentional optimizations that work correctly within the system constraints.
