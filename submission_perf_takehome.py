@@ -761,7 +761,7 @@ class KernelBuilder:
 
     def build_kernel_10_16_256(self, n_nodes: int, write_indices: bool = True):
 
-        return self.build_kernel_general(10, n_nodes, 256, 16, write_indices)
+        return self.build_kernel_general(10, n_nodes, 256, 16, False)
 
     def build_kernel_general(
         self,
