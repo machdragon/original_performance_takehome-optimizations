@@ -3097,46 +3097,46 @@ class KernelBuilder:
                         level4_prepared = True
 
                     if special_round:
-                    body.extend(
-                        vec_block_hash_only_slots(
-                            block_0_vecs,
-                            0,
-                            info["wrap_round"],
-                            info["node_const"],
-                            info["node_pair"],
-                            info["node_arith"],
-                            node_prefetch,
-                            info["level2_round"],
-                            info["level3_round"],
-                        )
-                    )
-                    for block_idx in range(1, num_blocks):
-                        buf_idx = block_idx % 2
-                        # Block 0 is prefetched; hash it (using the
-                        # prefetch buffer) while we load block 1
-                        # with the standard double-buffer path.
-                        # Note: block 0's indices have already been
-                        # advanced by its previous-round hash, so
-                        # the prefetch is for *next*-round indices.
-                        hash_slots = vec_block_hash_only_slots(
-                            all_block_vecs[block_idx],
-                            buf_idx,
-                            info["wrap_round"],
-                            info["node_const"],
-                            info["node_pair"],
-                            info["node_arith"],
-                            node_prefetch,
-                            info["level2_round"],
-                            info["level3_round"],
-                        )
-                        # Prefetch only block 0, issued one block behind so idx updates are committed.
-                        load_slots = []
-                        if do_prefetch_next and block_idx == 1:
-                            load_slots = vec_block_prefetch_slots(
-                                all_block_vecs[0], v_node_prefetch
+                        body.extend(
+                            vec_block_hash_only_slots(
+                                block_0_vecs,
+                                0,
+                                info["wrap_round"],
+                                info["node_const"],
+                                info["node_pair"],
+                                info["node_arith"],
+                                node_prefetch,
+                                info["level2_round"],
+                                info["level3_round"],
                             )
-                        body.extend(interleave_slots(hash_slots, load_slots))
-                    pending_prev = False
+                        )
+                        for block_idx in range(1, num_blocks):
+                            buf_idx = block_idx % 2
+                            # Block 0 is prefetched; hash it (using the
+                            # prefetch buffer) while we load block 1
+                            # with the standard double-buffer path.
+                            # Note: block 0's indices have already been
+                            # advanced by its previous-round hash, so
+                            # the prefetch is for *next*-round indices.
+                            hash_slots = vec_block_hash_only_slots(
+                                all_block_vecs[block_idx],
+                                buf_idx,
+                                info["wrap_round"],
+                                info["node_const"],
+                                info["node_pair"],
+                                info["node_arith"],
+                                node_prefetch,
+                                info["level2_round"],
+                                info["level3_round"],
+                            )
+                            # Prefetch only block 0, issued one block behind so idx updates are committed.
+                            load_slots = []
+                            if do_prefetch_next and block_idx == 1:
+                                load_slots = vec_block_prefetch_slots(
+                                    all_block_vecs[0], v_node_prefetch
+                                )
+                            body.extend(interleave_slots(hash_slots, load_slots))
+                        pending_prev = False
                 else:
                     start_block = 1
                     if use_prefetch:
