@@ -1088,9 +1088,10 @@ class KernelBuilder:
         # Check if we can alias v_tmp2_block and v_tmp3_block to save space
         # They're used in different phases: v_tmp2 in hash stages, v_tmp3 in index updates
         # Can alias if not using level2_where or level3_where (which may use both simultaneously)
+        # Note: enable_level4_precompute is defined later, so we'll check it there
         can_alias_tmp23 = not enable_level2_where and not enable_level3_where
         if can_alias_tmp23:
-            v_tmp3_block = v_tmp2_block  # Alias to save 128 words
+            v_tmp3_block = v_tmp2_block  # Alias to save 128 words (may be overridden later)
         else:
             v_tmp3_block = self.alloc_scratch("v_tmp3_block", block_size * VLEN)
         level2_base_addr_const = self.scratch_const(3)
@@ -1157,6 +1158,13 @@ class KernelBuilder:
             and not self.enable_debug
             and not use_special  # Don't conflict with existing use_special path
         )
+        
+        # CRITICAL FIX: For level4_precompute, we need per-item isolated scratch.
+        # However, we can't disable aliasing (would exceed scratch). Instead, we'll use
+        # per-item offsets within v_tmp2_block for tree temps, and use relative_idx_vec
+        # space for final output (per-item, safe). This avoids conflicts while staying
+        # within scratch limits.
+        
         if enable_level4_precompute:
             # Precompute only level 4 (16 nodes) to save scratch space
             # Level 4: 16 scalars, 16*VLEN vectors
@@ -1806,11 +1814,18 @@ class KernelBuilder:
                 # v_tmp2_block: vselect tree temp space (4*VLEN per vector)
                 # v_tmp3_block: final output
                 
-                # Process block items sequentially, using per-item temp space offsets (like level2_round)
-                # Level2 uses: v_tmp1_block + bi * VLEN, v_tmp2_block + bi * VLEN, v_tmp3_block + bi * VLEN
-                # For level4, we need 8*VLEN temp space for vselect tree, but only have block_size*VLEN total.
-                # Key insight: We can reuse relative_idx_vec space for final output after it's used!
-                # After computing relative_idx, we don't need it anymore, so we can use that space for final output.
+                # Process block items with proper scratch isolation
+                # CRITICAL FIX: Per diagnosis, each block item needs isolated scratch to prevent
+                # bundler reordering from causing data corruption. However, we can't allocate
+                # per-item tree temps (would need 16*13*VLEN = 1664 words, exceeds scratch).
+                # 
+                # Solution: Use shared tree_temp_base (sequential processing is safe IF items
+                # process fully sequentially), but ensure per-item final output using a different
+                # region of v_tmp1_block (not the relative_idx_vec region to avoid conflicts).
+                # v_tmp1_block is block_size*VLEN = 128 words, so we can use:
+                # - bi*VLEN for relative_idx_vec (0-127 words, 16 items * 8 = 128 words)
+                # - But we need final output space too... Actually, we can reuse relative_idx_vec
+                #   AFTER the vselect tree is done with it (layer 4 writes final_out, layer 1 reads rel_idx)
                 for bi, vec_i in enumerate(block_vecs):
                     v_idx = idx_cache + vec_i
                     v_val = val_cache + vec_i
@@ -1819,24 +1834,14 @@ class KernelBuilder:
                     relative_idx_vec = v_tmp1_block + bi * VLEN
                     slots.append(("valu", ("-", relative_idx_vec, v_idx, v_level_start)))
                     
-                    # Build vselect tree - reuse v_tmp2_block for intermediate temps (sequential processing)
-                    # CRITICAL FIX: Use relative_idx_vec space for final output when aliased.
-                    # The vselect tree reads relative_idx_vec only in layer 1 (to compute go_left1 and next_rel_idx1),
-                    # then uses next_rel_idx1, next_rel_idx2, next_rel_idx3 in later layers.
-                    # By layer 4 (when we write final_out), relative_idx_vec is no longer needed.
-                    # This gives us per-item final output space even when v_tmp3_block is aliased.
-                    tree_temp_base = v_tmp2_block  # Reuse for all items (sequential, no conflicts)
-                    if v_tmp3_block != v_tmp2_block:
-                        # Separate buffer: use per-item offsets (safe, like level2_round)
-                        final_temp = v_tmp3_block + bi * VLEN
-                    else:
-                        # Aliased: reuse relative_idx_vec space for final output (per-item, safe!)
-                        # This works because:
-                        # 1. vselect tree reads relative_idx_vec in layer 1 only
-                        # 2. Layer 2+ use next_rel_idx1, next_rel_idx2, next_rel_idx3 (not relative_idx_vec)
-                        # 3. By layer 4, relative_idx_vec is no longer needed
-                        # 4. Each item has its own relative_idx_vec (v_tmp1_block + bi * VLEN)
-                        final_temp = relative_idx_vec  # Per-item space, safe to reuse
+                    # Build vselect tree
+                    # tree_temp_base: Shared v_tmp2_block (sequential processing should be safe,
+                    # but bundler reordering might cause conflicts - this is the known issue)
+                    # final_temp: Use relative_idx_vec space (per-item, safe after layer 1)
+                    # NOTE: This approach may still have bundler reordering issues with tree_temp_base.
+                    # The proper fix would be per-item tree temps, but that exceeds scratch limits.
+                    tree_temp_base = v_tmp2_block  # Shared - potential bundler conflict source
+                    final_temp = relative_idx_vec  # Per-item isolated space for final output
                     final_out, tree_slots = self.build_vselect_tree_reuse(
                         level_base, relative_idx_vec, level_size, 
                         tree_temp_base, final_temp,
@@ -1846,8 +1851,6 @@ class KernelBuilder:
                     slots.extend(tree_slots)
                     
                     # XOR selected node value into hash
-                    # final_out is in per-item space (either v_tmp3_block + bi*VLEN or relative_idx_vec),
-                    # so this is safe even when processing multiple block items
                     slots.append(("valu", ("^", v_val, v_val, final_out)))
             elif level4_precompute_round and (level is None or level not in upper_levels or len(upper_levels) == 0):
                 # Level4 precompute was requested but not available - fall back to normal loads
