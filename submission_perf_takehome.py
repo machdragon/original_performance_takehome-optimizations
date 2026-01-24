@@ -1,5 +1,6 @@
 
 import random
+import sys
 import unittest
 
 from problem import (
@@ -1235,18 +1236,21 @@ class KernelBuilder:
         # We'll check this after round_info is built, but for now use conservative check
         # Note: v_tmp4_block allocation is optional - code will work without it (using fallback path)
         # TODO: Move this check after round_info is built to be more precise
-        level3_dedup_needed = (
-            forest_height >= 3
-            and not enable_level3_where
-            and use_cross_round
-            and self.assume_zero_indices
-        )
-        if not v_tmp4_block and level3_dedup_needed:
-            try:
-                v_tmp4_block = self.alloc_scratch("v_tmp4_block_l3", block_size * VLEN)
-            except AssertionError:
-                # Out of scratch space - will use fallback path without v_tmp4_block
-                v_tmp4_block = None
+        # Level 3 dedup needs v_tmp4_block, but scratch space is tight
+        # Only allocate if we're sure we'll use it AND have space
+        # For now, skip allocation to avoid scratch overflow - code will use fallback path
+        # TODO: Optimize scratch usage to allow v_tmp4_block allocation
+        # level3_dedup_needed = (
+        #     forest_height >= 3
+        #     and not enable_level3_where
+        #     and use_cross_round
+        #     and self.assume_zero_indices
+        # )
+        # if not v_tmp4_block and level3_dedup_needed:
+        #     try:
+        #         v_tmp4_block = self.alloc_scratch("v_tmp4_block_l3", block_size * VLEN)
+        #     except AssertionError:
+        #         v_tmp4_block = None
         
         can_alias_tmp23 = not enable_level2_where and not enable_level3_where
         if can_alias_tmp23:
@@ -1976,6 +1980,19 @@ class KernelBuilder:
         ):
             slots = []
             node_buf = v_node_block[buf_idx]
+            # Define v_one and v_zero lazily - they're cached by scratch_vconst so won't allocate multiple times
+            v_one = None
+            v_zero = None
+            def get_v_one():
+                nonlocal v_one
+                if v_one is None:
+                    v_one = self.scratch_vconst(1)
+                return v_one
+            def get_v_zero():
+                nonlocal v_zero
+                if v_zero is None:
+                    v_zero = self.scratch_vconst(0)
+                return v_zero
 
             if level4_precompute_round and level is not None and level in upper_levels and len(upper_levels) > 0 and len(block_vecs) <= VLEN:
                 level_base = upper_levels[level]
@@ -2026,7 +2043,7 @@ class KernelBuilder:
                     slots.append(("valu", ("<", v_left, v_offset, v_one)))
                     slots.append(("flow", ("vselect", v_left, v_left, node0, node1)))
                     slots.append(("valu", ("-", v_offset, v_offset, v_two)))
-                    slots.append(("valu", ("<", v_offset, v_offset, v_one)))
+                    slots.append(("valu", ("<", v_offset, v_offset, get_v_one())))
                     slots.append(("flow", ("vselect", v_offset, v_offset, node2, node3)))
                     slots.append(("flow", ("vselect", v_offset, v_go_left1, v_left, v_offset)))
                     slots.append(("valu", ("^", v_val, v_val, v_offset)))
@@ -2037,6 +2054,7 @@ class KernelBuilder:
             elif node_pair is not None:
                 if self.enable_level2_where and v_level1_left is not None:
                     node_right, _node_diff = node_pair
+                    v_one = self.scratch_vconst(1)
                     for bi, vec_i in enumerate(block_vecs):
                         v_idx = idx_cache + vec_i
                         slots.append(
@@ -2150,13 +2168,17 @@ class KernelBuilder:
                 # Formula: out = low + mask * (high - low), where mask = (offset >> bit) & 1
                 # Total: 1 (offset) + 3*3 (3 layers: >>&, -, multiply_add) + 1 (hash) = 11 ops
                 # Can optimize to ~9 by fusing operations
+                
+                # Debug: Confirm path is triggered
+                if self.enable_debug:
+                    print(f"LEVEL3_DEDUP_PATH_TRIGGERED: round={round}, level={level}, level3_dedup_round={level3_dedup_round}, "
+                          f"level2_round={level2_round}, node_arith={node_arith}")
                 # Total: 1 (offset) + 3*3 (3 layers: >>&, -, multiply_add) + 1 (hash) = 11 ops
                 # Can optimize to ~9 by fusing operations
                 
                 level3_vecs = level3_vecs_base
                 node_buf = v_node_block[buf_idx]
                 v_level_start = self.scratch_vconst(7)
-                v_one = self.scratch_vconst(1)
                 bits = 3  # level_size = 8, log2(8) = 3
                 
                 for bi, vec_i in enumerate(block_vecs):
@@ -2182,7 +2204,7 @@ class KernelBuilder:
                         
                         # Extract bit: mask = (offset >> bit) & 1 - 2 ops
                         slots.append(("valu", (">>", v_mask_temp, v_offset, v_bit_shift)))
-                        slots.append(("valu", ("&", v_mask, v_mask_temp, v_one)))
+                        slots.append(("valu", ("&", v_mask, v_mask_temp, get_v_one())))
                         
                         # Compute high branch: current_high = current_low + stride * VLEN
                         current_high = current_low + stride * VLEN
@@ -2203,9 +2225,8 @@ class KernelBuilder:
                     # Hash with selected node value - 1 op
                     slots.append(("valu", ("^", v_val, v_val, node_buf + bi * VLEN)))
                     
-                    # Trace marker for debugging
-                    if self.enable_debug:
-                        slots.append(("debug", ("LEVEL3_DEDUP_TRIGGERED", round, level, bi)))
+                    # Trace marker for debugging (always add, even if enable_debug=False, for verification)
+                    slots.append(("debug", ("LEVEL3_DEDUP_TRIGGERED", round, level, bi)))
             else:
                 for bi, vec_i in enumerate(block_vecs):
                     v_val = val_cache + vec_i
@@ -2252,14 +2273,16 @@ class KernelBuilder:
                         )
 
             if fast_wrap and wrap_round:
+                v_zero = self.scratch_vconst(0)
                 for _bi, vec_i in enumerate(block_vecs):
                     v_idx = idx_cache + vec_i
                     slots.append(("valu", ("+", v_idx, v_zero, v_zero)))
             else:
+                v_one = self.scratch_vconst(1)
                 for bi, vec_i in enumerate(block_vecs):
                     v_val = val_cache + vec_i
                     slots.append(
-                        ("valu", ("&", v_tmp3_block + bi * VLEN, v_val, v_one))
+                        ("valu", ("&", v_tmp3_block + bi * VLEN, v_val, get_v_one()))
                     )
                 for bi, _vec_i in enumerate(block_vecs):
                     slots.append(
@@ -2483,6 +2506,17 @@ class KernelBuilder:
                     and not level2_round
                     and not level2_dedup_round
                 )
+                # Debug logging - always store for level 3 to see what's happening
+                if level == 3:
+                    debug_msg = (f"ROUND={round}, level={level}, fast_wrap={fast_wrap}, enable_level3_where={enable_level3_where}, "
+                          f"enable_prefetch={enable_prefetch}, uniform_round={uniform_round}, binary_round={binary_round}, "
+                          f"arith_round={arith_round}, level2_round={level2_round}, level2_dedup_round={level2_dedup_round}, "
+                          f"level3_dedup_round={level3_dedup_round}, use_cross_round={use_cross_round}, use_special={use_special}")
+                    # Store in round_info for inspection
+                    round_info[-1]["_debug_level3"] = debug_msg
+                    # Also print if debug enabled (but fast_wrap=False when debug=True, so this won't show for level 3)
+                    if self.enable_debug:
+                        print(debug_msg, file=sys.stderr)
                 level4_precompute_round = (
                     enable_level4_precompute
                     and level == 4
