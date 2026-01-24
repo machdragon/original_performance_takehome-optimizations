@@ -1,5 +1,6 @@
 
 import random
+import sys
 import unittest
 
 from problem import (
@@ -246,6 +247,9 @@ class KernelBuilder:
                 skipped_writes.update(writes)
             return None
 
+        recent_load_history = []  # Track loads from previous bundles for latency-aware scheduling
+        LOAD_LATENCY = 1  # Loads are available 1 cycle after issue
+        
         i = 0
         while i < len(slots_info):
             info = slots_info[i]
@@ -259,14 +263,25 @@ class KernelBuilder:
             barrier = info["barrier"]
 
             if barrier:
+                # Track loads before flush
+                if self.enable_latency_aware:
+                    if "load" in bundle:
+                        recent_load_history.append(set(bundle_writes))
+                        if len(recent_load_history) > LOAD_LATENCY:
+                            recent_load_history.pop(0)
                 flush()
                 instrs.append({engine: [slot]})
                 i += 1
                 continue
 
             recent_loads = set()
-            if self.enable_latency_aware and "load" in bundle:
-                recent_loads = bundle_writes
+            if self.enable_latency_aware:
+                # Track loads from current bundle
+                if "load" in bundle:
+                    recent_loads.update(bundle_writes)
+                # Track loads from previous bundles (latency)
+                for prev_loads in recent_load_history:
+                    recent_loads.update(prev_loads)
 
             if engine != "load" and bundle_loads() < SLOT_LIMITS["load"]:
                 while bundle_loads() < SLOT_LIMITS["load"]:
@@ -322,6 +337,12 @@ class KernelBuilder:
             add_to_bundle(info)
             i += 1
 
+        # Track loads before final flush
+        if self.enable_latency_aware:
+            if "load" in bundle:
+                recent_load_history.append(set(bundle_writes))
+                if len(recent_load_history) > LOAD_LATENCY:
+                    recent_load_history.pop(0)
         flush()
 
         if False and self.enable_combining:
@@ -391,32 +412,92 @@ class KernelBuilder:
         if self.enable_second_pass:
             for i in range(len(instrs)):
                 bundle = instrs[i].copy()
-
+                
+                # Extract slots by engine
                 load_slots = bundle.pop("load", [])
                 valu_slots = bundle.pop("valu", [])
                 alu_slots = bundle.pop("alu", [])
                 store_slots = bundle.pop("store", [])
                 flow_slots = bundle.pop("flow", [])
                 debug_slots = bundle.pop("debug", [])
-
+                
+                # Build dependency graph for reordering
+                all_slots = []
+                slot_deps = {}  # slot -> set of dependencies (reads)
+                slot_writes = {}  # slot -> set of writes
+                
+                for slot in load_slots:
+                    reads, writes, _ = self._slot_reads_writes("load", slot)
+                    all_slots.append(("load", slot))
+                    slot_deps[("load", slot)] = reads
+                    slot_writes[("load", slot)] = writes
+                for slot in valu_slots:
+                    reads, writes, _ = self._slot_reads_writes("valu", slot)
+                    all_slots.append(("valu", slot))
+                    slot_deps[("valu", slot)] = reads
+                    slot_writes[("valu", slot)] = writes
+                for slot in alu_slots:
+                    reads, writes, _ = self._slot_reads_writes("alu", slot)
+                    all_slots.append(("alu", slot))
+                    slot_deps[("alu", slot)] = reads
+                    slot_writes[("alu", slot)] = writes
+                for slot in store_slots:
+                    reads, writes, _ = self._slot_reads_writes("store", slot)
+                    all_slots.append(("store", slot))
+                    slot_deps[("store", slot)] = reads
+                    slot_writes[("store", slot)] = writes
+                for slot in flow_slots:
+                    reads, writes, _ = self._slot_reads_writes("flow", slot)
+                    all_slots.append(("flow", slot))
+                    slot_deps[("flow", slot)] = reads
+                    slot_writes[("flow", slot)] = writes
+                
+                # Topological sort: prioritize loads, then VALU, then ALU, respecting dependencies
+                reordered_slots = []
+                remaining = set(all_slots)
+                scheduled_writes = set()
+                
+                def can_schedule(slot_info):
+                    engine, slot = slot_info
+                    deps = slot_deps[slot_info]
+                    # Can schedule if all dependencies are satisfied (all deps are in scheduled_writes)
+                    return deps.issubset(scheduled_writes)
+                
+                # Priority order: load > valu > alu > store > flow
+                engine_priority = {"load": 0, "valu": 1, "alu": 2, "store": 3, "flow": 4}
+                
+                while remaining:
+                    # Find schedulable slots, prioritizing by engine
+                    candidates = [s for s in remaining if can_schedule(s)]
+                    if not candidates:
+                        # No dependencies satisfied, schedule any (shouldn't happen if bundler is correct)
+                        candidates = list(remaining)
+                    
+                    # Sort by engine priority
+                    candidates.sort(key=lambda s: engine_priority.get(s[0], 99))
+                    next_slot = candidates[0]
+                    
+                    engine, slot = next_slot
+                    reordered_slots.append((engine, slot))
+                    remaining.remove(next_slot)
+                    scheduled_writes.update(slot_writes[next_slot])
+                
+                # Rebuild bundle in dependency order, respecting slot limits
                 reordered = {}
-                if load_slots:
-                    reordered["load"] = load_slots[:SLOT_LIMITS["load"]]
-                if valu_slots:
-                    reordered["valu"] = valu_slots[:SLOT_LIMITS["valu"]]
-                if alu_slots:
-                    reordered["alu"] = alu_slots[:SLOT_LIMITS["alu"]]
-                if store_slots:
-                    reordered["store"] = store_slots[:SLOT_LIMITS["store"]]
-                if flow_slots:
-                    reordered["flow"] = flow_slots[:SLOT_LIMITS["flow"]]
+                for engine, slot in reordered_slots:
+                    engine_list = reordered.setdefault(engine, [])
+                    if len(engine_list) < SLOT_LIMITS.get(engine, 999):
+                        engine_list.append(slot)
+                
+                # Add debug slots (no limits)
                 if debug_slots:
                     reordered["debug"] = debug_slots
-
+                
+                # Add any remaining slots that didn't fit (shouldn't happen)
                 for engine, slots in bundle.items():
                     if slots:
                         reordered.setdefault(engine, []).extend(slots)
-
+                
                 instrs[i] = reordered
 
         return instrs
@@ -1143,12 +1224,39 @@ class KernelBuilder:
         v_tmp1_block = self.alloc_scratch("v_tmp1_block", block_size * VLEN)
         v_tmp2_block = self.alloc_scratch("v_tmp2_block", block_size * VLEN)
         
+        # Pre-allocate level start constants for Level 2 and Level 3 dedup (reused across rounds)
+        # These are cached by scratch_vconst, so pre-allocating here ensures they exist
+        # and avoids per-round allocations that might push us over scratch limit
+        v_level_start_3 = self.scratch_vconst(3)  # For Level 2 dedup
+        v_level_start_7 = self.scratch_vconst(7)  # For Level 3 dedup
+        
         v_tmp4_block = None
         if enable_arith:
             v_tmp4_block = self.alloc_scratch("v_tmp4_block", block_size * VLEN)
-
         enable_level2_where = self.enable_level2_where
         enable_level3_where = self.enable_level3_where
+        
+        # Level 3 deduplication needs v_tmp4_block for 4 pairs (8 nodes)
+        # Make allocation conditional: only allocate if level3 dedup rounds will be used
+        # Check if level 3 rounds exist and dedup will be triggered
+        # We'll check this after round_info is built, but for now use conservative check
+        # Note: v_tmp4_block allocation is optional - code will work without it (using fallback path)
+        # TODO: Move this check after round_info is built to be more precise
+        # Level 3 dedup needs v_tmp4_block, but scratch space is tight
+        # Only allocate if we're sure we'll use it AND have space
+        # For now, skip allocation to avoid scratch overflow - code will use fallback path
+        # TODO: Optimize scratch usage to allow v_tmp4_block allocation
+        # level3_dedup_needed = (
+        #     forest_height >= 3
+        #     and not enable_level3_where
+        #     and use_cross_round
+        #     and self.assume_zero_indices
+        # )
+        # if not v_tmp4_block and level3_dedup_needed:
+        #     try:
+        #         v_tmp4_block = self.alloc_scratch("v_tmp4_block_l3", block_size * VLEN)
+        #     except AssertionError:
+        #         v_tmp4_block = None
         
         can_alias_tmp23 = not enable_level2_where and not enable_level3_where
         if can_alias_tmp23:
@@ -1160,6 +1268,15 @@ class KernelBuilder:
         level2_tree_tmp_base = None
         level2_addr_temp = tmp1
         level2_scalars_base = v_tmp1
+        
+        # Level 3 deduplication: indices 7-14 (8 nodes)
+        # Use v_node_block[1] for level3 if level2 uses [0], otherwise use [0]
+        level3_base_addr_const = self.scratch_const(7)
+        if enable_level2_where:
+            level3_vecs_base = v_node_block[1]  # Level 2 uses [0], so use [1] for level 3
+        else:
+            level3_vecs_base = v_node_block[0]  # Can reuse [0] if level2 not using it
+        level3_addr_temp = tmp2
 
         level_vec_base = []
         level_sizes = []
@@ -1687,6 +1804,33 @@ class KernelBuilder:
                     ("valu", ("vbroadcast", level2_vecs_base + i * VLEN, level2_scalars_base + i))
                 )
             return slots
+        
+        def level2_prepare_slots_dedup():
+            """Prepare level 2 vectors for gather deduplication (works even when enable_level2_where is False)"""
+            slots = []
+            level2_scalars = [v_tmp1, v_tmp2, v_tmp3, tmp1]
+            slots.append(("alu", ("+", level2_addr_temp, self.scratch["forest_values_p"], level2_base_addr_const)))
+            for i in range(4):
+                slots.append(("load", ("load", level2_scalars[i], level2_addr_temp)))
+                if i < 3:
+                    slots.append(("flow", ("add_imm", level2_addr_temp, level2_addr_temp, 1)))
+            for i in range(4):
+                slots.append(("valu", ("vbroadcast", level2_vecs_base + i * VLEN, level2_scalars[i])))
+            return slots
+        
+        def level3_prepare_slots_dedup():
+            """Prepare level 3 vectors for gather deduplication (8 nodes, indices 7-14)"""
+            slots = []
+            # Reuse scalar temps: v_tmp1-3, tmp1-3 for 8 values
+            level3_scalars = [v_tmp1, v_tmp2, v_tmp3, tmp1, tmp2, tmp3, v_tmp1, v_tmp2]  # Reuse some for last 2
+            slots.append(("alu", ("+", level3_addr_temp, self.scratch["forest_values_p"], level3_base_addr_const)))
+            for i in range(8):
+                slots.append(("load", ("load", level3_scalars[i], level3_addr_temp)))
+                if i < 7:
+                    slots.append(("flow", ("add_imm", level3_addr_temp, level3_addr_temp, 1)))
+            for i in range(8):
+                slots.append(("valu", ("vbroadcast", level3_vecs_base + i * VLEN, level3_scalars[i])))
+            return slots
 
         def emit_level_select_block_slots(block_vecs, buf_idx, node_arith):
             level = node_arith["level"]
@@ -1838,9 +1982,12 @@ class KernelBuilder:
             level2_round=False,
             level4_precompute_round=False,
             level=None,
+            level3_dedup_round=False,
         ):
             slots = []
             node_buf = v_node_block[buf_idx]
+            # Reuse pre-allocated constants from outer scope (v_one, v_zero, v_two already allocated)
+            # These are passed via closure, so no need to allocate again
 
             if level4_precompute_round and level is not None and level in upper_levels and len(upper_levels) > 0 and len(block_vecs) <= VLEN:
                 level_base = upper_levels[level]
@@ -1886,7 +2033,7 @@ class KernelBuilder:
                     v_offset = v_tmp1_block + bi * VLEN
                     v_go_left1 = v_tmp2_block + bi * VLEN
                     v_left = v_tmp3_block + bi * VLEN
-                    slots.append(("valu", ("-", v_offset, v_idx, v_level_start)))
+                    slots.append(("valu", ("-", v_offset, v_idx, v_level_start_3)))
                     slots.append(("valu", ("<", v_go_left1, v_offset, v_two)))
                     slots.append(("valu", ("<", v_left, v_offset, v_one)))
                     slots.append(("flow", ("vselect", v_left, v_left, node0, node1)))
@@ -1902,6 +2049,7 @@ class KernelBuilder:
             elif node_pair is not None:
                 if self.enable_level2_where and v_level1_left is not None:
                     node_right, _node_diff = node_pair
+                    v_one = self.scratch_vconst(1)
                     for bi, vec_i in enumerate(block_vecs):
                         v_idx = idx_cache + vec_i
                         slots.append(
@@ -1965,6 +2113,115 @@ class KernelBuilder:
                     slots.append(
                         ("valu", ("^", v_val, v_val, node_base + bi * VLEN))
                     )
+            elif level == 2 and not level2_round and node_arith is None:
+                # Gather deduplication for Level 2: VALU-only arithmetic selection (avoids flow engine bottleneck)
+                # Vectors should be prepared once per round by level2_prepare_slots_dedup() at round start
+                # This maintains the load pipeline by doing loads early, then VALU work
+                # Level 2 has indices 3-6, so we load those 4 values once per round
+                # Uses multiply_add for selection instead of vselect (flow engine has only 1 slot/cycle!)
+                
+                # Use pre-prepared vectors (level2_vecs_base = v_node_block[0])
+                level2_vecs = level2_vecs_base
+                node_buf = v_node_block[buf_idx]
+                # Reuse pre-allocated v_level_start_3 from outer scope
+                for bi, vec_i in enumerate(block_vecs):
+                    v_idx = idx_cache + vec_i
+                    v_val = val_cache + vec_i
+                    v_offset = v_tmp2_block + bi * VLEN
+                    v_bit0 = v_tmp1_block + bi * VLEN
+                    v_bit1 = v_tmp3_block + bi * VLEN
+                    
+                    # Compute relative offset (idx - 3) and extract bits
+                    slots.append(("valu", ("-", v_offset, v_idx, v_level_start)))
+                    slots.append(("valu", ("&", v_bit0, v_offset, v_one)))
+                    slots.append(("valu", (">>", v_bit1, v_offset, self.scratch_vconst(1))))
+                    slots.append(("valu", ("&", v_bit1, v_bit1, v_one)))
+                    
+                    # Compute differences between adjacent nodes
+                    v_diff_01 = v_tmp1_block + bi * VLEN
+                    v_diff_23 = v_tmp2_block + bi * VLEN
+                    slots.append(("valu", ("-", v_diff_01, level2_vecs + 1 * VLEN, level2_vecs + 0 * VLEN)))
+                    slots.append(("valu", ("-", v_diff_23, level2_vecs + 3 * VLEN, level2_vecs + 2 * VLEN)))
+                    
+                    # Select low pair (0 or 1) based on bit0
+                    v_sel_low = v_tmp1_block + bi * VLEN
+                    v_sel_high = v_tmp2_block + bi * VLEN
+                    slots.append(("valu", ("multiply_add", v_sel_low, v_bit0, v_diff_01, level2_vecs + 0 * VLEN)))
+                    slots.append(("valu", ("multiply_add", v_sel_high, v_bit0, v_diff_23, level2_vecs + 2 * VLEN)))
+                    
+                    # Select final result (low or high) based on bit1
+                    v_result = v_tmp3_block + bi * VLEN
+                    slots.append(("valu", ("-", v_result, v_sel_high, v_sel_low)))
+                    slots.append(("valu", ("multiply_add", node_buf + bi * VLEN, v_bit1, v_result, v_sel_low)))
+                    
+                    # Hash with selected node value
+                    slots.append(("valu", ("^", v_val, v_val, node_buf + bi * VLEN)))
+            elif level == 3 and level3_dedup_round and not level2_round and node_arith is None:
+                # Gather deduplication for Level 3: Optimized VALU-only selection (~9 ops)
+                # Level 3 has indices 7-14 (8 nodes), 3-bit relative offset
+                # Strategy: Process layer-by-layer in reverse (msb first), using bitmask tricks
+                # Formula: out = low + mask * (high - low), where mask = (offset >> bit) & 1
+                # Total: 1 (offset) + 3*3 (3 layers: >>&, -, multiply_add) + 1 (hash) = 11 ops
+                # Can optimize to ~9 by fusing operations
+                
+                # Debug: Confirm path is triggered
+                if self.enable_debug:
+                    print(f"LEVEL3_DEDUP_PATH_TRIGGERED: round={round}, level={level}, level3_dedup_round={level3_dedup_round}, "
+                          f"level2_round={level2_round}, node_arith={node_arith}")
+                # Total: 1 (offset) + 3*3 (3 layers: >>&, -, multiply_add) + 1 (hash) = 11 ops
+                # Can optimize to ~9 by fusing operations
+                
+                level3_vecs = level3_vecs_base
+                node_buf = v_node_block[buf_idx]
+                # Reuse pre-allocated v_level_start_7 from outer scope
+                bits = 3  # level_size = 8, log2(8) = 3
+                
+                for bi, vec_i in enumerate(block_vecs):
+                    v_idx = idx_cache + vec_i
+                    v_val = val_cache + vec_i
+                    v_offset = v_tmp1_block + bi * VLEN
+                    
+                    # Compute relative offset (idx - 7) - 1 op
+                    slots.append(("valu", ("-", v_offset, v_idx, v_level_start_7)))
+                    
+                    # Process 3 layers: bit2 (msb), bit1, bit0 (lsb)
+                    # Start with full range: current_low = level3_vecs[0]
+                    current_low = level3_vecs
+                    stride = 4  # Initial stride = level_size // 2 = 4 (in VLEN units)
+                    
+                    # Use temp registers: v_tmp1=offset, v_tmp2=mask/diff, v_tmp3=out (intermediate)
+                    for bit_idx, bit in enumerate([2, 1, 0]):  # msb to lsb (bit2, bit1, bit0)
+                        v_bit_shift = self.scratch_vconst(bit)
+                        v_mask_temp = v_tmp2_block + bi * VLEN
+                        v_mask = v_tmp2_block + bi * VLEN
+                        # For final layer, write directly to node_buf; otherwise use v_tmp3
+                        v_out = node_buf + bi * VLEN if bit_idx == 2 else v_tmp3_block + bi * VLEN
+                        
+                        # Extract bit: mask = (offset >> bit) & 1 - 2 ops
+                        slots.append(("valu", (">>", v_mask_temp, v_offset, v_bit_shift)))
+                        slots.append(("valu", ("&", v_mask, v_mask_temp, v_one)))
+                        
+                        # Compute high branch: current_high = current_low + stride * VLEN
+                        current_high = current_low + stride * VLEN
+                        
+                        # Compute diff = high - low - 1 op (reuse v_mask_temp)
+                        v_diff = v_mask_temp
+                        slots.append(("valu", ("-", v_diff, current_high, current_low)))
+                        
+                        # Fused multiply_add: out = low + mask * diff - 1 op
+                        # multiply_add(dest, a, b, c) = dest = a * b + c
+                        # So: out = mask * diff + low
+                        slots.append(("valu", ("multiply_add", v_out, v_mask, v_diff, current_low)))
+                        
+                        # Update for next layer
+                        current_low = v_out
+                        stride //= 2  # Halve stride for next bit
+                    
+                    # Hash with selected node value - 1 op
+                    slots.append(("valu", ("^", v_val, v_val, node_buf + bi * VLEN)))
+                    
+                    # Trace marker for debugging (always add, even if enable_debug=False, for verification)
+                    slots.append(("debug", ("LEVEL3_DEDUP_TRIGGERED", round, level, bi)))
             else:
                 for bi, vec_i in enumerate(block_vecs):
                     v_val = val_cache + vec_i
@@ -2011,10 +2268,12 @@ class KernelBuilder:
                         )
 
             if fast_wrap and wrap_round:
+                v_zero = self.scratch_vconst(0)
                 for _bi, vec_i in enumerate(block_vecs):
                     v_idx = idx_cache + vec_i
                     slots.append(("valu", ("+", v_idx, v_zero, v_zero)))
             else:
+                v_one = self.scratch_vconst(1)
                 for bi, vec_i in enumerate(block_vecs):
                     v_val = val_cache + vec_i
                     slots.append(
@@ -2177,11 +2436,26 @@ class KernelBuilder:
                     }
         v_node_prefetch = None
 
+        # Enable prefetch for arith rounds, level2_where, level2 deduplication, or level3 deduplication
+        # Level 2/3 deduplication is used when: level==2/3, not level2/3_round, not arith_round
+        # This happens when enable_level2/3_where=False but we still want gather deduplication
+        enable_level2_dedup = (
+            not enable_level2_where
+            and fast_wrap
+            and use_cross_round
+            and rounds > 1
+        )  # Will be used for level 2 rounds if not arith_round
+        enable_level3_dedup = (
+            not enable_level3_where
+            and fast_wrap
+            and use_cross_round
+            and rounds > 1
+        )  # Will be used for level 3 rounds if not arith_round
         enable_prefetch = (
             self.enable_prefetch
             and rounds > 1
             and use_cross_round
-            and (enable_arith or enable_level2_where)
+            and (enable_arith or enable_level2_where or enable_level2_dedup or enable_level3_dedup)
         )
         if enable_prefetch:
             v_node_prefetch = self.alloc_scratch(
@@ -2207,6 +2481,37 @@ class KernelBuilder:
                 level2_round = (
                     fast_wrap and enable_level2_where and enable_prefetch and level == 2
                 )
+                level2_dedup_round = (
+                    fast_wrap
+                    and not enable_level2_where
+                    and enable_prefetch
+                    and level == 2
+                    and not uniform_round
+                    and not binary_round
+                    and not arith_round
+                )
+                level3_dedup_round = (
+                    fast_wrap
+                    and not enable_level3_where
+                    and enable_prefetch
+                    and level == 3
+                    and not uniform_round
+                    and not binary_round
+                    and not arith_round
+                    and not level2_round
+                    and not level2_dedup_round
+                )
+                # Debug logging - always store for level 3 to see what's happening
+                if level == 3:
+                    debug_msg = (f"ROUND={round}, level={level}, fast_wrap={fast_wrap}, enable_level3_where={enable_level3_where}, "
+                          f"enable_prefetch={enable_prefetch}, uniform_round={uniform_round}, binary_round={binary_round}, "
+                          f"arith_round={arith_round}, level2_round={level2_round}, level2_dedup_round={level2_dedup_round}, "
+                          f"level3_dedup_round={level3_dedup_round}, use_cross_round={use_cross_round}, use_special={use_special}")
+                    # Store in round_info for inspection
+                    round_info[-1]["_debug_level3"] = debug_msg
+                    # Also print if debug enabled (but fast_wrap=False when debug=True, so this won't show for level 3)
+                    if self.enable_debug:
+                        print(debug_msg, file=sys.stderr)
                 level4_precompute_round = (
                     enable_level4_precompute
                     and level == 4
@@ -2214,6 +2519,7 @@ class KernelBuilder:
                     and not binary_round
                     and not arith_round
                     and not level2_round
+                    and not level3_dedup_round
                 )
                 round_info.append(
                     {
@@ -2228,10 +2534,14 @@ class KernelBuilder:
                             and node_pair is None
                             and node_arith is None
                             and not level2_round
+                            and not level2_dedup_round
+                            and not level3_dedup_round
                             and not level4_precompute_round
                         ),
                         "arith_round": arith_round,
                         "level2_round": level2_round,
+                        "level2_dedup_round": level2_dedup_round,
+                        "level3_dedup_round": level3_dedup_round,
                         "level4_precompute_round": level4_precompute_round,
                     }
                 )
@@ -2239,7 +2549,7 @@ class KernelBuilder:
                 for round in range(rounds - 1):
                     info = round_info[round]
                     next_info = round_info[round + 1]
-                    if (info["arith_round"] or info["level2_round"]) and next_info["load_needed"]:
+                    if (info["arith_round"] or info["level2_round"] or info.get("level2_dedup_round", False) or info.get("level3_dedup_round", False)) and next_info["load_needed"]:
                         prefetch_next[round] = True
                         prefetch_active[round + 1] = True
 
@@ -2263,32 +2573,46 @@ class KernelBuilder:
                 for unroll_r in range(8):
                     r=unroll_r;info=round_info[r];up=prefetch_active[r];dpn=prefetch_next[r];np=v_node_prefetch if up else None
                     sr=enable_prefetch and(info["arith_round"]or info["level2_round"]);l2p=level2_prepare_slots()if info["level2_round"]else[];l2pd=False
+                    # Prepare level 2 vectors for gather deduplication if needed
+                    level2_dedup = info.get("level") == 2 and not info["level2_round"] and info.get("node_arith") is None
+                    l2p_dedup = level2_prepare_slots_dedup() if level2_dedup else []
                     if pending_prev:
                         lb=last_block_idx%2;pnp=v_node_prefetch if prev_use_prefetch else None
-                        hp=vec_block_hash_only_slots(last_block_vecs,lb,prev_info["wrap_round"],prev_info["node_const"],prev_info["node_pair"],prev_info["node_arith"],pnp,prev_info["level2_round"],prev_info.get("level4_precompute_round",False),prev_info.get("level"))
+                        hp=vec_block_hash_only_slots(last_block_vecs,lb,prev_info["wrap_round"],prev_info["node_const"],prev_info["node_pair"],prev_info["node_arith"],pnp,prev_info["level2_round"],prev_info.get("level4_precompute_round",False),prev_info.get("level"),prev_info.get("level3_dedup_round",False))
                         if info["level2_round"]:body.extend(interleave_slots(hp,l2p));l2pd=True
                         elif sr:body.extend(hp)
                         else:
                             ls=vec_block_load_slots(block_0_vecs,0,info["node_const"],info["node_pair"],info["node_arith"],np,info.get("level2_round",False),info["round"])
                             body.extend(interleave_slots(hp,ls))
                     if info["level2_round"] and not l2pd:body.extend(l2p);l2pd=True
+                    elif level2_dedup and not l2pd and l2p_dedup:body.extend(l2p_dedup);l2pd=True
+                    elif level3_dedup and not l2pd and l3p_dedup:body.extend(l3p_dedup);l2pd=True
                     if sr:
-                        body.extend(vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level")))
+                        body.extend(vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"),info.get("level3_dedup_round",False)))
                         for bi in range(1,num_blocks):
-                            b=bi%2;hs=vec_block_hash_only_slots(all_block_vecs[bi],b,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
+                            b=bi%2;hs=vec_block_hash_only_slots(all_block_vecs[bi],b,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"),info.get("level3_dedup_round",False))
                             ls=vec_block_prefetch_slots(all_block_vecs[0],v_node_prefetch)if dpn and bi==1 else[]
                             body.extend(interleave_slots(hs,ls))
+                        pending_prev=False
+                    elif level2_dedup or level3_dedup:
+                        # Level 2/3 deduplication path: prepare vectors, then hash all blocks (no loads needed)
+                        if l2p_dedup:body.extend(l2p_dedup)
+                        if l3p_dedup:body.extend(l3p_dedup)
+                        body.extend(vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"),info.get("level3_dedup_round",False)))
+                        for bi in range(1,num_blocks):
+                            b=bi%2;hs=vec_block_hash_only_slots(all_block_vecs[bi],b,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"),info.get("level3_dedup_round",False))
+                            body.extend(hs)
                         pending_prev=False
                     else:
                         sb=1
                         if up:
-                            hs=vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
+                            hs=vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"),info.get("level3_dedup_round",False))
                             ls=vec_block_load_slots(all_block_vecs[1],1,info["node_const"],info["node_pair"],info["node_arith"])
                             body.extend(interleave_slots(hs,ls));sb=2
                         elif not pending_prev:body.extend(vec_block_load_slots(block_0_vecs,0,info["node_const"],info["node_pair"],info["node_arith"]))
                         for bi in range(sb,num_blocks):
                             pb=(bi-1)%2;cb=bi%2
-                            hs=vec_block_hash_only_slots(all_block_vecs[bi-1],pb,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],None,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
+                            hs=vec_block_hash_only_slots(all_block_vecs[bi-1],pb,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],None,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"),info.get("level3_dedup_round",False))
                             ls=vec_block_load_slots(all_block_vecs[bi],cb,info["node_const"],info["node_pair"],info["node_arith"])
                             body.extend(interleave_slots(hs,ls))
                         pending_prev=True
@@ -2297,32 +2621,37 @@ class KernelBuilder:
                 for round in range(rounds):
                     info=round_info[round];up=prefetch_active[round];dpn=prefetch_next[round];np=v_node_prefetch if up else None
                     sr=enable_prefetch and(info["arith_round"]or info["level2_round"]);l2p=level2_prepare_slots()if info["level2_round"]else[];l2pd=False
+                    # Prepare level 2 vectors for gather deduplication if needed
+                    level2_dedup = info.get("level") == 2 and not info["level2_round"] and info.get("node_arith") is None
+                    l2p_dedup = level2_prepare_slots_dedup() if level2_dedup else []
                     if pending_prev:
                         lb=last_block_idx%2;pnp=v_node_prefetch if prev_use_prefetch else None
-                        hp=vec_block_hash_only_slots(last_block_vecs,lb,prev_info["wrap_round"],prev_info["node_const"],prev_info["node_pair"],prev_info["node_arith"],pnp,prev_info["level2_round"],prev_info.get("level4_precompute_round",False),prev_info.get("level"))
+                        hp=vec_block_hash_only_slots(last_block_vecs,lb,prev_info["wrap_round"],prev_info["node_const"],prev_info["node_pair"],prev_info["node_arith"],pnp,prev_info["level2_round"],prev_info.get("level4_precompute_round",False),prev_info.get("level"),prev_info.get("level3_dedup_round",False))
                         if info["level2_round"]:body.extend(interleave_slots(hp,l2p));l2pd=True
+                        elif level2_dedup:body.extend(interleave_slots(hp,l2p_dedup));l2pd=True
                         elif sr:body.extend(hp)
                         else:
                             ls=vec_block_load_slots(block_0_vecs,0,info["node_const"],info["node_pair"],info["node_arith"],np,info.get("level2_round",False),info["round"])
                             body.extend(interleave_slots(hp,ls))
                     if info["level2_round"]and not l2pd:body.extend(l2p);l2pd=True
+                    elif level2_dedup and not l2pd and l2p_dedup:body.extend(l2p_dedup);l2pd=True
                     if sr:
-                        body.extend(vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level")))
+                        body.extend(vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"),info.get("level3_dedup_round",False)))
                         for bi in range(1,num_blocks):
-                            b=bi%2;hs=vec_block_hash_only_slots(all_block_vecs[bi],b,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
+                            b=bi%2;hs=vec_block_hash_only_slots(all_block_vecs[bi],b,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"),info.get("level3_dedup_round",False))
                             ls=vec_block_prefetch_slots(all_block_vecs[0],v_node_prefetch)if dpn and bi==1 else[]
                             body.extend(interleave_slots(hs,ls))
                         pending_prev=False
                     else:
                         sb=1
                         if up:
-                            hs=vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
+                            hs=vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"),info.get("level3_dedup_round",False))
                             ls=vec_block_load_slots(all_block_vecs[1],1,info["node_const"],info["node_pair"],info["node_arith"])
                             body.extend(interleave_slots(hs,ls));sb=2
                         elif not pending_prev:body.extend(vec_block_load_slots(block_0_vecs,0,info["node_const"],info["node_pair"],info["node_arith"]))
                         for bi in range(sb,num_blocks):
                             pb=(bi-1)%2;cb=bi%2
-                            hs=vec_block_hash_only_slots(all_block_vecs[bi-1],pb,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],None,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
+                            hs=vec_block_hash_only_slots(all_block_vecs[bi-1],pb,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],None,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"),info.get("level3_dedup_round",False))
                             ls=vec_block_load_slots(all_block_vecs[bi],cb,info["node_const"],info["node_pair"],info["node_arith"])
                             body.extend(interleave_slots(hs,ls))
                         pending_prev=True
