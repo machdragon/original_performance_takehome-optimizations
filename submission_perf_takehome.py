@@ -1769,7 +1769,7 @@ class KernelBuilder:
             slots = []
             node_buf = v_node_block[buf_idx]
 
-            if level4_precompute_round and level is not None and level in upper_levels and len(upper_levels) > 0:
+            if level4_precompute_round and level is not None and level in upper_levels and len(upper_levels) > 0 and len(block_vecs) <= VLEN:
                 level_base = upper_levels[level]
                 level_size = 1 << level
                 level_start = (1 << level) - 1 if level > 0 else 0
@@ -1779,7 +1779,7 @@ class KernelBuilder:
                     v_val = val_cache + vec_i
                     relative_idx_vec = v_tmp1_block + bi * VLEN
                     slots.append(("valu", ("-", relative_idx_vec, v_idx, v_level_start)))
-                    tree_temp_base = v_node_block[1]
+                    tree_temp_base = v_tmp2_block
                     final_temp = v_node_block[0] + bi * VLEN
                     final_out, tree_slots = self.build_vselect_tree_reuse(
                         level_base, relative_idx_vec, level_size, 
