@@ -3131,32 +3131,6 @@ class KernelBuilder:
 
                     prev_info = info
                     prev_use_prefetch = False
-            else:
-                # Original looped path
-                for round in range(rounds):
-                    info = round_info[round]
-                    use_prefetch = prefetch_active[round]
-                    do_prefetch_next = prefetch_next[round]
-                    node_prefetch = v_node_prefetch if use_prefetch else None
-                    # Only true for arith rounds that have spare load
-                    # bandwidth – consumer rounds that *use* prefetch
-                    # but aren't arith still go through the normal
-                    # pipelined path below, with use_prefetch guiding
-                    # how block 0 is consumed.
-                    special_round = enable_prefetch and (
-                        info["arith_round"]
-                        or info["level2_round"]
-                        or info["level3_round"]
-                        or info["level4_round"]
-                    )
-                    level2_prep = level2_prepare_slots() if info["level2_round"] else []
-                    level3_prep = level3_prepare_slots() if info["level3_round"] else []
-                    level4_prep = level4_prepare_slots() if info["level4_round"] else []
-                    level2_prepared = False
-                    level3_prepared = False
-                    level4_prepared = False
-
-                if pending_prev:
                     last_buf = last_block_idx % 2
                     prev_node_prefetch = v_node_prefetch if prev_use_prefetch else None
                     hash_prev = vec_block_hash_only_slots(
