@@ -949,12 +949,14 @@ class KernelBuilder:
         body.append(("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"])))
         
         # Pre-create all hash stage constants (build_hash_vec uses scratch_vconst)
+        # Store the constant addresses so build_hash_vec can reuse them
+        hash_const_map = {}
         for op1, val1, op2, op3, val3 in HASH_STAGES:
-            self.scratch_vconst(val1)
-            self.scratch_vconst(val3)
+            hash_const_map[val1] = self.scratch_vconst(val1)
+            hash_const_map[val3] = self.scratch_vconst(val3)
             if op1 == "+" and op2 == "+" and op3 == "<<":
                 factor = 1 + (1 << val3)
-                self.scratch_vconst(factor)
+                hash_const_map[factor] = self.scratch_vconst(factor)
 
         # Process rounds sequentially - match general kernel's vec_hash_slots structure
         for r in range(rounds):
@@ -988,8 +990,31 @@ class KernelBuilder:
                 # XOR value with node (matches vec_hash_slots)
                 body.append(("valu", ("^", val_addr, val_addr, node_addr)))
                 
-                # Hash value - use build_hash_vec which matches vec_hash_slots in general kernel
-                body.extend(self.build_hash_vec(val_addr, tmp1_vec, tmp2_vec))
+                # Hash value - manually implement build_hash_vec to avoid scratch_vconst calls during body building
+                # This ensures all constants are created before body is built
+                for op1, val1, op2, op3, val3 in HASH_STAGES:
+                    if op1 == "+" and op2 == "+" and op3 == "<<":
+                        factor = 1 + (1 << val3)
+                        body.append(
+                            (
+                                "valu",
+                                (
+                                    "multiply_add",
+                                    val_addr,
+                                    val_addr,
+                                    hash_const_map[factor],
+                                    hash_const_map[val1],
+                                ),
+                            )
+                        )
+                    else:
+                        body.append(
+                            ("valu", (op1, tmp1_vec, val_addr, hash_const_map[val1]))
+                        )
+                        body.append(
+                            ("valu", (op3, tmp2_vec, val_addr, hash_const_map[val3]))
+                        )
+                        body.append(("valu", (op2, val_addr, tmp1_vec, tmp2_vec)))
                 
                 # Update index: idx = idx * 2 + (val & 1) + 1
                 # Match general kernel's fast_wrap path exactly
