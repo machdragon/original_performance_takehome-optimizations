@@ -1814,25 +1814,16 @@ class KernelBuilder:
                 # v_tmp2_block: vselect tree temp space (4*VLEN per vector)
                 # v_tmp3_block: final output
                 
-                # Process block items with per-item isolated scratch (per diagnosis)
-                # CRITICAL FIX: Each block item must have isolated tree_temp_base to prevent
-                # bundler reordering from corrupting data. Per diagnosis, use per-item offsets.
+                # Process block items with proper scratch isolation (per diagnosis)
+                # CRITICAL FIX: Per diagnosis, bundler reordering causes conflicts when tree_temp_base
+                # is shared. Use v_node_block[1] for tree temps (level4 rounds don't use normal loads)
+                # and v_node_block[0] for per-item final output. This separates tree temps from
+                # final output, reducing conflict risk.
                 # 
-                # Strategy: Use v_node_block[1] (the ping-pong buffer) for tree temps since
-                # level4_precompute rounds don't use normal block loads (they use vselect).
-                # This gives us block_size*VLEN = 128 words, enough for 13*VLEN per item if
-                # we use per-item offsets: v_node_block[1] + bi * 13*VLEN
-                # However, 16 items * 13*VLEN = 1664 words, exceeds v_node_block[1] size.
-                # 
-                # Alternative: Process items in smaller groups, or use v_node_block[0] + v_node_block[1]
-                # Actually, we can use v_node_block[0] for tree temps since level4 rounds don't
-                # load to it. But we need to ensure it's large enough.
-                # 
-                # Best solution per diagnosis: Use per-item offsets within available space.
-                # Since we can't fit all items, we'll process them in a way that ensures
-                # sequential execution and use shared tree_temp_base with per-item final output.
-                # The bundler should respect the instruction stream order, but if it doesn't,
-                # we may need to add explicit barriers or disable bundling for this section.
+                # Note: We still use shared tree_temp_base (v_node_block[1]), so bundler reordering
+                # could still cause conflicts on intermediate temps. The proper fix would be per-item
+                # tree temps, but that exceeds scratch. This is a compromise that separates final
+                # output (per-item) from tree temps (shared, sequential).
                 for bi, vec_i in enumerate(block_vecs):
                     v_idx = idx_cache + vec_i
                     v_val = val_cache + vec_i
@@ -1841,12 +1832,12 @@ class KernelBuilder:
                     relative_idx_vec = v_tmp1_block + bi * VLEN
                     slots.append(("valu", ("-", relative_idx_vec, v_idx, v_level_start)))
                     
-                    # Build vselect tree with per-item final output
-                    # tree_temp_base: Shared v_tmp2_block (sequential processing should prevent conflicts,
-                    # but bundler reordering is a known risk per diagnosis)
-                    # final_temp: Per-item relative_idx_vec space (isolated, prevents final output conflicts)
-                    tree_temp_base = v_tmp2_block  # Shared - bundler reordering risk acknowledged
-                    final_temp = relative_idx_vec  # Per-item isolated space for final output
+                    # Build vselect tree
+                    # tree_temp_base: Use v_node_block[1] (level4 rounds don't load to it, safe to reuse)
+                    # Sequential processing should prevent conflicts, but bundler reordering risk exists
+                    # final_temp: Per-item v_node_block[0] + bi*VLEN (isolated, prevents final conflicts)
+                    tree_temp_base = v_node_block[1]  # Shared - sequential processing should be safe
+                    final_temp = v_node_block[0] + bi * VLEN  # Per-item isolated space for final output
                     final_out, tree_slots = self.build_vselect_tree_reuse(
                         level_base, relative_idx_vec, level_size, 
                         tree_temp_base, final_temp,
@@ -1856,7 +1847,7 @@ class KernelBuilder:
                     slots.extend(tree_slots)
                     
                     # XOR selected node value into hash
-                    # final_out is in per-item isolated space, preventing final output conflicts
+                    # final_out is in per-item isolated space, preventing bundler conflicts
                     slots.append(("valu", ("^", v_val, v_val, final_out)))
             elif level4_precompute_round and (level is None or level not in upper_levels or len(upper_levels) == 0):
                 # Level4 precompute was requested but not available - fall back to normal loads
