@@ -1224,6 +1224,12 @@ class KernelBuilder:
         v_tmp1_block = self.alloc_scratch("v_tmp1_block", block_size * VLEN)
         v_tmp2_block = self.alloc_scratch("v_tmp2_block", block_size * VLEN)
         
+        # Pre-allocate level start constants for Level 2 and Level 3 dedup (reused across rounds)
+        # These are cached by scratch_vconst, so pre-allocating here ensures they exist
+        # and avoids per-round allocations that might push us over scratch limit
+        v_level_start_3 = self.scratch_vconst(3)  # For Level 2 dedup
+        v_level_start_7 = self.scratch_vconst(7)  # For Level 3 dedup
+        
         v_tmp4_block = None
         if enable_arith:
             v_tmp4_block = self.alloc_scratch("v_tmp4_block", block_size * VLEN)
@@ -1980,19 +1986,8 @@ class KernelBuilder:
         ):
             slots = []
             node_buf = v_node_block[buf_idx]
-            # Define v_one and v_zero lazily - they're cached by scratch_vconst so won't allocate multiple times
-            v_one = None
-            v_zero = None
-            def get_v_one():
-                nonlocal v_one
-                if v_one is None:
-                    v_one = self.scratch_vconst(1)
-                return v_one
-            def get_v_zero():
-                nonlocal v_zero
-                if v_zero is None:
-                    v_zero = self.scratch_vconst(0)
-                return v_zero
+            # Reuse pre-allocated constants from outer scope (v_one, v_zero, v_two already allocated)
+            # These are passed via closure, so no need to allocate again
 
             if level4_precompute_round and level is not None and level in upper_levels and len(upper_levels) > 0 and len(block_vecs) <= VLEN:
                 level_base = upper_levels[level]
@@ -2038,12 +2033,12 @@ class KernelBuilder:
                     v_offset = v_tmp1_block + bi * VLEN
                     v_go_left1 = v_tmp2_block + bi * VLEN
                     v_left = v_tmp3_block + bi * VLEN
-                    slots.append(("valu", ("-", v_offset, v_idx, v_level_start)))
+                    slots.append(("valu", ("-", v_offset, v_idx, v_level_start_3)))
                     slots.append(("valu", ("<", v_go_left1, v_offset, v_two)))
                     slots.append(("valu", ("<", v_left, v_offset, v_one)))
                     slots.append(("flow", ("vselect", v_left, v_left, node0, node1)))
                     slots.append(("valu", ("-", v_offset, v_offset, v_two)))
-                    slots.append(("valu", ("<", v_offset, v_offset, get_v_one())))
+                    slots.append(("valu", ("<", v_offset, v_offset, v_one)))
                     slots.append(("flow", ("vselect", v_offset, v_offset, node2, node3)))
                     slots.append(("flow", ("vselect", v_offset, v_go_left1, v_left, v_offset)))
                     slots.append(("valu", ("^", v_val, v_val, v_offset)))
@@ -2128,7 +2123,7 @@ class KernelBuilder:
                 # Use pre-prepared vectors (level2_vecs_base = v_node_block[0])
                 level2_vecs = level2_vecs_base
                 node_buf = v_node_block[buf_idx]
-                v_level_start = self.scratch_vconst(3)
+                # Reuse pre-allocated v_level_start_3 from outer scope
                 for bi, vec_i in enumerate(block_vecs):
                     v_idx = idx_cache + vec_i
                     v_val = val_cache + vec_i
@@ -2178,7 +2173,7 @@ class KernelBuilder:
                 
                 level3_vecs = level3_vecs_base
                 node_buf = v_node_block[buf_idx]
-                v_level_start = self.scratch_vconst(7)
+                # Reuse pre-allocated v_level_start_7 from outer scope
                 bits = 3  # level_size = 8, log2(8) = 3
                 
                 for bi, vec_i in enumerate(block_vecs):
@@ -2187,7 +2182,7 @@ class KernelBuilder:
                     v_offset = v_tmp1_block + bi * VLEN
                     
                     # Compute relative offset (idx - 7) - 1 op
-                    slots.append(("valu", ("-", v_offset, v_idx, v_level_start)))
+                    slots.append(("valu", ("-", v_offset, v_idx, v_level_start_7)))
                     
                     # Process 3 layers: bit2 (msb), bit1, bit0 (lsb)
                     # Start with full range: current_low = level3_vecs[0]
@@ -2204,7 +2199,7 @@ class KernelBuilder:
                         
                         # Extract bit: mask = (offset >> bit) & 1 - 2 ops
                         slots.append(("valu", (">>", v_mask_temp, v_offset, v_bit_shift)))
-                        slots.append(("valu", ("&", v_mask, v_mask_temp, get_v_one())))
+                        slots.append(("valu", ("&", v_mask, v_mask_temp, v_one)))
                         
                         # Compute high branch: current_high = current_low + stride * VLEN
                         current_high = current_low + stride * VLEN
@@ -2282,7 +2277,7 @@ class KernelBuilder:
                 for bi, vec_i in enumerate(block_vecs):
                     v_val = val_cache + vec_i
                     slots.append(
-                        ("valu", ("&", v_tmp3_block + bi * VLEN, v_val, get_v_one()))
+                        ("valu", ("&", v_tmp3_block + bi * VLEN, v_val, v_one))
                     )
                 for bi, _vec_i in enumerate(block_vecs):
                     slots.append(

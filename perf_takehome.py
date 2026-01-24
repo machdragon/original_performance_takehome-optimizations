@@ -44,6 +44,7 @@ class KernelBuilder:
         max_special_level: int = -1,
         max_arith_level: int = -1,
         enable_prefetch: bool = True,
+        enable_double_buffer_prefetch: bool = False,  # Double-buffer prefetching (requires 2x scratch space)
         enable_level2_where: bool = True,
         enable_level2_valu: bool = False,
         enable_level3_valu: bool = False,
@@ -71,6 +72,7 @@ class KernelBuilder:
         self.max_special_level = max_special_level
         self.max_arith_level = max_arith_level
         self.enable_prefetch = enable_prefetch
+        self.enable_double_buffer_prefetch = enable_double_buffer_prefetch
         self.enable_level2_where = enable_level2_where
         self.enable_level2_valu = enable_level2_valu
         self.enable_level3_valu = enable_level3_valu
@@ -1585,6 +1587,11 @@ class KernelBuilder:
         v_tmp1_block = self.alloc_scratch("v_tmp1_block", block_size * VLEN)
         v_tmp2_block = self.alloc_scratch("v_tmp2_block", block_size * VLEN)
         
+        # Pre-allocate level start constants for Level 2 dedup (reused across rounds)
+        # These are cached by scratch_vconst, so pre-allocating here ensures they exist
+        # and avoids per-round allocations that might push us over scratch limit
+        v_level_start_3 = self.scratch_vconst(3)  # For Level 2 dedup
+        
         # Level 2 where-tree selection (optional): load 4 nodes once per round, vselect per vector.
         enable_level2_where = self.enable_level2_where
         enable_level2_valu = self.enable_level2_valu
@@ -1620,8 +1627,11 @@ class KernelBuilder:
         # Reuse scratch to avoid extra allocations when prefetch is enabled.
         level2_addr_temp = tmp1
         level2_scalars_base = v_tmp1  # Use first 4 lanes as scalar temps.
-        level3_base_addr_const = None
-        level3_vecs_base = v_node_block[0]  # Reuse v_node_block[0] for the 8 level-3 vectors.
+        # Level 3 where-tree selection (optional): load 8 nodes once per round, vselect per vector.
+        if enable_level2_where:
+            level3_vecs_base = v_node_block[1]  # Level 2 uses [0], so use [1] for level 3
+        else:
+            level3_vecs_base = v_node_block[0]  # Can reuse [0] if level2 not using it
         level4_base_addr_const = self.scratch_const(15)
         level4_vecs_base = v_node_block[0]  # Reuse v_node_block[0] for the 16 level-4 vectors.
         level4_diffs_base = v_node_block[1]
@@ -2856,6 +2866,15 @@ class KernelBuilder:
                     }
         # Cross-round pipelining for better load utilization.
         v_node_prefetch = None
+        # Enable prefetch for arith rounds, level2_where, level2 deduplication, or level3 deduplication
+        # Level 2/3 deduplication is used when: level==2/3, not level2/3_round, not arith_round
+        # This happens when enable_level2/3_where=False but we still want gather deduplication
+        enable_level2_dedup = (
+            not enable_level2_where
+            and fast_wrap
+            and use_cross_round
+            and rounds > 1
+        )  # Will be used for level 2 rounds if not arith_round
         # Prefetch relies on cross-round pipeline; used for arith rounds and level-2/3/4 where-tree rounds.
         enable_prefetch = (
             self.enable_prefetch
@@ -2864,21 +2883,43 @@ class KernelBuilder:
             and (
                 enable_arith
                 or enable_level2_where
+                or enable_level2_dedup
                 or enable_level3_where
                 or enable_level3_valu
                 or enable_level4_valu
                 or enable_level4_where
             )
         )
+        # Double-buffer prefetching: ping-pong between two buffers to hide memory latency
+        # Round N uses buffer A (if prefetched), prefetches round N+1 into buffer B
+        # Round N+1 uses buffer B (prefetched), prefetches round N+2 into buffer A
+        v_node_prefetch = None
+        v_node_prefetch_A = None
+        v_node_prefetch_B = None
         if enable_prefetch:
-            # Prefetch buffer only needs block 0 (block_size vectors).
-            v_node_prefetch = self.alloc_scratch(
-                "v_node_prefetch", block_size * VLEN
-            )
+            if self.enable_double_buffer_prefetch:
+                # Allocate two prefetch buffers for ping-pong pattern (requires 2x scratch space)
+                v_node_prefetch_A = self.alloc_scratch(
+                    "v_node_prefetch_A", block_size * VLEN
+                )
+                v_node_prefetch_B = self.alloc_scratch(
+                    "v_node_prefetch_B", block_size * VLEN
+                )
+                # For backward compatibility, keep v_node_prefetch pointing to A initially
+                v_node_prefetch = v_node_prefetch_A
+            else:
+                # Single buffer (original implementation)
+                v_node_prefetch = self.alloc_scratch(
+                    "v_node_prefetch", block_size * VLEN
+                )
+                v_node_prefetch_A = v_node_prefetch  # Alias for compatibility
+                v_node_prefetch_B = None
 
         round_info = []
         prefetch_active = [False] * rounds
         prefetch_next = [False] * rounds
+        # Track which prefetch buffer (A or B) each round should use
+        prefetch_buffer = [None] * rounds  # 'A', 'B', or None
         if use_cross_round:
             for round in range(rounds):
                 level = round % wrap_period
@@ -2930,17 +2971,37 @@ class KernelBuilder:
                 )
             if v_node_prefetch is not None:
                 # Prefetch the next round's node values when an arith or level-2 round appears.
-                for round in range(rounds - 1):
-                    info = round_info[round]
-                    next_info = round_info[round + 1]
-                    if (
-                        info["arith_round"]
-                        or info["level2_round"]
-                        or info["level3_round"]
-                        or info["level4_round"]
-                    ) and next_info["load_needed"]:
-                        prefetch_next[round] = True
-                        prefetch_active[round + 1] = True
+                if self.enable_double_buffer_prefetch and v_node_prefetch_B is not None:
+                    # Use ping-pong pattern: alternate between buffers A and B
+                    current_buffer = 'A'  # Start with buffer A
+                    for round in range(rounds - 1):
+                        info = round_info[round]
+                        next_info = round_info[round + 1]
+                        if (
+                            info["arith_round"]
+                            or info["level2_round"]
+                            or info["level3_round"]
+                            or info["level4_round"]
+                        ) and next_info["load_needed"]:
+                            prefetch_next[round] = True
+                            prefetch_active[round + 1] = True
+                            # Assign buffer for next round (ping-pong)
+                            prefetch_buffer[round + 1] = current_buffer
+                            # Switch to other buffer for next prefetch
+                            current_buffer = 'B' if current_buffer == 'A' else 'A'
+                else:
+                    # Single buffer (original implementation)
+                    for round in range(rounds - 1):
+                        info = round_info[round]
+                        next_info = round_info[round + 1]
+                        if (
+                            info["arith_round"]
+                            or info["level2_round"]
+                            or info["level3_round"]
+                            or info["level4_round"]
+                        ) and next_info["load_needed"]:
+                            prefetch_next[round] = True
+                            prefetch_active[round + 1] = True
 
         if use_cross_round:
             block_0_vecs = [offset * VLEN for offset in range(block_size)]
@@ -2966,7 +3027,22 @@ class KernelBuilder:
                     info = round_info[round]
                     use_prefetch = prefetch_active[round]
                     do_prefetch_next = prefetch_next[round]
-                    node_prefetch = v_node_prefetch if use_prefetch else None
+                    # Select which prefetch buffer to use (A or B) based on ping-pong pattern
+                    if self.enable_double_buffer_prefetch and v_node_prefetch_B is not None:
+                        if use_prefetch and prefetch_buffer[round] is not None:
+                            node_prefetch = v_node_prefetch_A if prefetch_buffer[round] == 'A' else v_node_prefetch_B
+                        else:
+                            node_prefetch = None
+                        # Determine which buffer to use for prefetching next round
+                        if do_prefetch_next and round < rounds - 1:
+                            next_buffer = prefetch_buffer[round + 1] if prefetch_buffer[round + 1] is not None else ('B' if prefetch_buffer[round] == 'A' else 'A')
+                            prefetch_target = v_node_prefetch_A if next_buffer == 'A' else v_node_prefetch_B
+                        else:
+                            prefetch_target = None
+                    else:
+                        # Single buffer (original implementation)
+                        node_prefetch = v_node_prefetch if use_prefetch else None
+                        prefetch_target = v_node_prefetch if do_prefetch_next else None
                     # Only true for arith rounds that have spare load
                     # bandwidth – consumer rounds that *use* prefetch
                     # but aren't arith still go through the normal
@@ -2987,7 +3063,19 @@ class KernelBuilder:
 
                     if pending_prev:
                         last_buf = last_block_idx % 2
-                        prev_node_prefetch = v_node_prefetch if prev_use_prefetch else None
+                        # Use the correct prefetch buffer for previous round
+                        if self.enable_double_buffer_prefetch and v_node_prefetch_B is not None:
+                            if prev_use_prefetch and prev_info is not None:
+                                prev_round = prev_info.get("round", 0)
+                                if prev_round < len(prefetch_buffer) and prefetch_buffer[prev_round] is not None:
+                                    prev_node_prefetch = v_node_prefetch_A if prefetch_buffer[prev_round] == 'A' else v_node_prefetch_B
+                                else:
+                                    prev_node_prefetch = v_node_prefetch_A  # Default to A if not set
+                            else:
+                                prev_node_prefetch = None
+                        else:
+                            # Single buffer (original implementation)
+                            prev_node_prefetch = v_node_prefetch if prev_use_prefetch else None
                         hash_prev = vec_block_hash_only_slots(
                             last_block_vecs,
                             last_buf,
@@ -3064,9 +3152,9 @@ class KernelBuilder:
                                 info["level4_round"],
                             )
                             load_slots = []
-                            if do_prefetch_next and block_idx == 1:
+                            if do_prefetch_next and block_idx == 1 and prefetch_target is not None:
                                 load_slots = vec_block_prefetch_slots(
-                                    all_block_vecs[0], v_node_prefetch
+                                    all_block_vecs[0], prefetch_target
                                 )
                             body.extend(interleave_slots(hash_slots, load_slots))
                         pending_prev = False
@@ -3174,6 +3262,9 @@ class KernelBuilder:
                     level2_prepared = True
                 if info["level3_round"] and not level3_prepared:
                     body.extend(level3_prep)
+                    level3_prepared = True
+                if level3_dedup and not level3_prepared and l3p_dedup:
+                    body.extend(l3p_dedup)
                     level3_prepared = True
                 if info["level4_round"] and not level4_prepared:
                     body.extend(level4_prep)
@@ -3298,9 +3389,9 @@ class KernelBuilder:
                                 info["level4_round"],
                             )
                             load_slots = []
-                            if do_prefetch_next and block_idx == 1:
+                            if do_prefetch_next and block_idx == 1 and prefetch_target is not None:
                                 load_slots = vec_block_prefetch_slots(
-                                    all_block_vecs[0], v_node_prefetch
+                                    all_block_vecs[0], prefetch_target
                                 )
                             body.extend(interleave_slots(hash_slots, load_slots))
                         pending_prev = False
@@ -3371,7 +3462,22 @@ class KernelBuilder:
                     info = round_info[round]
                     use_prefetch = prefetch_active[round]
                     do_prefetch_next = prefetch_next[round]
-                    node_prefetch = v_node_prefetch if use_prefetch else None
+                    # Select which prefetch buffer to use (A or B) based on ping-pong pattern
+                    if self.enable_double_buffer_prefetch and v_node_prefetch_B is not None:
+                        if use_prefetch and prefetch_buffer[round] is not None:
+                            node_prefetch = v_node_prefetch_A if prefetch_buffer[round] == 'A' else v_node_prefetch_B
+                        else:
+                            node_prefetch = None
+                        # Determine which buffer to use for prefetching next round
+                        if do_prefetch_next and round < rounds - 1:
+                            next_buffer = prefetch_buffer[round + 1] if prefetch_buffer[round + 1] is not None else ('B' if prefetch_buffer[round] == 'A' else 'A')
+                            prefetch_target = v_node_prefetch_A if next_buffer == 'A' else v_node_prefetch_B
+                        else:
+                            prefetch_target = None
+                    else:
+                        # Single buffer (original implementation)
+                        node_prefetch = v_node_prefetch if use_prefetch else None
+                        prefetch_target = v_node_prefetch if do_prefetch_next else None
                     # Only true for arith rounds that have spare load
                     # bandwidth – consumer rounds that *use* prefetch
                     # but aren't arith still go through the normal
@@ -3392,7 +3498,19 @@ class KernelBuilder:
 
                     if pending_prev:
                         last_buf = last_block_idx % 2
-                        prev_node_prefetch = v_node_prefetch if prev_use_prefetch else None
+                        # Use the correct prefetch buffer for previous round
+                        if self.enable_double_buffer_prefetch and v_node_prefetch_B is not None:
+                            if prev_use_prefetch and prev_info is not None:
+                                prev_round = prev_info.get("round", 0)
+                                if prev_round < len(prefetch_buffer) and prefetch_buffer[prev_round] is not None:
+                                    prev_node_prefetch = v_node_prefetch_A if prefetch_buffer[prev_round] == 'A' else v_node_prefetch_B
+                                else:
+                                    prev_node_prefetch = v_node_prefetch_A  # Default to A if not set
+                            else:
+                                prev_node_prefetch = None
+                        else:
+                            # Single buffer (original implementation)
+                            prev_node_prefetch = v_node_prefetch if prev_use_prefetch else None
                         hash_prev = vec_block_hash_only_slots(
                             last_block_vecs,
                             last_buf,
@@ -3474,9 +3592,9 @@ class KernelBuilder:
                             )
                             # Prefetch only block 0, issued one block behind so idx updates are committed.
                             load_slots = []
-                            if do_prefetch_next and block_idx == 1:
+                            if do_prefetch_next and block_idx == 1 and prefetch_target is not None:
                                 load_slots = vec_block_prefetch_slots(
-                                    all_block_vecs[0], v_node_prefetch
+                                    all_block_vecs[0], prefetch_target
                                 )
                             body.extend(interleave_slots(hash_slots, load_slots))
                         pending_prev = False
@@ -3859,6 +3977,7 @@ def do_kernel_test(
     enable_latency_aware: bool | None = None,
     enable_combining: bool | None = None,
     enable_software_pipeline: bool | None = None,
+    enable_double_buffer_prefetch: bool | None = None,
 ):
     print(f"{forest_height=}, {rounds=}, {batch_size=}")
     random.seed(seed)
@@ -3904,6 +4023,8 @@ def do_kernel_test(
         enable_combining = False
     if enable_software_pipeline is None:
         enable_software_pipeline = False
+    if enable_double_buffer_prefetch is None:
+        enable_double_buffer_prefetch = False
     kb = KernelBuilder(
         enable_debug=enable_debug,
         assume_zero_indices=assume_zero_indices,
@@ -3924,6 +4045,7 @@ def do_kernel_test(
         enable_latency_aware=enable_latency_aware,
         enable_combining=enable_combining,
         enable_software_pipeline=enable_software_pipeline,
+        enable_double_buffer_prefetch=enable_double_buffer_prefetch,
     )
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
     # print(kb.instrs)
