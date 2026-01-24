@@ -750,17 +750,36 @@ class KernelBuilder:
         slots.append(("valu", ("-", next_rel_idx1, rel_idx, subtract_mid1)))
 
         if level_size > 2:
+            # For layer 2, we need to select from the chosen half
+            # Since vselect produces a single vector (not an address), we can't use out1 as a base
+            # Instead, we use nested vselects to select the correct vectors based on both go_left1 and go_left2
+            
             mid2 = mid1 // 2
             v_mid2 = self.scratch_vconst(mid2)
             go_left2 = temp_base + temp_offset
             temp_offset += VLEN
             slots.append(("valu", ("<", go_left2, next_rel_idx1, v_mid2)))
 
-            left2 = out1
-            right2 = out1 + mid2 * VLEN
+            # Compute left2 and right2 candidates based on go_left1
+            # left2: if go_left1 then current_out else current_out + mid1*VLEN
+            # right2: if go_left1 then current_out + mid2*VLEN else current_out + mid1*VLEN + mid2*VLEN
+            left2_left_half = current_out
+            left2_right_half = current_out + mid1 * VLEN
+            right2_left_half = current_out + mid2 * VLEN
+            right2_right_half = current_out + mid1 * VLEN + mid2 * VLEN
+            
+            # Select left2 and right2 candidates based on go_left1
+            left2_candidate = temp_base + temp_offset
+            temp_offset += VLEN
+            slots.append(("flow", ("vselect", left2_candidate, go_left1, left2_left_half, left2_right_half)))
+            right2_candidate = temp_base + temp_offset
+            temp_offset += VLEN
+            slots.append(("flow", ("vselect", right2_candidate, go_left1, right2_left_half, right2_right_half)))
+            
+            # Now select final result based on go_left2
             out2 = temp_base + temp_offset
             temp_offset += VLEN
-            slots.append(("flow", ("vselect", out2, go_left2, left2, right2)))
+            slots.append(("flow", ("vselect", out2, go_left2, left2_candidate, right2_candidate)))
 
 
             if level_size > 4:
@@ -778,8 +797,26 @@ class KernelBuilder:
                 temp_offset += VLEN
                 slots.append(("valu", ("<", go_left3, next_rel_idx2, v_mid3)))
 
-                left3 = out2
-                right3 = out2 + mid3 * VLEN
+                # For layer 3, compute addresses based on previous decisions (go_left1 and go_left2)
+                # We need to determine which quarter we're in, then select left or right eighth
+                quarter0_base = current_out
+                quarter1_base = current_out + mid2 * VLEN
+                quarter2_base = current_out + mid1 * VLEN
+                quarter3_base = current_out + mid1 * VLEN + mid2 * VLEN
+                
+                # Select quarter base using nested vselects
+                quarter_left = temp_base + temp_offset
+                temp_offset += VLEN
+                slots.append(("flow", ("vselect", quarter_left, go_left2, quarter0_base, quarter1_base)))
+                quarter_right = temp_base + temp_offset
+                temp_offset += VLEN
+                slots.append(("flow", ("vselect", quarter_right, go_left2, quarter2_base, quarter3_base)))
+                quarter_base = temp_base + temp_offset
+                temp_offset += VLEN
+                slots.append(("flow", ("vselect", quarter_base, go_left1, quarter_left, quarter_right)))
+                
+                left3 = quarter_base
+                right3 = quarter_base + mid3 * VLEN
                 out3 = temp_base + temp_offset
                 temp_offset += VLEN
                 slots.append(("flow", ("vselect", out3, go_left3, left3, right3)))
@@ -792,14 +829,56 @@ class KernelBuilder:
                     temp_offset += VLEN
                     slots.append(("valu", ("-", next_rel_idx3, next_rel_idx2, subtract_mid3)))
 
+                    # For layer 4, compute addresses based on all previous decisions (go_left1, go_left2, go_left3)
+                    # We need to determine which eighth we're in, then select left or right sixteenth
+                    # Compute all 8 eighth bases
+                    eighth_bases = [
+                        current_out,
+                        current_out + mid3 * VLEN,
+                        current_out + mid2 * VLEN,
+                        current_out + mid2 * VLEN + mid3 * VLEN,
+                        current_out + mid1 * VLEN,
+                        current_out + mid1 * VLEN + mid3 * VLEN,
+                        current_out + mid1 * VLEN + mid2 * VLEN,
+                        current_out + mid1 * VLEN + mid2 * VLEN + mid3 * VLEN,
+                    ]
+                    
+                    # Select eighth base using nested vselects based on go_left1, go_left2, go_left3
+                    # First, select based on go_left3 within each quarter
+                    eighth_left_quarter0 = temp_base + temp_offset
+                    temp_offset += VLEN
+                    slots.append(("flow", ("vselect", eighth_left_quarter0, go_left3, eighth_bases[0], eighth_bases[1])))
+                    eighth_right_quarter0 = temp_base + temp_offset
+                    temp_offset += VLEN
+                    slots.append(("flow", ("vselect", eighth_right_quarter0, go_left3, eighth_bases[2], eighth_bases[3])))
+                    eighth_left_quarter1 = temp_base + temp_offset
+                    temp_offset += VLEN
+                    slots.append(("flow", ("vselect", eighth_left_quarter1, go_left3, eighth_bases[4], eighth_bases[5])))
+                    eighth_right_quarter1 = temp_base + temp_offset
+                    temp_offset += VLEN
+                    slots.append(("flow", ("vselect", eighth_right_quarter1, go_left3, eighth_bases[6], eighth_bases[7])))
+                    
+                    # Then select quarter based on go_left2
+                    eighth_left_half = temp_base + temp_offset
+                    temp_offset += VLEN
+                    slots.append(("flow", ("vselect", eighth_left_half, go_left2, eighth_left_quarter0, eighth_right_quarter0)))
+                    eighth_right_half = temp_base + temp_offset
+                    temp_offset += VLEN
+                    slots.append(("flow", ("vselect", eighth_right_half, go_left2, eighth_left_quarter1, eighth_right_quarter1)))
+                    
+                    # Finally select half based on go_left1
+                    eighth_base = temp_base + temp_offset
+                    temp_offset += VLEN
+                    slots.append(("flow", ("vselect", eighth_base, go_left1, eighth_left_half, eighth_right_half)))
+                    
                     mid4 = mid3 // 2
                     v_mid4 = self.scratch_vconst(mid4)
                     go_left4 = temp_base + temp_offset
                     temp_offset += VLEN
                     slots.append(("valu", ("<", go_left4, next_rel_idx3, v_mid4)))
 
-                    left4 = out3
-                    right4 = out3 + mid4 * VLEN
+                    left4 = eighth_base
+                    right4 = eighth_base + mid4 * VLEN
                     out4 = final_temp
                     slots.append(("flow", ("vselect", out4, go_left4, left4, right4)))
                     final_out = out4
@@ -1848,12 +1927,16 @@ class KernelBuilder:
                 level_size = 1 << level
                 level_start = (1 << level) - 1 if level > 0 else 0
                 v_level_start = self.scratch_vconst(level_start)
+                # Calculate maximum temp space needed for vselect tree (level_size=16 needs ~25*VLEN)
+                # Use 30*VLEN to be safe
+                VSELECT_TREE_TEMP_SIZE = 30 * VLEN
                 for bi, vec_i in enumerate(block_vecs):
                     v_idx = idx_cache + vec_i
                     v_val = val_cache + vec_i
                     relative_idx_vec = v_tmp1_block + bi * VLEN
                     slots.append(("valu", ("-", relative_idx_vec, v_idx, v_level_start)))
-                    tree_temp_base = v_tmp2_block
+                    # Use per-item temp space to avoid data corruption when VLIW bundler reorders instructions
+                    tree_temp_base = v_tmp2_block + bi * VSELECT_TREE_TEMP_SIZE
                     final_temp = v_node_block[0] + bi * VLEN
                     final_out, tree_slots = self.build_vselect_tree_reuse(
                         level_base, relative_idx_vec, level_size, 
