@@ -1595,11 +1595,13 @@ class KernelBuilder:
         # Alias v_tmp3_block unless features that truly need it are enabled.
         # This frees 128 words in the common path (block_size=16).
         enable_level4_where = (
-            forest_height == 10
+            self.enable_level4_where
+            and forest_height == 10
             and rounds == 16
             and batch_size == 256
             and block_size >= 16
         )
+        enable_level4_valu = self.enable_level4_valu
         need_tmp3_block = (
             enable_arith
             or enable_level2_valu
