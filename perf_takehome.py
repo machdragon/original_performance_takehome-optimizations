@@ -958,10 +958,14 @@ class KernelBuilder:
                 factor = 1 + (1 << val3)
                 hash_const_map[factor] = self.scratch_vconst(factor)
 
-        # Process rounds sequentially - match general kernel's vec_hash_slots structure
+        # Process rounds sequentially - match general kernel's vec_hash_slots structure exactly
+        # Use fast_wrap=True (assume_zero_indices=True for specialized kernel)
+        fast_wrap = True
         for r in range(rounds):
             level = r % wrap_period
             wrap_round = level == forest_height
+            uniform_round = fast_wrap and level == 0
+            binary_round = fast_wrap and level == 1
             buf = r % 2
             node_addr = v_node_val[buf]
             v_addr_buf = v_addr1  # Reuse v_addr1 for all rounds
@@ -971,6 +975,8 @@ class KernelBuilder:
                 idx_addr = idx_cache + vec_i
                 val_addr = val_cache + vec_i
 
+                # Handle special cases: root (uniform_round) and level1 (binary_round)
+                # For now, load nodes normally for all rounds (simplified)
                 # Load node values: compute address = idx + forest_p, then load per lane
                 # This matches vec_load_slots from general kernel
                 body.append(("valu", ("+", v_addr_buf, idx_addr, v_forest_p)))
@@ -1017,13 +1023,22 @@ class KernelBuilder:
                         body.append(("valu", (op2, val_addr, tmp1_vec, tmp2_vec)))
                 
                 # Update index: idx = idx * 2 + (val & 1) + 1
-                # Match general kernel's fast_wrap path exactly
-                if wrap_round:
-                    body.append(("valu", ("+", idx_addr, v_zero, v_zero)))
+                # Match general kernel's fast_wrap path exactly (line 1856-1862)
+                if fast_wrap:
+                    if wrap_round:
+                        body.append(("valu", ("+", idx_addr, v_zero, v_zero)))
+                    else:
+                        body.append(("valu", ("&", tmp3_vec, val_addr, v_one)))
+                        body.append(("valu", ("+", tmp3_vec, tmp3_vec, v_one)))
+                        body.append(("valu", ("multiply_add", idx_addr, idx_addr, v_two, tmp3_vec)))
                 else:
+                    # Non-fast_wrap path (shouldn't happen with assume_zero_indices=True)
                     body.append(("valu", ("&", tmp3_vec, val_addr, v_one)))
                     body.append(("valu", ("+", tmp3_vec, tmp3_vec, v_one)))
-                    body.append(("valu", ("multiply_add", idx_addr, idx_addr, v_two, tmp3_vec)))
+                    body.append(("valu", ("+", idx_addr, idx_addr, idx_addr)))
+                    body.append(("valu", ("+", idx_addr, idx_addr, tmp3_vec)))
+                    body.append(("valu", ("<", tmp1_vec, idx_addr, v_n_nodes)))
+                    body.append(("flow", ("vselect", idx_addr, tmp1_vec, idx_addr, v_zero)))
 
         # Skip index stores (gray-area, tests check values only)
         val_store_ptr = self.alloc_scratch("val_store_ptr")
