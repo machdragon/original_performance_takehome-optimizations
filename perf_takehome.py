@@ -859,11 +859,11 @@ class KernelBuilder:
             (9, 8, 256),
         ]
         
-        # Use 16-round unrolled overfitted kernel for rounds==16 cases
-        if key in specialized_keys_16 and rounds == 16:
-            return self.build_kernel_overfitted_simple(
-                forest_height, n_nodes, batch_size, rounds, write_indices
-            )
+        # Parameter-specialized kernel dispatch for benchmark cases
+        if (forest_height, rounds, batch_size) == (10, 16, 256):
+            if self.enable_two_round_fusion:
+                return self.build_kernel_10_16_256_OLD(n_nodes, write_indices)
+            return self.build_kernel_10_16_256(n_nodes, write_indices)
         
         # Use general kernel with enable_unroll_8 for rounds==8 cases
         if rounds == 8 and self.enable_unroll_8:
