@@ -3065,7 +3065,25 @@ class KernelBuilder:
                         pending_prev = True
 
                     prev_info = info
-                    prev_use_prefetch = False
+                    prev_use_prefetch = use_prefetch
+                
+                # Epilogue: hash last block of final round (round 7)
+                if pending_prev:
+                    last_buf = last_block_idx % 2
+                    prev_node_prefetch = v_node_prefetch if prev_use_prefetch else None
+                    body.extend(
+                        vec_block_hash_only_slots(
+                            last_block_vecs,
+                            last_buf,
+                            prev_info["wrap_round"],
+                            prev_info["node_const"],
+                            prev_info["node_pair"],
+                            prev_info["node_arith"],
+                            prev_node_prefetch,
+                            prev_info["level2_round"],
+                            prev_info["level3_round"],
+                        )
+                    )
             else:
                 # Original looped path
                 for round in range(rounds):
