@@ -1131,13 +1131,7 @@ class KernelBuilder:
 
         upper_levels = {}
         precompute_max_level = 4
-        enable_level4_precompute = (
-            self.assume_zero_indices
-            and self.max_special_level >= 4
-            and forest_height >= 4
-            and not self.enable_debug
-            and not use_special
-        )
+        enable_level4_precompute = False
         if enable_level4_precompute:
             level4_size = 16
             level4_start = 15
