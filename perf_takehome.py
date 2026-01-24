@@ -1584,7 +1584,6 @@ class KernelBuilder:
         ]
         v_tmp1_block = self.alloc_scratch("v_tmp1_block", block_size * VLEN)
         v_tmp2_block = self.alloc_scratch("v_tmp2_block", block_size * VLEN)
-<<<<<<< HEAD
         
         # Level 2 where-tree selection (optional): load 4 nodes once per round, vselect per vector.
         enable_level2_where = self.enable_level2_where
@@ -1616,23 +1615,6 @@ class KernelBuilder:
         v_tmp4_block = None
         if enable_arith:
             v_tmp4_block = self.alloc_scratch("v_tmp4_block", block_size * VLEN)
-        # Optionally alias v_tmp3_block to v_tmp2_block to free 128 words.
-        alias_tmp3_block = self.alias_tmp3_block and not (
-            enable_arith
-            or enable_level2_valu
-            or enable_level3_where
-            or enable_level4_where
-        )
-        if alias_tmp3_block:
-            v_tmp3_block = v_tmp2_block
-        else:
-            v_tmp3_block = self.alloc_scratch("v_tmp3_block", block_size * VLEN)
-        v_tmp4_block = None
-        if enable_arith:
-            v_tmp4_block = self.alloc_scratch("v_tmp4_block", block_size * VLEN)
-
-        # Level 2 where-tree selection (optional): load 4 nodes once per round, vselect per vector.
->>>>>>> phase-27
         level2_base_addr_const = self.scratch_const(3)
         level2_vecs_base = v_node_block[0]  # Reuse v_node_block[0] for the 4 level-2 vectors.
         # Reuse scratch to avoid extra allocations when prefetch is enabled.
@@ -2202,11 +2184,7 @@ class KernelBuilder:
                         "+",
                         level2_addr_temp,
                         self.scratch["forest_values_p"],
-<<<<<<< HEAD
-                        self.scratch_const(15),
-=======
                         level4_base_addr_const,
->>>>>>> phase-27
                     ),
                 )
             )
@@ -2217,15 +2195,6 @@ class KernelBuilder:
                 )
                 if i < 15:
                     slots.append(("flow", ("add_imm", level2_addr_temp, level2_addr_temp, 1)))
-<<<<<<< HEAD
-            # Precompute diffs for arithmetic selection.
-            for pair in range(8):
-                even = level4_vecs_base + (2 * pair) * VLEN
-                odd = level4_vecs_base + (2 * pair + 1) * VLEN
-                diff = level4_diffs_base + pair * VLEN
-                slots.append(("valu", ("-", diff, odd, even)))
-=======
->>>>>>> phase-27
             return slots
 
         def emit_level_select_block_slots(block_vecs, buf_idx, node_arith):
@@ -2998,10 +2967,7 @@ class KernelBuilder:
                     and level == 3
                 )
                 level4_round = (
-                    fast_wrap and enable_level4_valu and enable_prefetch and level == 4
-                )
-                level4_round = (
-                    fast_wrap and enable_level4_where and enable_prefetch and level == 4
+                    fast_wrap and (enable_level4_valu or enable_level4_where) and enable_prefetch and level == 4
                 )
                 round_info.append(
                     {
