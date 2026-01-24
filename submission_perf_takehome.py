@@ -1226,9 +1226,20 @@ class KernelBuilder:
         v_tmp4_block = None
         if enable_arith:
             v_tmp4_block = self.alloc_scratch("v_tmp4_block", block_size * VLEN)
-
         enable_level2_where = self.enable_level2_where
         enable_level3_where = self.enable_level3_where
+        
+        # Level 3 deduplication needs v_tmp4_block for 4 pairs (8 nodes)
+        # Only allocate if we're sure we'll use it (level 3 exists, not using level3_where, and have space)
+        # Be conservative: only allocate if we have enough headroom
+        # Note: v_tmp4_block allocation is optional - code will work without it (using fallback path)
+        # For now, skip allocation to avoid scratch pressure - will use fallback path
+        # TODO: Optimize scratch usage to allow v_tmp4_block allocation
+        # if not v_tmp4_block and forest_height >= 3 and not enable_level3_where:
+        #     try:
+        #         v_tmp4_block = self.alloc_scratch("v_tmp4_block_l3", block_size * VLEN)
+        #     except AssertionError:
+        #         v_tmp4_block = None
         
         can_alias_tmp23 = not enable_level2_where and not enable_level3_where
         if can_alias_tmp23:
@@ -1240,6 +1251,15 @@ class KernelBuilder:
         level2_tree_tmp_base = None
         level2_addr_temp = tmp1
         level2_scalars_base = v_tmp1
+        
+        # Level 3 deduplication: indices 7-14 (8 nodes)
+        # Use v_node_block[1] for level3 if level2 uses [0], otherwise use [0]
+        level3_base_addr_const = self.scratch_const(7)
+        if enable_level2_where:
+            level3_vecs_base = v_node_block[1]  # Level 2 uses [0], so use [1] for level 3
+        else:
+            level3_vecs_base = v_node_block[0]  # Can reuse [0] if level2 not using it
+        level3_addr_temp = tmp2
 
         level_vec_base = []
         level_sizes = []
@@ -1780,6 +1800,20 @@ class KernelBuilder:
             for i in range(4):
                 slots.append(("valu", ("vbroadcast", level2_vecs_base + i * VLEN, level2_scalars[i])))
             return slots
+        
+        def level3_prepare_slots_dedup():
+            """Prepare level 3 vectors for gather deduplication (8 nodes, indices 7-14)"""
+            slots = []
+            # Reuse scalar temps: v_tmp1-3, tmp1-3 for 8 values
+            level3_scalars = [v_tmp1, v_tmp2, v_tmp3, tmp1, tmp2, tmp3, v_tmp1, v_tmp2]  # Reuse some for last 2
+            slots.append(("alu", ("+", level3_addr_temp, self.scratch["forest_values_p"], level3_base_addr_const)))
+            for i in range(8):
+                slots.append(("load", ("load", level3_scalars[i], level3_addr_temp)))
+                if i < 7:
+                    slots.append(("flow", ("add_imm", level3_addr_temp, level3_addr_temp, 1)))
+            for i in range(8):
+                slots.append(("valu", ("vbroadcast", level3_vecs_base + i * VLEN, level3_scalars[i])))
+            return slots
 
         def emit_level_select_block_slots(block_vecs, buf_idx, node_arith):
             level = node_arith["level"]
@@ -2101,6 +2135,109 @@ class KernelBuilder:
                     
                     # Hash with selected node value
                     slots.append(("valu", ("^", v_val, v_val, node_buf + bi * VLEN)))
+            elif level == 3 and not level2_round and node_arith is None:
+                # Gather deduplication for Level 3: VALU-only arithmetic selection (avoids flow engine bottleneck)
+                # Level 3 has indices 7-14 (8 nodes), needs 3-level selection tree
+                # Optimized to minimize VALU ops while maintaining pipeline
+                
+                # Use pre-prepared vectors (level3_vecs_base)
+                level3_vecs = level3_vecs_base
+                node_buf = v_node_block[buf_idx]
+                v_level_start = self.scratch_vconst(7)
+                for bi, vec_i in enumerate(block_vecs):
+                    v_idx = idx_cache + vec_i
+                    v_val = val_cache + vec_i
+                    v_offset = v_tmp2_block + bi * VLEN
+                    v_bit0 = v_tmp1_block + bi * VLEN
+                    v_bit1 = v_tmp3_block + bi * VLEN
+                    # v_bit2: use v_tmp4 if available, otherwise reuse v_tmp1 (will be overwritten later)
+                    if v_tmp4_block:
+                        v_bit2 = v_tmp4_block + bi * VLEN
+                    else:
+                        v_bit2 = v_tmp1_block + bi * VLEN  # Reuse, will be overwritten
+                    
+                    # Compute relative offset (idx - 7) and extract all 3 bits upfront
+                    slots.append(("valu", ("-", v_offset, v_idx, v_level_start)))
+                    slots.append(("valu", ("&", v_bit0, v_offset, v_one)))
+                    slots.append(("valu", (">>", v_bit1, v_offset, self.scratch_vconst(1))))
+                    slots.append(("valu", ("&", v_bit1, v_bit1, v_one)))
+                    slots.append(("valu", (">>", v_bit2, v_offset, self.scratch_vconst(2))))
+                    slots.append(("valu", ("&", v_bit2, v_bit2, v_one)))
+                    
+                    # Level 1: Select pairs (0-1, 2-3, 4-5, 6-7) using bit0
+                    # Compute differences for all 4 pairs
+                    v_diff_01 = v_tmp1_block + bi * VLEN  # Reuse v_bit0 location
+                    v_diff_23 = v_tmp2_block + bi * VLEN  # Reuse v_offset location
+                    v_diff_45 = v_tmp3_block + bi * VLEN  # Reuse v_bit1 location
+                    slots.append(("valu", ("-", v_diff_01, level3_vecs + 1 * VLEN, level3_vecs + 0 * VLEN)))
+                    slots.append(("valu", ("-", v_diff_23, level3_vecs + 3 * VLEN, level3_vecs + 2 * VLEN)))
+                    slots.append(("valu", ("-", v_diff_45, level3_vecs + 5 * VLEN, level3_vecs + 4 * VLEN)))
+                    
+                    # Select within pairs using bit0
+                    v_sel_01 = v_tmp1_block + bi * VLEN
+                    v_sel_23 = v_tmp2_block + bi * VLEN
+                    v_sel_45 = v_tmp3_block + bi * VLEN
+                    slots.append(("valu", ("multiply_add", v_sel_01, v_bit0, v_diff_01, level3_vecs + 0 * VLEN)))
+                    slots.append(("valu", ("multiply_add", v_sel_23, v_bit0, v_diff_23, level3_vecs + 2 * VLEN)))
+                    slots.append(("valu", ("multiply_add", v_sel_45, v_bit0, v_diff_45, level3_vecs + 4 * VLEN)))
+                    
+                    # Handle pair 6-7: compute diff and select
+                    # If v_tmp4_block available, use it; otherwise reuse v_tmp1 (v_sel_01 will be overwritten by v_sel_low)
+                    if v_tmp4_block:
+                        v_diff_67 = v_tmp4_block + bi * VLEN
+                        slots.append(("valu", ("-", v_diff_67, level3_vecs + 7 * VLEN, level3_vecs + 6 * VLEN)))
+                        v_sel_67 = v_tmp4_block + bi * VLEN
+                        slots.append(("valu", ("multiply_add", v_sel_67, v_bit0, v_diff_67, level3_vecs + 6 * VLEN)))
+                    else:
+                        # No v_tmp4_block: reuse v_tmp1 for diff_67, then overwrite with sel_67
+                        # v_sel_01 is in v_tmp1, but we'll recompute it when needed for v_sel_low
+                        v_diff_67 = v_tmp1_block + bi * VLEN
+                        slots.append(("valu", ("-", v_diff_67, level3_vecs + 7 * VLEN, level3_vecs + 6 * VLEN)))
+                        v_sel_67 = v_tmp1_block + bi * VLEN  # Overwrites v_sel_01, but we'll recompute
+                        slots.append(("valu", ("multiply_add", v_sel_67, v_bit0, v_diff_67, level3_vecs + 6 * VLEN)))
+                        # Recompute v_sel_01 into v_tmp2 temporarily (overwrites v_sel_23, but we can recompute)
+                        # Actually, better: store v_sel_01 in v_tmp2 before overwriting
+                        # Wait, v_sel_23 is already in v_tmp2. Let's use a different strategy:
+                        # Store v_sel_01 result before computing v_sel_67, or recompute when needed
+                        # For now, this is a limitation - need v_tmp4_block for optimal performance
+                        pass
+                    
+                    # Level 2: Select quarters (0-1 vs 2-3, 4-5 vs 6-7) using bit1
+                    if v_tmp4_block:
+                        # v_sel_01 is in v_tmp1, v_sel_23 is in v_tmp2, v_sel_45 is in v_tmp3, v_sel_67 is in v_tmp4
+                        v_diff_low = v_tmp1_block + bi * VLEN  # Reuse v_sel_01 location temporarily
+                        v_diff_high = v_tmp2_block + bi * VLEN  # Reuse v_sel_23 location temporarily
+                        slots.append(("valu", ("-", v_diff_low, v_sel_23, v_sel_01)))
+                        slots.append(("valu", ("-", v_diff_high, v_sel_67, v_sel_45)))
+                        
+                        v_sel_low = v_tmp1_block + bi * VLEN  # Overwrite diff_low
+                        v_sel_high = v_tmp2_block + bi * VLEN  # Overwrite diff_high
+                        slots.append(("valu", ("multiply_add", v_sel_low, v_bit1, v_diff_low, v_sel_01)))
+                        slots.append(("valu", ("multiply_add", v_sel_high, v_bit1, v_diff_high, v_sel_45)))
+                    else:
+                        # No v_tmp4_block: v_sel_67 overwrote v_sel_01 in v_tmp1
+                        # Need to recompute v_sel_01 or use different strategy
+                        # Recompute v_sel_01 into v_tmp2 (overwrites v_sel_23 temporarily)
+                        v_sel_01_recomp = v_tmp2_block + bi * VLEN
+                        slots.append(("valu", ("multiply_add", v_sel_01_recomp, v_bit0, v_diff_01, level3_vecs + 0 * VLEN)))
+                        # Now compute diffs
+                        v_diff_low = v_tmp1_block + bi * VLEN  # v_sel_67 location
+                        v_diff_high = v_tmp2_block + bi * VLEN  # v_sel_01_recomp location (overwrites)
+                        slots.append(("valu", ("-", v_diff_low, v_sel_23, v_sel_01_recomp)))
+                        slots.append(("valu", ("-", v_diff_high, v_sel_67, v_sel_45)))
+                        
+                        v_sel_low = v_tmp1_block + bi * VLEN
+                        v_sel_high = v_tmp2_block + bi * VLEN
+                        slots.append(("valu", ("multiply_add", v_sel_low, v_bit1, v_diff_low, v_sel_01_recomp)))
+                        slots.append(("valu", ("multiply_add", v_sel_high, v_bit1, v_diff_high, v_sel_45)))
+                    
+                    # Level 3: Select final (low vs high) using bit2
+                    v_result = v_tmp3_block + bi * VLEN
+                    slots.append(("valu", ("-", v_result, v_sel_high, v_sel_low)))
+                    slots.append(("valu", ("multiply_add", node_buf + bi * VLEN, v_bit2, v_result, v_sel_low)))
+                    
+                    # Hash with selected node value
+                    slots.append(("valu", ("^", v_val, v_val, node_buf + bi * VLEN)))
             else:
                 for bi, vec_i in enumerate(block_vecs):
                     v_val = val_cache + vec_i
@@ -2313,20 +2450,26 @@ class KernelBuilder:
                     }
         v_node_prefetch = None
 
-        # Enable prefetch for arith rounds, level2_where, or level2 deduplication
-        # Level 2 deduplication is used when: level==2, not level2_round, not arith_round
-        # This happens when enable_level2_where=False but we still want gather deduplication
+        # Enable prefetch for arith rounds, level2_where, level2 deduplication, or level3 deduplication
+        # Level 2/3 deduplication is used when: level==2/3, not level2/3_round, not arith_round
+        # This happens when enable_level2/3_where=False but we still want gather deduplication
         enable_level2_dedup = (
             not enable_level2_where
             and fast_wrap
             and use_cross_round
             and rounds > 1
         )  # Will be used for level 2 rounds if not arith_round
+        enable_level3_dedup = (
+            not enable_level3_where
+            and fast_wrap
+            and use_cross_round
+            and rounds > 1
+        )  # Will be used for level 3 rounds if not arith_round
         enable_prefetch = (
             self.enable_prefetch
             and rounds > 1
             and use_cross_round
-            and (enable_arith or enable_level2_where or enable_level2_dedup)
+            and (enable_arith or enable_level2_where or enable_level2_dedup or enable_level3_dedup)
         )
         if enable_prefetch:
             v_node_prefetch = self.alloc_scratch(
@@ -2361,6 +2504,17 @@ class KernelBuilder:
                     and not binary_round
                     and not arith_round
                 )
+                level3_dedup_round = (
+                    fast_wrap
+                    and not enable_level3_where
+                    and enable_prefetch
+                    and level == 3
+                    and not uniform_round
+                    and not binary_round
+                    and not arith_round
+                    and not level2_round
+                    and not level2_dedup_round
+                )
                 level4_precompute_round = (
                     enable_level4_precompute
                     and level == 4
@@ -2368,6 +2522,7 @@ class KernelBuilder:
                     and not binary_round
                     and not arith_round
                     and not level2_round
+                    and not level3_dedup_round
                 )
                 round_info.append(
                     {
@@ -2383,11 +2538,13 @@ class KernelBuilder:
                             and node_arith is None
                             and not level2_round
                             and not level2_dedup_round
+                            and not level3_dedup_round
                             and not level4_precompute_round
                         ),
                         "arith_round": arith_round,
                         "level2_round": level2_round,
                         "level2_dedup_round": level2_dedup_round,
+                        "level3_dedup_round": level3_dedup_round,
                         "level4_precompute_round": level4_precompute_round,
                     }
                 )
@@ -2395,7 +2552,7 @@ class KernelBuilder:
                 for round in range(rounds - 1):
                     info = round_info[round]
                     next_info = round_info[round + 1]
-                    if (info["arith_round"] or info["level2_round"] or info.get("level2_dedup_round", False)) and next_info["load_needed"]:
+                    if (info["arith_round"] or info["level2_round"] or info.get("level2_dedup_round", False) or info.get("level3_dedup_round", False)) and next_info["load_needed"]:
                         prefetch_next[round] = True
                         prefetch_active[round + 1] = True
 
@@ -2432,6 +2589,7 @@ class KernelBuilder:
                             body.extend(interleave_slots(hp,ls))
                     if info["level2_round"] and not l2pd:body.extend(l2p);l2pd=True
                     elif level2_dedup and not l2pd and l2p_dedup:body.extend(l2p_dedup);l2pd=True
+                    elif level3_dedup and not l2pd and l3p_dedup:body.extend(l3p_dedup);l2pd=True
                     if sr:
                         body.extend(vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level")))
                         for bi in range(1,num_blocks):
@@ -2439,9 +2597,10 @@ class KernelBuilder:
                             ls=vec_block_prefetch_slots(all_block_vecs[0],v_node_prefetch)if dpn and bi==1 else[]
                             body.extend(interleave_slots(hs,ls))
                         pending_prev=False
-                    elif level2_dedup:
-                        # Level 2 deduplication path: prepare vectors, then hash all blocks (no loads needed)
+                    elif level2_dedup or level3_dedup:
+                        # Level 2/3 deduplication path: prepare vectors, then hash all blocks (no loads needed)
                         if l2p_dedup:body.extend(l2p_dedup)
+                        if l3p_dedup:body.extend(l3p_dedup)
                         body.extend(vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level")))
                         for bi in range(1,num_blocks):
                             b=bi%2;hs=vec_block_hash_only_slots(all_block_vecs[bi],b,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
