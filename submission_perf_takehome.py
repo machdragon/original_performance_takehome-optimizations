@@ -30,7 +30,7 @@ class KernelBuilder:
         enable_level2_valu: bool = False,
         enable_two_round_fusion: bool = False,
         enable_level3_where: bool = False,
-        enable_unroll_8: bool = False,
+        enable_unroll_8: bool = True,
         lookahead: int = 1024,
         block_size: int = 16,
         enable_second_pass: bool = False,
