@@ -431,7 +431,6 @@ class KernelBuilder:
             self.scratch_debug[addr] = (name, length)
         self.scratch_ptr += length
         if self.scratch_ptr > SCRATCH_SIZE:
-            # Enhanced error message with usage breakdown
             usage_info = f"Scratch usage: {self.scratch_ptr}/{SCRATCH_SIZE} words"
             if name:
                 usage_info += f" (failed allocating {length} words for '{name}')"
@@ -566,9 +565,7 @@ class KernelBuilder:
             out2 = temp_base + VLEN
             slots.append(("flow", ("vselect", out2, go_left2, left2, right2)))
 
-            # For level_size > 4, need additional layers
             if level_size > 4:
-                # Layer 3: Select between pairs within each quarter
                 subtract_mid2 = self.alloc_scratch(f"subtract_mid2_{vec}", VLEN)
                 slots.append(("flow", ("vselect", subtract_mid2, go_left2, v_zero, v_mid2)))
                 next_rel_idx2 = self.alloc_scratch(f"next_rel_idx2_{vec}", VLEN)
@@ -584,7 +581,6 @@ class KernelBuilder:
                 out3 = temp_base + 2 * VLEN
                 slots.append(("flow", ("vselect", out3, go_left3, left3, right3)))
 
-                # For level_size > 8 (i.e., level_size == 16), need layer 4
                 if level_size > 8:
                     subtract_mid3 = self.alloc_scratch(f"subtract_mid3_{vec}", VLEN)
                     slots.append(("flow", ("vselect", subtract_mid3, go_left3, v_zero, v_mid3)))
@@ -632,10 +628,6 @@ class KernelBuilder:
         round: int,
         vec: int,
     ):
-        """
-        Version of build_vselect_tree that reuses pre-allocated temp space
-        instead of allocating new scratch. Used when scratch is tight.
-        """
         slots = []
 
         if level_size <= 1:
@@ -656,8 +648,6 @@ class KernelBuilder:
         current_out = all_level_vecs
         rel_idx = relative_idx_vec
         v_zero = self.scratch_vconst(0)
-
-        # Pre-allocated temp space offsets (reuse provided temp_base)
         temp_offset = 0
         
         mid1 = level_size // 2
@@ -692,9 +682,9 @@ class KernelBuilder:
             temp_offset += VLEN
             slots.append(("flow", ("vselect", out2, go_left2, left2, right2)))
 
-            # For level_size > 4, need additional layers
+
             if level_size > 4:
-                # Layer 3
+
                 subtract_mid2 = temp_base + temp_offset
                 temp_offset += VLEN
                 slots.append(("flow", ("vselect", subtract_mid2, go_left2, v_zero, v_mid2)))
@@ -714,7 +704,6 @@ class KernelBuilder:
                 temp_offset += VLEN
                 slots.append(("flow", ("vselect", out3, go_left3, left3, right3)))
 
-                # For level_size > 8 (i.e., level_size == 16), need layer 4
                 if level_size > 8:
                     subtract_mid3 = temp_base + temp_offset
                     temp_offset += VLEN
@@ -731,7 +720,7 @@ class KernelBuilder:
 
                     left4 = out3
                     right4 = out3 + mid4 * VLEN
-                    out4 = final_temp  # Use provided final temp space
+                    out4 = final_temp
                     slots.append(("flow", ("vselect", out4, go_left4, left4, right4)))
                     final_out = out4
                 else:
@@ -1011,7 +1000,6 @@ class KernelBuilder:
         block_limit = vec_count - (vec_count % block_size)
         num_blocks = block_limit // block_size
         max_special = min(self.max_special_level, forest_height)
-        # Only use old use_special path if max_special_level < 4 (to avoid conflict with level4_precompute)
         use_special = self.assume_zero_indices and max_special >= 0 and max_special < 4
         use_cross_round = (
             not self.enable_debug
@@ -1070,9 +1058,9 @@ class KernelBuilder:
             self.alloc_scratch("v_node_block_A", block_size * VLEN),
             self.alloc_scratch("v_node_block_B", block_size * VLEN),
         ]
-        # Optimize temporary block allocations: use aliasing when possible
-        # v_tmp1_block and v_tmp2_block are used in hash stages and can often share space
-        # v_tmp3_block is used for index updates and can sometimes alias with v_tmp2_block
+
+
+
         v_tmp1_block = self.alloc_scratch("v_tmp1_block", block_size * VLEN)
         v_tmp2_block = self.alloc_scratch("v_tmp2_block", block_size * VLEN)
         
@@ -1083,15 +1071,9 @@ class KernelBuilder:
         enable_level2_where = self.enable_level2_where
         enable_level3_where = self.enable_level3_where
         
-        # Optimize temporary block allocations: use aliasing when possible
-        # v_tmp3_block is used for index updates and can sometimes alias with v_tmp2_block
-        # Check if we can alias v_tmp2_block and v_tmp3_block to save space
-        # They're used in different phases: v_tmp2 in hash stages, v_tmp3 in index updates
-        # Can alias if not using level2_where or level3_where (which may use both simultaneously)
-        # Note: enable_level4_precompute is defined later, so we'll check it there
         can_alias_tmp23 = not enable_level2_where and not enable_level3_where
         if can_alias_tmp23:
-            v_tmp3_block = v_tmp2_block  # Alias to save 128 words (may be overridden later)
+            v_tmp3_block = v_tmp2_block
         else:
             v_tmp3_block = self.alloc_scratch("v_tmp3_block", block_size * VLEN)
         level2_base_addr_const = self.scratch_const(3)
@@ -1147,27 +1129,16 @@ class KernelBuilder:
                         ),
                     )
 
-        # Precompute level 4 for vselect tree optimization
-        # Only enable if use_special is not already enabled (to avoid scratch conflicts)
-        upper_levels = {}  # level -> base scratch addr (vectorized)
+        upper_levels = {}
         precompute_max_level = 4
         enable_level4_precompute = (
             self.assume_zero_indices
             and self.max_special_level >= 4
             and forest_height >= 4
             and not self.enable_debug
-            and not use_special  # Don't conflict with existing use_special path
+            and not use_special
         )
-        
-        # CRITICAL FIX: For level4_precompute, we need per-item isolated scratch.
-        # However, we can't disable aliasing (would exceed scratch). Instead, we'll use
-        # per-item offsets within v_tmp2_block for tree temps, and use relative_idx_vec
-        # space for final output (per-item, safe). This avoids conflicts while staying
-        # within scratch limits.
-        
         if enable_level4_precompute:
-            # Precompute only level 4 (16 nodes) to save scratch space
-            # Level 4: 16 scalars, 16*VLEN vectors
             level4_size = 16
             level4_start = 15
             level4_values = self.alloc_scratch("level4_values", level4_size)
@@ -1175,8 +1146,6 @@ class KernelBuilder:
             level4_addr = self.alloc_scratch("level4_addr")
             level_base = level4_vecs
             upper_levels[4] = level_base
-
-            # Compute address for level 4
             self.add(
                 "alu",
                 (
@@ -1186,12 +1155,10 @@ class KernelBuilder:
                     self.scratch_const(level4_start),
                 ),
             )
-            # Load level 4 values (2 vloads for 16 nodes)
             for v in range(2):
                 self.add("load", ("vload", level4_values + v * VLEN, level4_addr))
                 if v < 1:
                     self.add("flow", ("add_imm", level4_addr, level4_addr, VLEN))
-            # Broadcast scalars to vectors
             for p in range(level4_size):
                 self.add(
                     "valu",
@@ -1803,55 +1770,26 @@ class KernelBuilder:
             node_buf = v_node_block[buf_idx]
 
             if level4_precompute_round and level is not None and level in upper_levels and len(upper_levels) > 0:
-                # Use precomputed level with vselect tree
                 level_base = upper_levels[level]
                 level_size = 1 << level
                 level_start = (1 << level) - 1 if level > 0 else 0
                 v_level_start = self.scratch_vconst(level_start)
-                
-                # Reuse v_tmp blocks for vselect tree temp space (no new allocations)
-                # v_tmp1_block: relative_idx_vec and intermediate results
-                # v_tmp2_block: vselect tree temp space (4*VLEN per vector)
-                # v_tmp3_block: final output
-                
-                # Process block items with proper scratch isolation (per diagnosis)
-                # CRITICAL FIX: Per diagnosis, bundler reordering causes conflicts when tree_temp_base
-                # is shared. Use v_node_block[1] for tree temps (level4 rounds don't use normal loads)
-                # and v_node_block[0] for per-item final output. This separates tree temps from
-                # final output, reducing conflict risk.
-                # 
-                # Note: We still use shared tree_temp_base (v_node_block[1]), so bundler reordering
-                # could still cause conflicts on intermediate temps. The proper fix would be per-item
-                # tree temps, but that exceeds scratch. This is a compromise that separates final
-                # output (per-item) from tree temps (shared, sequential).
                 for bi, vec_i in enumerate(block_vecs):
                     v_idx = idx_cache + vec_i
                     v_val = val_cache + vec_i
-                    
-                    # Compute relative index - use per-item offset (like level2_round)
                     relative_idx_vec = v_tmp1_block + bi * VLEN
                     slots.append(("valu", ("-", relative_idx_vec, v_idx, v_level_start)))
-                    
-                    # Build vselect tree
-                    # tree_temp_base: Use v_node_block[1] (level4 rounds don't load to it, safe to reuse)
-                    # Sequential processing should prevent conflicts, but bundler reordering risk exists
-                    # final_temp: Per-item v_node_block[0] + bi*VLEN (isolated, prevents final conflicts)
-                    tree_temp_base = v_node_block[1]  # Shared - sequential processing should be safe
-                    final_temp = v_node_block[0] + bi * VLEN  # Per-item isolated space for final output
+                    tree_temp_base = v_node_block[1]
+                    final_temp = v_node_block[0] + bi * VLEN
                     final_out, tree_slots = self.build_vselect_tree_reuse(
                         level_base, relative_idx_vec, level_size, 
                         tree_temp_base, final_temp,
-                        0,  # round number
+                        0,
                         vec_i // VLEN
                     )
                     slots.extend(tree_slots)
-                    
-                    # XOR selected node value into hash
-                    # final_out is in per-item isolated space, preventing bundler conflicts
                     slots.append(("valu", ("^", v_val, v_val, final_out)))
             elif level4_precompute_round and (level is None or level not in upper_levels or len(upper_levels) == 0):
-                # Level4 precompute was requested but not available - fall back to normal loads
-                # This shouldn't happen if enable_level4_precompute logic is correct, but add safety check
                 for bi, vec_i in enumerate(block_vecs):
                     v_idx = idx_cache + vec_i
                     v_val = val_cache + vec_i
@@ -2062,8 +2000,8 @@ class KernelBuilder:
                     node_arith,
                     node_prefetch,
                     False,
-                    False,  # level4_precompute_round - not used in vec_block_hash_slots
-                    None,   # level - not used in vec_block_hash_slots
+                    False,
+                    None,
                 )
             )
             return slots
@@ -2194,7 +2132,7 @@ class KernelBuilder:
                 )
                 level4_precompute_round = (
                     enable_level4_precompute
-                    and level == 4  # Only use for level 4 (we only precomputed level 4)
+                    and level == 4
                     and not uniform_round
                     and not binary_round
                     and not arith_round
@@ -2355,7 +2293,7 @@ class KernelBuilder:
                 )
                 level4_precompute_round = (
                     enable_level4_precompute
-                    and level == 4  # Only use for level 4 (we only precomputed level 4)
+                    and level == 4
                     and not uniform_round
                     and not binary_round
                     and not arith_round
