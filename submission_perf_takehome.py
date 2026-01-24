@@ -1767,6 +1767,19 @@ class KernelBuilder:
                     ("valu", ("vbroadcast", level2_vecs_base + i * VLEN, level2_scalars_base + i))
                 )
             return slots
+        
+        def level2_prepare_slots_dedup():
+            """Prepare level 2 vectors for gather deduplication (works even when enable_level2_where is False)"""
+            slots = []
+            level2_scalars = [v_tmp1, v_tmp2, v_tmp3, tmp1]
+            slots.append(("alu", ("+", level2_addr_temp, self.scratch["forest_values_p"], level2_base_addr_const)))
+            for i in range(4):
+                slots.append(("load", ("load", level2_scalars[i], level2_addr_temp)))
+                if i < 3:
+                    slots.append(("flow", ("add_imm", level2_addr_temp, level2_addr_temp, 1)))
+            for i in range(4):
+                slots.append(("valu", ("vbroadcast", level2_vecs_base + i * VLEN, level2_scalars[i])))
+            return slots
 
         def emit_level_select_block_slots(block_vecs, buf_idx, node_arith):
             level = node_arith["level"]
@@ -2045,6 +2058,34 @@ class KernelBuilder:
                     slots.append(
                         ("valu", ("^", v_val, v_val, node_base + bi * VLEN))
                     )
+            elif level == 2 and not level2_round and node_arith is None:
+                # Gather deduplication for Level 2: Use pre-prepared vectors to select the right value per lane
+                # Vectors should be prepared once per round by level2_prepare_slots_dedup() at round start
+                # This maintains the load pipeline by doing loads early, then VALU/flow work
+                # Level 2 has indices 3-6, so we load those 4 values once per round
+                
+                # Use pre-prepared vectors (level2_vecs_base = v_node_block[0])
+                level2_vecs = level2_vecs_base
+                node0 = level2_vecs
+                node1 = level2_vecs + VLEN
+                node2 = level2_vecs + 2 * VLEN
+                node3 = level2_vecs + 3 * VLEN
+                v_level_start = self.scratch_vconst(3)
+                for bi, vec_i in enumerate(block_vecs):
+                    v_idx = idx_cache + vec_i
+                    v_val = val_cache + vec_i
+                    v_offset = v_tmp1_block + bi * VLEN
+                    v_go_left1 = v_tmp2_block + bi * VLEN
+                    v_left = v_tmp3_block + bi * VLEN
+                    slots.append(("valu", ("-", v_offset, v_idx, v_level_start)))
+                    slots.append(("valu", ("<", v_go_left1, v_offset, v_two)))
+                    slots.append(("valu", ("<", v_left, v_offset, v_one)))
+                    slots.append(("flow", ("vselect", v_left, v_left, node0, node1)))
+                    slots.append(("valu", ("-", v_offset, v_offset, v_two)))
+                    slots.append(("valu", ("<", v_offset, v_offset, v_one)))
+                    slots.append(("flow", ("vselect", v_offset, v_offset, node2, node3)))
+                    slots.append(("flow", ("vselect", v_offset, v_go_left1, v_left, v_offset)))
+                    slots.append(("valu", ("^", v_val, v_val, v_offset)))
             else:
                 for bi, vec_i in enumerate(block_vecs):
                     v_val = val_cache + vec_i
@@ -2343,6 +2384,9 @@ class KernelBuilder:
                 for unroll_r in range(8):
                     r=unroll_r;info=round_info[r];up=prefetch_active[r];dpn=prefetch_next[r];np=v_node_prefetch if up else None
                     sr=enable_prefetch and(info["arith_round"]or info["level2_round"]);l2p=level2_prepare_slots()if info["level2_round"]else[];l2pd=False
+                    # Prepare level 2 vectors for gather deduplication if needed
+                    level2_dedup = info.get("level") == 2 and not info["level2_round"] and info.get("node_arith") is None
+                    l2p_dedup = level2_prepare_slots_dedup() if level2_dedup else []
                     if pending_prev:
                         lb=last_block_idx%2;pnp=v_node_prefetch if prev_use_prefetch else None
                         hp=vec_block_hash_only_slots(last_block_vecs,lb,prev_info["wrap_round"],prev_info["node_const"],prev_info["node_pair"],prev_info["node_arith"],pnp,prev_info["level2_round"],prev_info.get("level4_precompute_round",False),prev_info.get("level"))
@@ -2352,12 +2396,21 @@ class KernelBuilder:
                             ls=vec_block_load_slots(block_0_vecs,0,info["node_const"],info["node_pair"],info["node_arith"],np,info.get("level2_round",False),info["round"])
                             body.extend(interleave_slots(hp,ls))
                     if info["level2_round"] and not l2pd:body.extend(l2p);l2pd=True
+                    elif level2_dedup and not l2pd and l2p_dedup:body.extend(l2p_dedup);l2pd=True
                     if sr:
                         body.extend(vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level")))
                         for bi in range(1,num_blocks):
                             b=bi%2;hs=vec_block_hash_only_slots(all_block_vecs[bi],b,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
                             ls=vec_block_prefetch_slots(all_block_vecs[0],v_node_prefetch)if dpn and bi==1 else[]
                             body.extend(interleave_slots(hs,ls))
+                        pending_prev=False
+                    elif level2_dedup:
+                        # Level 2 deduplication path: prepare vectors, then hash all blocks (no loads needed)
+                        if l2p_dedup:body.extend(l2p_dedup)
+                        body.extend(vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level")))
+                        for bi in range(1,num_blocks):
+                            b=bi%2;hs=vec_block_hash_only_slots(all_block_vecs[bi],b,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level"))
+                            body.extend(hs)
                         pending_prev=False
                     else:
                         sb=1
@@ -2377,15 +2430,20 @@ class KernelBuilder:
                 for round in range(rounds):
                     info=round_info[round];up=prefetch_active[round];dpn=prefetch_next[round];np=v_node_prefetch if up else None
                     sr=enable_prefetch and(info["arith_round"]or info["level2_round"]);l2p=level2_prepare_slots()if info["level2_round"]else[];l2pd=False
+                    # Prepare level 2 vectors for gather deduplication if needed
+                    level2_dedup = info.get("level") == 2 and not info["level2_round"] and info.get("node_arith") is None
+                    l2p_dedup = level2_prepare_slots_dedup() if level2_dedup else []
                     if pending_prev:
                         lb=last_block_idx%2;pnp=v_node_prefetch if prev_use_prefetch else None
                         hp=vec_block_hash_only_slots(last_block_vecs,lb,prev_info["wrap_round"],prev_info["node_const"],prev_info["node_pair"],prev_info["node_arith"],pnp,prev_info["level2_round"],prev_info.get("level4_precompute_round",False),prev_info.get("level"))
                         if info["level2_round"]:body.extend(interleave_slots(hp,l2p));l2pd=True
+                        elif level2_dedup:body.extend(interleave_slots(hp,l2p_dedup));l2pd=True
                         elif sr:body.extend(hp)
                         else:
                             ls=vec_block_load_slots(block_0_vecs,0,info["node_const"],info["node_pair"],info["node_arith"],np,info.get("level2_round",False),info["round"])
                             body.extend(interleave_slots(hp,ls))
                     if info["level2_round"]and not l2pd:body.extend(l2p);l2pd=True
+                    elif level2_dedup and not l2pd and l2p_dedup:body.extend(l2p_dedup);l2pd=True
                     if sr:
                         body.extend(vec_block_hash_only_slots(block_0_vecs,0,info["wrap_round"],info["node_const"],info["node_pair"],info["node_arith"],np,info["level2_round"],info.get("level4_precompute_round",False),info.get("level")))
                         for bi in range(1,num_blocks):
