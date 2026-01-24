@@ -1625,8 +1625,6 @@ class KernelBuilder:
         level4_base_addr_const = self.scratch_const(15)
         level4_vecs_base = v_node_block[0]  # Reuse v_node_block[0] for the 16 level-4 vectors.
         level4_diffs_base = v_node_block[1]
-        level4_vecs_base = v_node_block[0]  # Reuse v_node_block[0] for the 16 level-4 vectors.
->>>>>>> phase-27
 
         level_vec_base = []
         level_sizes = []
@@ -2468,64 +2466,6 @@ class KernelBuilder:
                     slots.append(("flow", ("vselect", v_sel, v_bit2, v_bit0, v_sel)))
                     slots.append(("valu", ("^", v_val, v_val, v_sel)))
             elif level4_round:
-<<<<<<< HEAD
-                bases = level4_vecs_base
-                diffs = level4_diffs_base
-                v_level_start = self.scratch_vconst(15)
-                for bi, vec_i in enumerate(block_vecs):
-                    v_idx = idx_cache + vec_i
-                    v_val = val_cache + vec_i
-                    v_t0 = v_tmp1_block + bi * VLEN
-                    v_t1 = v_tmp2_block + bi * VLEN
-                    v_t2 = v_tmp3_block + bi * VLEN
-                    v_bit = v_tmp3_block + bi * VLEN
-                    # bit0
-                    slots.append(("valu", ("-", v_t0, v_idx, v_level_start)))
-                    slots.append(("valu", ("&", v_bit, v_t0, v_one)))
-                    # t0..t3 (low 8)
-                    slots.append(("valu", ("multiply_add", v_t0, v_bit, diffs + 0 * VLEN, bases + 0 * VLEN)))
-                    slots.append(("valu", ("multiply_add", v_t1, v_bit, diffs + 1 * VLEN, bases + 2 * VLEN)))
-                    slots.append(("valu", ("multiply_add", v_t2, v_bit, diffs + 2 * VLEN, bases + 4 * VLEN)))
-                    slots.append(("valu", ("multiply_add", v_bit, v_bit, diffs + 3 * VLEN, bases + 6 * VLEN)))
-                    # bit1
-                    slots.append(("valu", ("-", v_t1, v_t1, v_t0)))
-                    slots.append(("valu", ("-", v_t2, v_t2, v_bit)))
-                    slots.append(("valu", ("-", v_bit, v_idx, v_level_start)))
-                    slots.append(("valu", (">>", v_bit, v_bit, v_one)))
-                    slots.append(("valu", ("&", v_bit, v_bit, v_one)))
-                    slots.append(("valu", ("multiply_add", v_t0, v_bit, v_t1, v_t0)))
-                    slots.append(("valu", ("multiply_add", v_t2, v_bit, v_t2, v_bit)))
-                    # t4..t7 (high 8)
-                    slots.append(("valu", ("-", v_t1, v_idx, v_level_start)))
-                    slots.append(("valu", ("&", v_t1, v_t1, v_one)))
-                    slots.append(("valu", ("multiply_add", v_t1, v_t1, diffs + 4 * VLEN, bases + 8 * VLEN)))
-                    slots.append(("valu", ("multiply_add", v_bit, v_t1, diffs + 5 * VLEN, bases + 10 * VLEN)))
-                    slots.append(("valu", ("multiply_add", v_t2, v_t1, diffs + 6 * VLEN, bases + 12 * VLEN)))
-                    slots.append(("valu", ("multiply_add", v_t1, v_t1, diffs + 7 * VLEN, bases + 14 * VLEN)))
-                    # bit1 for high
-                    slots.append(("valu", ("-", v_bit, v_bit, v_t1)))
-                    slots.append(("valu", ("-", v_t2, v_t2, v_t1)))
-                    slots.append(("valu", ("-", v_t1, v_idx, v_level_start)))
-                    slots.append(("valu", (">>", v_t1, v_t1, v_one)))
-                    slots.append(("valu", ("&", v_t1, v_t1, v_one)))
-                    slots.append(("valu", ("multiply_add", v_bit, v_t1, v_bit, v_t1)))
-                    slots.append(("valu", ("multiply_add", v_t2, v_t1, v_t2, v_t1)))
-                    # bit2 low/high
-                    slots.append(("valu", ("-", v_t1, v_idx, v_level_start)))
-                    slots.append(("valu", (">>", v_t1, v_t1, v_two)))
-                    slots.append(("valu", ("&", v_t1, v_t1, v_one)))
-                    slots.append(("valu", ("-", v_t2, v_t2, v_t0)))
-                    slots.append(("valu", ("multiply_add", v_t0, v_t1, v_t2, v_t0)))
-                    slots.append(("valu", ("-", v_t2, v_bit, v_t0)))
-                    slots.append(("valu", ("multiply_add", v_bit, v_t1, v_t2, v_bit)))
-                    # bit3 final
-                    slots.append(("valu", ("-", v_t1, v_idx, v_level_start)))
-                    slots.append(("valu", (">>", v_t1, v_t1, self.scratch_vconst(3))))
-                    slots.append(("valu", ("&", v_t1, v_t1, v_one)))
-                    slots.append(("valu", ("-", v_t2, v_bit, v_t0)))
-                    slots.append(("valu", ("multiply_add", v_t0, v_t1, v_t2, v_t0)))
-                    slots.append(("valu", ("^", v_val, v_val, v_t0)))
-=======
                 node0 = level4_vecs_base
                 node1 = level4_vecs_base + VLEN
                 node2 = level4_vecs_base + 2 * VLEN
@@ -2627,7 +2567,6 @@ class KernelBuilder:
                     slots.append(("valu", ("-", t1, out, t0)))
                     slots.append(("valu", ("multiply_add", out, bit, t1, t0)))
                     slots.append(("valu", ("^", v_val, v_val, out)))
->>>>>>> phase-27
             elif node_const is not None:
                 for _bi, vec_i in enumerate(block_vecs):
                     v_val = val_cache + vec_i
@@ -2922,16 +2861,14 @@ class KernelBuilder:
             self.enable_prefetch
             and rounds > 1
             and use_cross_round
-<<<<<<< HEAD
-            and (enable_arith or enable_level2_where or enable_level3_where or enable_level3_valu or enable_level4_valu)
-=======
             and (
                 enable_arith
                 or enable_level2_where
                 or enable_level3_where
+                or enable_level3_valu
+                or enable_level4_valu
                 or enable_level4_where
             )
->>>>>>> phase-27
         )
         if enable_prefetch:
             # Prefetch buffer only needs block 0 (block_size vectors).
@@ -3021,7 +2958,6 @@ class KernelBuilder:
             prev_info = None
             prev_use_prefetch = False
 
-<<<<<<< HEAD
             # Unrolled path for exactly 8 rounds (eliminates loop overhead, enables better VLIW bundling)
             if self.enable_unroll_8 and rounds == 8:
                 # Process 8 rounds with unrolled loop body
@@ -3062,6 +2998,7 @@ class KernelBuilder:
                             prev_node_prefetch,
                             prev_info["level2_round"],
                             prev_info["level3_round"],
+                            prev_info["level4_round"],
                         )
                         if info["level2_round"]:
                             body.extend(interleave_slots(hash_prev, level2_prep))
@@ -3076,8 +3013,127 @@ class KernelBuilder:
                             body.extend(hash_prev)
                         else:
                             load_slots = vec_block_load_slots(
-=======
-            for round in range(rounds):
+                                block_0_vecs,
+                                0,
+                                info["node_const"],
+                                info["node_pair"],
+                                info["node_arith"],
+                                node_prefetch,
+                                info.get("level2_round", False),
+                                info["round"],
+                            )
+                            body.extend(interleave_slots(hash_prev, load_slots))
+
+                    if info["level2_round"] and not level2_prepared:
+                        body.extend(level2_prep)
+                        level2_prepared = True
+                    if info["level3_round"] and not level3_prepared:
+                        body.extend(level3_prep)
+                        level3_prepared = True
+                    if info["level4_round"] and not level4_prepared:
+                        body.extend(level4_prep)
+                        level4_prepared = True
+
+                    if special_round:
+                        body.extend(
+                            vec_block_hash_only_slots(
+                                block_0_vecs,
+                                0,
+                                info["wrap_round"],
+                                info["node_const"],
+                                info["node_pair"],
+                                info["node_arith"],
+                                node_prefetch,
+                                info["level2_round"],
+                                info["level3_round"],
+                                info["level4_round"],
+                            )
+                        )
+                        for block_idx in range(1, num_blocks):
+                            buf_idx = block_idx % 2
+                            hash_slots = vec_block_hash_only_slots(
+                                all_block_vecs[block_idx],
+                                buf_idx,
+                                info["wrap_round"],
+                                info["node_const"],
+                                info["node_pair"],
+                                info["node_arith"],
+                                node_prefetch,
+                                info["level2_round"],
+                                info["level3_round"],
+                                info["level4_round"],
+                            )
+                            load_slots = []
+                            if do_prefetch_next and block_idx == 1:
+                                load_slots = vec_block_prefetch_slots(
+                                    all_block_vecs[0], v_node_prefetch
+                                )
+                            body.extend(interleave_slots(hash_slots, load_slots))
+                        pending_prev = False
+                    else:
+                        start_block = 1
+                        if use_prefetch:
+                            hash_slots = vec_block_hash_only_slots(
+                                block_0_vecs,
+                                0,
+                                info["wrap_round"],
+                                info["node_const"],
+                                info["node_pair"],
+                                info["node_arith"],
+                                node_prefetch,
+                                info["level2_round"],
+                                info["level3_round"],
+                                info["level4_round"],
+                            )
+                            load_slots = vec_block_load_slots(
+                                all_block_vecs[1],
+                                1,
+                                info["node_const"],
+                                info["node_pair"],
+                                info["node_arith"],
+                            )
+                            body.extend(interleave_slots(hash_slots, load_slots))
+                            start_block = 2
+                        elif not pending_prev:
+                            body.extend(
+                                vec_block_load_slots(
+                                    block_0_vecs,
+                                    0,
+                                    info["node_const"],
+                                    info["node_pair"],
+                                    info["node_arith"],
+                                )
+                            )
+                        for block_idx in range(start_block, num_blocks):
+                            prev_buf = (block_idx - 1) % 2
+                            curr_buf = block_idx % 2
+                            hash_slots = vec_block_hash_only_slots(
+                                all_block_vecs[block_idx - 1],
+                                prev_buf,
+                                info["wrap_round"],
+                                info["node_const"],
+                                info["node_pair"],
+                                info["node_arith"],
+                                None,
+                                info["level2_round"],
+                                info["level3_round"],
+                                info["level4_round"],
+                            )
+                            load_slots = vec_block_load_slots(
+                                all_block_vecs[block_idx],
+                                curr_buf,
+                                info["node_const"],
+                                info["node_pair"],
+                                info["node_arith"],
+                            )
+                            body.extend(interleave_slots(hash_slots, load_slots))
+                        pending_prev = True
+
+                    prev_info = info
+                    prev_use_prefetch = False
+            else:
+                # Original looped path
+                for round in range(rounds):
                 info = round_info[round]
                 use_prefetch = prefetch_active[round]
                 do_prefetch_next = prefetch_next[round]
@@ -3220,13 +3276,11 @@ class KernelBuilder:
                     elif not pending_prev:
                         body.extend(
                             vec_block_load_slots(
->>>>>>> phase-27
                                 block_0_vecs,
                                 0,
                                 info["node_const"],
                                 info["node_pair"],
                                 info["node_arith"],
-                                node_prefetch,
                                 info.get("level2_round", False),
                                 info["round"],
                             )
@@ -3323,6 +3377,7 @@ class KernelBuilder:
                                 None,
                                 info["level2_round"],
                                 info["level3_round"],
+                                info["level4_round"],
                             )
                             load_slots = vec_block_load_slots(
                                 all_block_vecs[block_idx],
@@ -3333,38 +3388,6 @@ class KernelBuilder:
                             )
                             body.extend(interleave_slots(hash_slots, load_slots))
                         pending_prev = True
-=======
-                    # For num_blocks == 2 the following loop is
-                    # intentionally empty when start_block == 2:
-                    # block 1 is loaded here and then hashed as the
-                    # deferred epilogue in the next round, which
-                    # is how the cross-round pipeline keeps one
-                    # block "in flight" across iterations.
-                    for block_idx in range(start_block, num_blocks):
-                        prev_buf = (block_idx - 1) % 2
-                        curr_buf = block_idx % 2
-                        hash_slots = vec_block_hash_only_slots(
-                            all_block_vecs[block_idx - 1],
-                            prev_buf,
-                            info["wrap_round"],
-                            info["node_const"],
-                            info["node_pair"],
-                            info["node_arith"],
-                            None,
-                            info["level2_round"],
-                            info["level3_round"],
-                            info["level4_round"],
-                        )
-                        load_slots = vec_block_load_slots(
-                            all_block_vecs[block_idx],
-                            curr_buf,
-                            info["node_const"],
-                            info["node_pair"],
-                            info["node_arith"],
-                        )
-                        body.extend(interleave_slots(hash_slots, load_slots))
-                    pending_prev = True
->>>>>>> phase-27
 
                     prev_info = info
                     prev_use_prefetch = False
@@ -3406,6 +3429,7 @@ class KernelBuilder:
                             prev_node_prefetch,
                             prev_info["level2_round"],
                             prev_info["level3_round"],
+                            prev_info["level4_round"],
                         )
                         if info["level2_round"]:
                             body.extend(interleave_slots(hash_prev, level2_prep))
@@ -3847,20 +3871,14 @@ def do_kernel_test(
     max_special_level: int | None = None,
     max_arith_level: int | None = None,
         enable_prefetch: bool | None = None,
-<<<<<<< HEAD
         enable_level2_where: bool | None = None,
         enable_level2_valu: bool | None = None,
         enable_two_round_fusion: bool | None = None,
         enable_level3_where: bool | None = None,
+        enable_level4_valu: bool | None = None,
+        enable_level4_where: bool | None = None,
+        alias_tmp3_block: bool | None = None,
         enable_unroll_8: bool | None = None,
-=======
-    enable_level2_where: bool | None = None,
-    enable_level2_valu: bool | None = None,
-    enable_two_round_fusion: bool | None = None,
-    enable_level3_where: bool | None = None,
-    enable_level4_where: bool | None = None,
-    alias_tmp3_block: bool | None = None,
->>>>>>> phase-27
     lookahead: int | None = None,
     block_size: int | None = None,
     enable_second_pass: bool | None = None,
@@ -3892,10 +3910,14 @@ def do_kernel_test(
         enable_two_round_fusion = False
     if enable_level3_where is None:
         enable_level3_where = False
+    if enable_level4_valu is None:
+        enable_level4_valu = False
     if enable_level4_where is None:
         enable_level4_where = False
     if alias_tmp3_block is None:
         alias_tmp3_block = False
+    if enable_unroll_8 is None:
+        enable_unroll_8 = False
     if lookahead is None:
         lookahead = 1024
     if block_size is None:
@@ -3918,12 +3940,10 @@ def do_kernel_test(
         enable_level2_valu=enable_level2_valu,
         enable_two_round_fusion=enable_two_round_fusion,
         enable_level3_where=enable_level3_where,
-<<<<<<< HEAD
-        enable_unroll_8=enable_unroll_8,
-=======
+        enable_level4_valu=enable_level4_valu,
         enable_level4_where=enable_level4_where,
         alias_tmp3_block=alias_tmp3_block,
->>>>>>> phase-27
+        enable_unroll_8=enable_unroll_8,
         lookahead=lookahead,
         block_size=block_size,
         enable_second_pass=enable_second_pass,
